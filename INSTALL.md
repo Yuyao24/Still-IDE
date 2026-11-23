@@ -9,13 +9,15 @@ build cache (you can delete it afterwards; see [Cleaning up the build](#cleaning
 GitHub builds Still automatically every time the code changes, so you don't
 need any developer tools on your computer:
 
-1. Open the repository on GitHub and click **Actions → Build Still**.
-2. Open the newest run with a green tick, scroll to **Artifacts**, and
-   download **Still-Windows** (or Still-macOS / Still-Linux).
-3. Unzip it and run `Still_…_x64-setup.exe`. It installs for your user only,
-   with no administrator rights needed.
+1. Open the repository on GitHub and click **Releases** (right-hand side of
+   the main page), then **Latest build**.
+2. Under **Assets**, click `Still_…_x64-setup.exe` (macOS: the `.dmg`;
+   Linux: the `.deb` or `.AppImage`). It downloads as a single file.
+3. Run it. It installs for your user only, with no administrator rights needed.
 
-Tagged versions (like `v0.2.1`) are also published under **Releases**.
+Each run under **Actions → Build Still** also keeps a copy under **Artifacts**;
+GitHub always zips those, and the zip holds just the installer. Tagged versions
+(like `v0.4.0`) are published as their own releases too.
 To update, download the newer installer and run it over the old one; your
 settings and projects are kept.
 
