@@ -1,20 +1,18 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent } from 'react'
 import { listen } from '@tauri-apps/api/event'
-import {
-  Clock3, Copy, Ellipsis, FolderGit2, FolderOpen, FolderPlus, FolderSearch, GitBranch, Moon, Pin, PinOff, Plus, Search, Server,
-  Settings2, Sun, X,
-} from 'lucide-react'
+import { Copy, Ellipsis, FolderOpen, FolderSearch, Moon, Pin, PinOff, Sun, X } from 'lucide-react'
 import {
   type HomeState, type JobEvent, type ProjectSummary, type SshHost, type SshOverview, type Workspace,
-  demo, desktop, home, hostLabel, mod, pickFolder, ssh,
+  api, demo, desktop, home, hostLabel, mod, pickFolder, ssh,
 } from './bridge'
 import { blankHost, HostDialog, hostMenu, OpenRemoteDialog } from './Remote'
 import { useSettings } from './settings'
+import { entryText, JournalSheet, useJournal } from './Journal'
+import { type Resume, clock, journal, resumeFor, sameDay } from './journal'
 import { TitleBar } from './TitleBar'
-import { Icon, IconButton, Menu, Modal, Segmented, Toggle, relativeTime, type MenuEntry, type MenuState } from './ui'
-import mark from './still.svg?inline'
+import { Icon, IconButton, Menu, Modal, Toggle, relativeTime, type MenuEntry, type MenuState } from './ui'
 
-export interface OpenOptions { venv?: boolean }
+export interface OpenOptions { venv?: boolean; file?: string; line?: number }
 
 interface Props {
   onOpen: (workspace: Workspace, options?: OpenOptions) => void
@@ -24,13 +22,6 @@ interface Props {
   notify: (message: unknown) => void
 }
 
-const tints = ['keyword', 'string', 'number', 'type', 'function', 'accent', 'green', 'amber']
-function tint(name: string) {
-  let hash = 0
-  for (const char of name) hash = (hash * 31 + char.charCodeAt(0)) >>> 0
-  return 'var(--' + tints[hash % tints.length] + ')'
-}
-
 function greeting() {
   const hour = new Date().getHours()
   return hour < 5 ? 'Good evening' : hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening'
@@ -38,13 +29,10 @@ function greeting() {
 
 const shortPath = (path: string, homeDir: string) => homeDir && path.startsWith(homeDir) ? '~' + path.slice(homeDir.length) : path
 
-function Monogram({ name, size = 28 }: { name: string; size?: number }) {
-  const letters = name.replace(/[^\p{L}\p{N} ]/gu, ' ').trim().split(/\s+/).map(word => word[0]).join('').slice(0, 2).toUpperCase() || '·'
-  return <span className="monogram" style={{ width: size, height: size, '--tint': tint(name), fontSize: size * .42 } as React.CSSProperties}>{letters}</span>
-}
-
 export default function Home(props: Props) {
-  const { theme } = useSettings()
+  const { theme, settings } = useSettings()
+  const entries = useJournal()
+  const [journalOpen, setJournal] = useState(false)
   const [state, setState] = useState<HomeState | null>(null)
   const [servers, setServers] = useState<SshOverview | null>(null)
   const [homeDir, setHomeDir] = useState('')
@@ -71,9 +59,9 @@ export default function Home(props: Props) {
   }, [])
   useEffect(() => { localStorage.setItem('still.home.sort', sort) }, [sort])
 
-  async function open(path: string) {
+  async function open(path: string, resume?: Resume) {
     if (!desktop) { props.onOpen(demo); return }
-    try { props.onOpen(await home.open(path)) } catch (error) { props.notify(error) }
+    try { props.onOpen(await home.open(path), resume ? { file: resume.path, line: resume.line } : undefined) } catch (error) { props.notify(error) }
   }
 
   async function openFolder() {
@@ -94,7 +82,7 @@ export default function Home(props: Props) {
 
   useEffect(() => {
     const handle = (event: KeyboardEvent) => {
-      if (creating || cloning || editingHost || remoteHost || document.querySelector('.modal-backdrop')) return
+      if (creating || cloning || editingHost || remoteHost || journalOpen || document.querySelector('.modal-backdrop')) return
       const meta = event.ctrlKey || event.metaKey
       const key = event.key.toLowerCase()
       if (meta && key === 'n') { event.preventDefault(); setCreating(true) }
@@ -115,8 +103,6 @@ export default function Home(props: Props) {
   }, [projects, term, sort])
   const recent = useMemo(() => [...projects].filter(project => !project.missing && (project.lastOpened || project.pinned))
     .sort((a, b) => Number(b.pinned) - Number(a.pinned) || (b.lastOpened ?? 0) - (a.lastOpened ?? 0)).slice(0, 4), [projects])
-  const library = filtered.filter(project => project.location === 'library')
-  const elsewhere = filtered.filter(project => project.location === 'external')
   const hosts = [...(servers?.saved ?? []), ...(servers?.imported ?? [])]
 
   function projectMenu(project: ProjectSummary): MenuEntry[] {
@@ -152,14 +138,11 @@ export default function Home(props: Props) {
   }
 
   function row(project: ProjectSummary) {
-    return <div key={project.path} className={'project-row-home' + (project.missing ? ' missing' : '')} onContextMenu={event => showMenu(event, projectMenu(project))}>
+    const when = project.lastOpened ? relativeTime(project.lastOpened) : project.modified ? 'edited ' + relativeTime(project.modified).toLowerCase() : ''
+    return <div key={project.path} className={'paper-row' + (project.missing ? ' missing' : '')} onContextMenu={event => showMenu(event, projectMenu(project))}>
       <button className="project-open" onClick={() => { if (!project.missing) void open(project.path) }} disabled={project.missing} title={project.path} onKeyDown={rowKey}>
-        <Monogram name={project.name} size={24} />
-        <span className="project-name">{project.name}{project.pinned && <Icon glyph={Pin} size={11} className="project-pin" />}</span>
-        <span className="project-path">{shortPath(project.path, homeDir)}</span>
-        <span className="project-langs">{project.missing ? <span className="badge">Missing</span> : project.languages.join(', ')}</span>
-        <span className="project-branch">{project.branch && <><Icon glyph={GitBranch} size={12} />{project.branch}</>}</span>
-        <span className="project-when">{project.lastOpened ? relativeTime(project.lastOpened) : project.modified ? 'Edited ' + relativeTime(project.modified).toLowerCase() : ''}</span>
+        <span className="paper-name">{project.name}{project.location === 'external' && <span className="muted"> · elsewhere</span>}{project.pinned && <Icon glyph={Pin} size={11} className="project-pin" />}</span>
+        <span className="paper-meta">{project.missing ? 'Missing' : [project.languages.slice(0, 2).join(', '), when].filter(Boolean).join(' · ')}</span>
       </button>
       <IconButton glyph={Ellipsis} label={'Actions for ' + project.name} className="row-action" onClick={event => showMenu(event, projectMenu(project), true)} />
     </div>
@@ -173,35 +156,46 @@ export default function Home(props: Props) {
     onTest: (host: SshHost) => { props.notify('Connecting to ' + host.name + '…'); void ssh.test(host.id).then(result => props.notify('Connected: ' + result)).catch(props.notify) },
   }
 
+  const latest = recent.find(project => !project.missing && project.lastOpened)
+  const resume = latest ? resumeFor(latest.path) : null
+  const [changed, setChanged] = useState<number | null>(null)
+  useEffect(() => {
+    setChanged(null)
+    if (!latest || !desktop) return
+    let live = true
+    void api.git(latest.path).then(result => { if (live) setChanged(result.changes.length) }).catch(() => {})
+    return () => { live = false }
+  }, [latest?.path])
+  const todays = entries.filter(entry => sameDay(entry.time, Date.now())).slice(-3).reverse()
+
   return <div className="app home-app">
     <TitleBar onError={props.notify}
-      left={<div className="brand"><img src={mark} alt="" /><span className="brand-word">Still</span></div>}
-      center={<label className="jump home-search">
-        <Icon glyph={Search} size={13} />
-        <input ref={filterInput} value={filter} onChange={event => setFilter(event.target.value)} placeholder="Search projects…" aria-label="Search projects" spellCheck={false}
-          onKeyDown={event => {
-            if (event.key === 'Escape') { setFilter(''); event.currentTarget.blur() }
-            if (event.key === 'Enter' && filtered[0] && !filtered[0].missing) void open(filtered[0].path)
-            if (event.key === 'ArrowDown') { event.preventDefault(); list.current?.querySelector<HTMLButtonElement>('.project-open')?.focus() }
-          }} />
-        <kbd>{mod}+K</kbd>
-      </label>}
+      left={<span className="brand"><span className="brand-word">Still</span></span>}
       right={<>
+        <label className="paper-search">
+          <input ref={filterInput} value={filter} onChange={event => setFilter(event.target.value)} placeholder="Search" aria-label="Search projects" spellCheck={false}
+            onKeyDown={event => {
+              if (event.key === 'Escape') { setFilter(''); event.currentTarget.blur() }
+              if (event.key === 'Enter' && filtered[0] && !filtered[0].missing) void open(filtered[0].path)
+              if (event.key === 'ArrowDown') { event.preventDefault(); list.current?.querySelector<HTMLButtonElement>('.project-open')?.focus() }
+            }} />
+          {!filter && <kbd>{mod}+K</kbd>}
+        </label>
         <IconButton glyph={theme.kind === 'dark' ? Sun : Moon} label="Toggle light and dark" onClick={props.onToggleTheme} />
-        <IconButton glyph={Settings2} label={'Settings (' + mod + '+,)'} onClick={() => props.onSettings()} />
+        <button className="quiet-link" onClick={() => props.onSettings()}>Settings</button>
       </>} />
 
     <main className="home" onKeyDown={rowKey}>
-      <div className="home-inner">
-        <header className="home-hero">
-          <h1>{greeting()}</h1>
-          <p className="home-sub">
-            {state ? projects.length + (projects.length === 1 ? ' project' : ' projects') : 'Loading projects…'}
-            {state?.projectsRoot && <> · <button className="link" onClick={event => showMenu(event, [
-              { label: 'Change projects folder…', icon: FolderOpen, action: () => { void chooseRoot() } },
-              { label: 'Reveal in file manager', icon: FolderSearch, action: () => { void home.reveal(state.projectsRoot!).catch(props.notify) } },
-            ], true)} title={state.projectsRoot}>{shortPath(state.projectsRoot, homeDir)}</button></>}
-          </p>
+      <div className="paper">
+        <header className="paper-hero">
+          <h1>{greeting()}.</h1>
+          <p>Pick up where you left off, or start something new.</p>
+          <div className="paper-actions">
+            <button className="paper-btn primary" onClick={() => setCreating(true)}>New project</button>
+            <button className="paper-btn" onClick={() => { void openFolder() }}>Open folder</button>
+            <button className="paper-btn" onClick={() => desktop ? setCloning(true) : props.notify('Cloning is available in the Still desktop app.')}>Clone</button>
+            <button className="paper-btn" onClick={() => desktop ? setEditingHost(blankHost) : props.notify('SSH is available in the Still desktop app.')}>Connect to server</button>
+          </div>
         </header>
 
         {state && !state.projectsRoot && desktop && <section className="setup-card">
@@ -210,85 +204,80 @@ export default function Home(props: Props) {
             <p>Still keeps new projects in one folder so they are easy to find. You can still create or open individual projects anywhere, and uninstalling Still never touches them.</p>
           </div>
           <div className="setup-actions">
-            <button className="text-btn primary" onClick={() => { void chooseRoot(state.suggestedRoot) }}>Use {shortPath(state.suggestedRoot, homeDir)}</button>
-            <button className="text-btn" onClick={() => { void chooseRoot() }}><Icon glyph={FolderOpen} size={13} />Choose folder…</button>
+            <button className="paper-btn primary" onClick={() => { void chooseRoot(state.suggestedRoot) }}>Use {shortPath(state.suggestedRoot, homeDir)}</button>
+            <button className="paper-btn" onClick={() => { void chooseRoot() }}>Choose folder…</button>
           </div>
         </section>}
 
-        <div className="home-actions">
-          <button className="action-tile" onClick={() => setCreating(true)}><Icon glyph={FolderPlus} size={16} /><span>New project</span><kbd>{mod}+N</kbd></button>
-          <button className="action-tile" onClick={() => { void openFolder() }}><Icon glyph={FolderOpen} size={16} /><span>Open folder</span><kbd>{mod}+O</kbd></button>
-          <button className="action-tile" onClick={() => desktop ? setCloning(true) : props.notify('Cloning is available in the Still desktop app.')}><Icon glyph={FolderGit2} size={16} /><span>Clone repository</span></button>
-          <button className="action-tile" onClick={() => desktop ? setEditingHost(blankHost) : props.notify('SSH is available in the Still desktop app.')}><Icon glyph={Server} size={16} /><span>Connect to server</span></button>
-        </div>
-
-        {recent.length > 0 && !term && <section className="home-section">
-          <h2 className="home-label"><Icon glyph={Clock3} size={13} />Recently opened</h2>
-          <div className="card-grid">
-            {recent.map(project => <button key={project.path} className="project-card" onClick={() => { void open(project.path) }}
-              onContextMenu={event => showMenu(event, projectMenu(project))} title={project.path}>
-              <span className="card-cover" style={{ '--tint': tint(project.name) } as React.CSSProperties} />
-              <Monogram name={project.name} size={30} />
-              <span className="card-title">{project.name}{project.pinned && <Icon glyph={Pin} size={11} className="project-pin" />}</span>
-              <span className="card-desc">{project.description ?? (project.languages.join(' · ') || 'Empty project')}</span>
-              <span className="card-meta">{relativeTime(project.lastOpened)}{project.branch && <> · <Icon glyph={GitBranch} size={11} />{project.branch}</>}</span>
-            </button>)}
-          </div>
+        {latest && !term && <section className="paper-section">
+          <h2>Continue</h2>
+          <button className="paper-continue" onClick={() => { void open(latest.path, resume ?? undefined) }} onContextMenu={event => showMenu(event, projectMenu(latest))}>
+            <b>{latest.name}</b>
+            {resume && <span className="muted">{resume.path}, line {resume.line}</span>}
+            {changed ? <span className="paper-amber">{changed} changed</span> : null}
+            <span className="muted paper-when">{relativeTime(latest.lastOpened)}</span>
+          </button>
         </section>}
 
-        <section className="home-section" ref={list}>
-          <div className="home-section-head">
-            <h2 className="home-label">{term ? 'Matching projects' : 'Projects'}</h2>
-            <Segmented label="Sort projects" value={sort} onChange={setSort} options={[{ value: 'recent', label: 'Recent' }, { value: 'name', label: 'Name' }]} />
+        <section className="paper-columns">
+          <div ref={list}>
+            <div className="paper-head">
+              <h2>{term ? 'Matching projects' : 'Projects'}{state?.projectsRoot && !term && <> · <button className="paper-root" onClick={event => showMenu(event, [
+                { label: 'Change projects folder…', icon: FolderOpen, action: () => { void chooseRoot() } },
+                { label: 'Reveal in file manager', icon: FolderSearch, action: () => { void home.reveal(state.projectsRoot!).catch(props.notify) } },
+              ], true)} title={state.projectsRoot}>{shortPath(state.projectsRoot, homeDir)}</button></>}</h2>
+              <span className="paper-sort">
+                <button className={sort === 'recent' ? 'is-active' : ''} onClick={() => setSort('recent')}>Recent</button>
+                <button className={sort === 'name' ? 'is-active' : ''} onClick={() => setSort('name')}>Name</button>
+              </span>
+            </div>
+            <div className="paper-list">
+              {filtered.map(row)}
+              {state && !filtered.length && <div className="paper-empty">
+                {term ? <p>No projects match “{filter}”.</p> : <p>No projects yet. <button className="link" onClick={() => setCreating(true)}>Create one</button>, or try the Orbit Lab sample from New project.</p>}
+              </div>}
+            </div>
           </div>
-          {state && !filtered.length && <div className="home-empty">
-            {term ? <p>No projects match “{filter}”.</p> : <>
-              <p>No projects yet.</p>
-              <div className="flex gap-2 justify-center mt-3">
-                <button className="text-btn primary" onClick={() => setCreating(true)}><Icon glyph={Plus} size={13} />New project</button>
-                <button className="text-btn" onClick={() => setCreating(true)}>Try the Orbit Lab sample</button>
-              </div>
-            </>}
-          </div>}
-          {library.length > 0 && <div className="project-list">
-            {elsewhere.length > 0 && <p className="list-caption">In your projects folder</p>}
-            {library.map(row)}
-          </div>}
-          {elsewhere.length > 0 && <div className="project-list">
-            <p className="list-caption">Elsewhere on this computer</p>
-            {elsewhere.map(row)}
-          </div>}
+          <div>
+            <div className="paper-head"><h2>Today</h2></div>
+            <div className="paper-list">
+              {todays.map(entry => <button key={entry.id} className="paper-row journal-line" onClick={() => { void open(entry.root, entry.path ? { path: entry.path, line: 1, time: entry.time } : undefined) }} title={entry.project}>
+                <time>{clock(entry.time)}</time><span>{entryText(entry)}</span>
+              </button>)}
+              {!todays.length && <p className="paper-row paper-quiet">Nothing yet today.</p>}
+              <button className="paper-row journal-line paper-quiet" onClick={() => setJournal(true)}><time /><span>Open journal</span></button>
+            </div>
+          </div>
         </section>
 
-        {desktop && <section className="home-section">
-          <div className="home-section-head">
-            <h2 className="home-label">Servers</h2>
-            <button className="text-btn" onClick={() => setEditingHost(blankHost)}><Icon glyph={Plus} size={13} />Add server</button>
-          </div>
-          {hosts.length ? <div className="project-list">{hosts.map(host => <div key={host.id} className="project-row-home"
-            onContextMenu={event => showMenu(event, hostMenu(host, serverActions))}>
-            <button className="project-open" onClick={() => setRemoteHost(host)} onKeyDown={rowKey}>
-              <span className="monogram server" style={{ width: 24, height: 24 }}><Icon glyph={Server} size={13} /></span>
-              <span className="project-name">{host.name}</span>
-              <span className="project-path">{hostLabel(host)}</span>
-              <span className="project-langs">{host.source === 'config' ? '~/.ssh/config' : host.jump ? 'via ' + host.jump : ''}</span>
-              <span className="project-branch" />
-              <span className="project-when">{host.lastUsed ? relativeTime(host.lastUsed) : ''}</span>
-            </button>
-            <IconButton glyph={Ellipsis} label={'Actions for ' + host.name} className="row-action" onClick={event => showMenu(event, hostMenu(host, serverActions), true)} />
-          </div>)}</div> : <p className="home-hint">Save servers you connect to with SSH. Open a terminal or browse and edit their files like a local project.</p>}
+        {desktop && <section className="paper-servers">
+          <h2>Servers</h2>
+          {hosts.map(host => <button key={host.id} onClick={() => setRemoteHost(host)} onContextMenu={event => showMenu(event, hostMenu(host, serverActions))} title={'Open a folder on ' + host.name}>
+            <span>{host.name}</span> <code>{host.source === 'config' && !host.user ? 'ssh config' : hostLabel(host)}</code>
+          </button>)}
+          {!hosts.length && <span className="muted">None saved yet.</span>}
+          <button className="paper-add" onClick={() => setEditingHost(blankHost)}>Add server</button>
         </section>}
 
-        <footer className="home-footer">
+        <footer className="paper-foot">
           <span><kbd>{mod}+N</kbd> new project</span><span><kbd>{mod}+O</kbd> open folder</span><span><kbd>/</kbd> search</span><span><kbd>{mod}+,</kbd> settings</span>
         </footer>
       </div>
     </main>
 
     {creating && <NewProjectDialog root={state?.projectsRoot ?? null} homeDir={homeDir} onClose={() => setCreating(false)} notify={props.notify}
-      onChooseRoot={() => { void chooseRoot() }} onCreated={(workspace, options) => { setCreating(false); props.onOpen(workspace, options) }} />}
+      onChooseRoot={() => { void chooseRoot() }} onCreated={(workspace, options) => {
+        setCreating(false)
+        if (settings.journal) journal.add({ kind: 'create', project: workspace.name, root: workspace.root, text: 'Created ' + workspace.name })
+        props.onOpen(workspace, options)
+      }} />}
     {cloning && <CloneDialog root={state?.projectsRoot ?? null} homeDir={homeDir} onClose={() => setCloning(false)}
-      onCloned={path => { setCloning(false); void open(path) }} />}
+      onCloned={path => {
+        setCloning(false)
+        if (settings.journal) journal.add({ kind: 'clone', project: path.split(/[\\/]/).filter(Boolean).at(-1) ?? path, root: path, text: 'Cloned ' + (path.split(/[\\/]/).filter(Boolean).at(-1) ?? path) })
+        void open(path)
+      }} />}
+    {journalOpen && <JournalSheet onClose={() => setJournal(false)} onOpen={entry => { setJournal(false); void open(entry.root, entry.path ? { path: entry.path, line: 1, time: entry.time } : undefined) }} />}
     {editingHost && <HostDialog host={editingHost} onClose={() => setEditingHost(null)} onSaved={host => { void refresh(); setRemoteHost(host) }} />}
     {remoteHost && <OpenRemoteDialog host={remoteHost} onClose={() => setRemoteHost(null)} onOpen={path => props.onOpenRemote(remoteHost, path)} />}
     {menu && <Menu {...menu} onClose={() => setMenu(null)} />}

@@ -26,16 +26,19 @@ export interface Settings {
   newProjectTemplate: string
   newProjectGit: boolean
   confirmDelete: boolean
+  idleMinutes: number
+  smoothCaret: boolean
+  journal: boolean
 }
 
 export const defaults: Settings = {
-  theme: 'still-dark',
+  theme: 'still-light',
   followSystem: false,
   lightTheme: 'still-light',
   darkTheme: 'still-dark',
   customThemes: [],
   uiFontSize: 13,
-  editorFont: '"JetBrains Mono Variable"',
+  editorFont: '"IBM Plex Mono"',
   editorFontSize: 14,
   editorLineHeight: 1.6,
   ligatures: false,
@@ -51,9 +54,13 @@ export const defaults: Settings = {
   newProjectTemplate: 'python',
   newProjectGit: true,
   confirmDelete: true,
+  idleMinutes: 5,
+  smoothCaret: true,
+  journal: true,
 }
 
 export const editorFonts = [
+  { label: 'IBM Plex Mono', value: '"IBM Plex Mono"' },
   { label: 'JetBrains Mono', value: '"JetBrains Mono Variable"' },
   { label: 'System monospace', value: 'ui-monospace, SFMono-Regular, Menlo' },
   { label: 'Cascadia Code', value: '"Cascadia Code", "Cascadia Mono"' },
@@ -114,6 +121,7 @@ export function applySettings(settings: Settings, systemDark: boolean) {
   root.setProperty('--editor-line-height', String(settings.editorLineHeight))
   root.setProperty('--ligatures', settings.ligatures ? 'contextual common-ligatures' : 'none')
   root.setProperty('--font-features', settings.ligatures ? '"liga" 1, "calt" 1' : '"liga" 0, "calt" 0')
+  document.documentElement.classList.toggle('smooth-caret', settings.smoothCaret)
   return theme
 }
 

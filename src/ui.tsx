@@ -122,3 +122,30 @@ export function relativeTime(time: number | null | undefined) {
   if (days < 7) return days === 1 ? 'Yesterday' : days + ' days ago'
   return new Date(time).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: days > 300 ? 'numeric' : undefined })
 }
+
+/** A single underline that slides to whichever child has `data-slide`. Re-measures when `key` changes or the container resizes. */
+export function useSlider(key: unknown) {
+  const ref = useRef<HTMLDivElement>(null)
+  const [box, setBox] = useState<{ left: number; width: number } | null>(null)
+  useLayoutEffect(() => {
+    const node = ref.current
+    if (!node) return
+    const measure = () => {
+      const target = node.querySelector<HTMLElement>(':scope > [data-slide]')
+      setBox(previous => {
+        if (!target) return null
+        const next = { left: target.offsetLeft, width: target.offsetWidth }
+        return previous && previous.left === next.left && previous.width === next.width ? previous : next
+      })
+    }
+    measure()
+    const observer = new ResizeObserver(measure)
+    observer.observe(node)
+    node.querySelectorAll(':scope > *').forEach(child => observer.observe(child))
+    return () => observer.disconnect()
+  }, [key])
+  const first = useRef(true)
+  useEffect(() => { if (box) first.current = false }, [box])
+  const bar = box ? <span className={'slider' + (first.current ? ' no-motion' : '')} aria-hidden="true" style={{ width: box.width, transform: `translateX(${box.left}px)` }} /> : null
+  return { ref, bar }
+}

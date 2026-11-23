@@ -223,6 +223,14 @@ function EditorSettings() {
         <Segmented label="Diff layout" value={settings.diffLayout} onChange={value => update({ diffLayout: value })} options={[{ value: 'inline', label: 'Inline' }, { value: 'split', label: 'Side by side' }]} /></div>
       <Toggle label="Confirm before deleting files" description="Local files go to the system trash either way." checked={settings.confirmDelete} onChange={value => update({ confirmDelete: value })} />
     </section>
+    <section className="settings-group">
+      <h3>Calm</h3>
+      <Toggle label="Smooth caret" description="The caret glides to its new position instead of jumping." checked={settings.smoothCaret} onChange={value => update({ smoothCaret: value })} />
+      <div className="setting-row"><span className="setting-text"><span>Idle screen</span><small>After this long without input, show drifting code, the time and today's numbers. Any key brings you back.</small></span>
+        <Segmented label="Idle screen" value={String(settings.idleMinutes)} onChange={value => update({ idleMinutes: Number(value) })}
+          options={[{ value: '0', label: 'Off' }, { value: '2', label: '2 min' }, { value: '5', label: '5 min' }, { value: '10', label: '10 min' }, { value: '20', label: '20 min' }]} /></div>
+      <Toggle label="Keep a journal" description="Notes saves, runs and commits on this computer. Shown on Home under Today." checked={settings.journal} onChange={value => update({ journal: value })} />
+    </section>
   </>
 }
 
@@ -306,7 +314,7 @@ const shortcutGroups: { title: string; items: [string, string][] }[] = [
   { title: 'General', items: [['Command palette and file finder', 'K / P'], ['Commands only', 'Shift+K'], ['Settings', ','], ['Go to Home', 'Shift+H'], ['Open folder', 'O'], ['New project (Home)', 'N']] },
   { title: 'Editor', items: [['Save', 'S'], ['Close tab', 'W'], ['Next / previous tab', 'Tab / Shift+Tab'], ['Find in file', 'F'], ['Find in all files', 'Shift+F'], ['Go to line', 'Alt+G'], ['Toggle comment', '/']] },
   { title: 'Run', items: [['Run active file', 'Enter'], ['Check or compile only', 'Shift+Enter']] },
-  { title: 'Layout', items: [['Toggle sidebar', 'B'], ['Toggle bottom drawer', 'J'], ['New terminal', 'Shift+`'], ['Explorer', 'Shift+E'], ['Source control', 'Shift+G']] },
+  { title: 'Layout', items: [['Overview of everything', '↑'], ['Focus mode', '.'], ['Toggle the left island', 'B'], ['Toggle the terminal island', 'J'], ['New terminal', 'Shift+`'], ['Files', 'Shift+E'], ['Git', 'Shift+G']] },
 ]
 
 function Shortcuts() {

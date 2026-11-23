@@ -9,10 +9,39 @@ shell files, has a real terminal, Git, a package manager panel, SSH remotes, and
 
 ## What's inside
 
-**Home.** A clean start page in the style of Notion. Recently opened projects as
-cards, every project in your projects folder plus projects kept elsewhere, and
-your SSH servers. Create a project from a template (Python, Java, JavaScript,
+**Look.** Neutral white or near-black, IBM Plex Sans and Mono, square corners
+and thin hairlines. Motion is short and quiet: underlines draw in, islands fade
+up, the caret glides between lines.
+
+**Home.** One centred column. Continue takes you back to the file and line you
+were on; Projects lists everything in your projects folder and projects kept
+elsewhere; Today shows the latest entries from your journal; servers sit on one
+line at the bottom. Create a project from a template (Python, Java, JavaScript,
 empty, or the Orbit Lab sample), open any folder, or clone a Git repository.
+
+**Islands.** The workbench is a set of separate panels on a white page: Files
+(or Search, Git, Packages, Servers) on the left, the editor in the middle, the
+graph on the right and the terminal below. The underlined names at the top show
+or hide each one. On narrow windows the graph steps aside by itself.
+
+**Overview.** Ctrl/Cmd + ↑ shows every island and your recent projects at once.
+Click or press Enter to jump, Delete to hide or show an island, and pick a
+layout (Classic, Code and graph, Review, Writing, Focus, or one you saved).
+
+**Focus.** Ctrl/Cmd + . hides everything but the code. The file's name sits
+large in the background, lines other than the current one are dimmed, and a thin
+timeline on the right marks where you edited this session (click a mark to go
+back there). Esc shows everything again.
+
+**Graph.** Still reads imports (Python, JavaScript/TypeScript, Java, Kotlin) and
+Markdown links to see how files connect. The right island shows the files around
+the one you are editing; Open graph shows the whole project, the files around
+this one, or only changed files, with tests, packages and data files on or off.
+
+**Journal and idle screen.** Saves, runs and commits are noted in a journal on
+this computer (turn it off in Settings → Editor). After a few minutes without
+input an idle screen shows drifting code, one excerpt at a time, the time and
+today's numbers; any key brings you back.
 
 **Editor.** CodeMirror 6 with syntax highlighting for Python, Java, JavaScript,
 TypeScript, JSX, HTML, CSS, JSON, Markdown, Rust, C/C++, Go, Kotlin, C#, Ruby,
@@ -80,10 +109,12 @@ and ligatures are adjustable.
 | Ctrl/Cmd + Shift + V | Markdown/text: edit, split, preview |
 | Ctrl/Cmd + F | Find in file |
 | Ctrl/Cmd + Shift + F | Find in all files |
-| Ctrl/Cmd + B | Toggle the sidebar |
-| Ctrl/Cmd + J | Toggle the bottom drawer |
+| Ctrl/Cmd + ↑ | Overview (Esc or Ctrl/Cmd + ↓ to return) |
+| Ctrl/Cmd + . | Focus mode (Esc to leave) |
+| Ctrl/Cmd + B | Show or hide the left island |
+| Ctrl/Cmd + J | Show or hide the terminal island |
 | Ctrl/Cmd + Shift + ` | New terminal |
-| Ctrl/Cmd + Shift + E / G | Explorer / Source control |
+| Ctrl/Cmd + Shift + E / G | Files / Git |
 | F2 / Delete in the explorer | Rename / move to trash |
 
 ## Where Still keeps things

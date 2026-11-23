@@ -4,17 +4,16 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import type { Terminal as Xterm } from '@xterm/xterm'
 import {
-  ArrowDown, ArrowUp, Braces, Check, ChevronRight, Circle, CircleAlert, CodeXml, Columns2, Copy, FilePlus2, Files, FolderOpen, FolderPlus,
-  FolderSearch, GitBranch, GitCompareArrows, GitPullRequestArrow, Hammer, House, Moon, Package, PanelBottom, PanelLeft, Pencil, Play, Plus,
+  ArrowDown, ArrowUp, Check, Circle, CircleAlert, CodeXml, Columns2, Copy, FilePlus2, Files, FolderOpen, FolderPlus,
+  FolderSearch, GitBranch, GitCompareArrows, GitPullRequestArrow, Hammer, House, Moon, Package,  Pencil, Play, Plus,
   RefreshCw, Rows2, Search, Server, Settings2, Square, SquareTerminal, Sun, TerminalSquare, Trash2, WrapText, X,
-  Camera, Eye, PenLine,
+  Camera, Eye, PenLine, LayoutGrid, Maximize2, Network, BookOpen,
 } from 'lucide-react'
 import {
   api, desktop, fileName, fileSystem, home, mod, parentPath, pickFolder, ssh,
   type Branches, type Change, type Commit, type Diagnostic, type Diff, type Entry, type GitStatus, type JobEvent, type Packages, type Runtimes,
   type SshHost, type SshOverview, type Workspace,
 } from './bridge'
-import mark from './still.svg?inline'
 import Editor, { defaultIndent, language, type CodeCapture, type Cursor, type EditorHandle, type EditorMemory, type EditorOptions } from './Editor'
 import CodeShot from './CodeShot'
 import { Preview, docKind } from './Preview'
@@ -24,17 +23,35 @@ import { HostDialog, OpenRemoteDialog, RemotePanel, blankHost } from './Remote'
 import { SearchPanel } from './Search'
 import type { SettingsSection } from './SettingsView'
 import { useSettings } from './settings'
+import { type Graph, buildGraph } from './graph'
+import { GraphView, MiniGraph } from './GraphView'
+import { Idle, useIdle } from './Idle'
+import { JournalSheet, useJournal } from './Journal'
+import { bump, clock, journal, lineChanges, remember } from './journal'
+import { Overview, type OverviewCard, type OverviewSpace } from './Overview'
 import Terminal, { type TerminalSession } from './Terminal'
 import { presets } from './themes'
 import { TitleBar } from './TitleBar'
 import { Dialog, Output, Problems, SplitGrip, type DialogState, type OutputEntry } from './Workbench'
-import { FileIcon, Icon, IconButton, Menu, type MenuEntry, type MenuState } from './ui'
+import { Icon, IconButton, Menu, useSlider, type MenuEntry, type MenuState } from './ui'
 
 type Side = 'explorer' | 'search' | 'git' | 'packages' | 'remote'
 type Drawer = 'terminal' | 'output' | 'problems'
 type DocView = 'edit' | 'split' | 'preview'
 type Tab = { id: string; path: string; contents: string; saved: string; memory?: EditorMemory; diff?: Diff; staged?: boolean; line?: number; view?: DocView }
-type Job = { id: string; kind: 'run' | 'git' | 'packages'; action: string }
+type Job = { id: string; kind: 'run' | 'git' | 'packages'; action: string; path?: string; detail?: string }
+type Edit = { time: number; line: number }
+type Islands = { side: Side | null; graph: boolean; drawer: boolean }
+const layouts: { id: string; label: string; islands?: Islands }[] = [
+  { id: 'classic', label: 'Classic', islands: { side: 'explorer', graph: true, drawer: true } },
+  { id: 'code-graph', label: 'Code and graph', islands: { side: null, graph: true, drawer: false } },
+  { id: 'review', label: 'Review', islands: { side: 'git', graph: false, drawer: true } },
+  { id: 'writing', label: 'Writing', islands: { side: null, graph: false, drawer: false } },
+  { id: 'focus', label: 'Focus' },
+]
+function savedLayout(): Islands | null {
+  try { return JSON.parse(localStorage.getItem('still.layout.custom') ?? 'null') } catch { return null }
+}
 
 const emptyStatus: GitStatus = { branch: null, changes: [] }
 const initialOutput: OutputEntry[] = [
@@ -105,6 +122,19 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const [remoteHost, setRemoteHost] = useState<SshHost | null>(null)
   const [searchFocus, setSearchFocus] = useState(0)
   const [shot, setShot] = useState<CodeCapture | null>(null)
+  const [graphOpen, setGraphOpen] = useState(() => localStorage.getItem('still.island.graph') !== 'off' && window.innerWidth > 1180)
+  const [focusMode, setFocusMode] = useState(false)
+  const [overview, setOverview] = useState(false)
+  const [graphView, setGraphView] = useState(false)
+  const [graph, setGraph] = useState<Graph | null>(null)
+  const [graphError, setGraphError] = useState('')
+  const [journalOpen, setJournalOpen] = useState(false)
+  const [edits, setEdits] = useState<Record<string, Edit[]>>({})
+  const [spaces, setSpaces] = useState<OverviewSpace[]>([])
+  const [lastRun, setLastRun] = useState<{ path: string; code: number | null; time: number } | null>(null)
+  const graphWanted = useRef(false)
+  const graphBuild = useRef(0)
+  const graphTimer = useRef<ReturnType<typeof setTimeout>>(undefined)
   const generation = useRef(0)
   const editor = useRef<EditorHandle | null>(null)
   const terminal = useRef<Xterm | null>(null)
@@ -138,6 +168,40 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const host = remote ? [...(servers?.saved ?? []), ...(servers?.imported ?? [])].find(item => item.id === workspace.remote) : undefined
 
   const notify = useCallback((error: unknown) => toast(errorText(error)), [toast])
+  const [idle, wake] = useIdle(settings.idleMinutes, Boolean(dialog || palette !== null || shot))
+  const record = settings.journal
+  const journalEntries = useJournal()
+  const latestRecord = useRef(record)
+  latestRecord.current = record
+  const changedPaths = useMemo(() => new Set(status.changes.map(change => change.path)), [status])
+
+  useEffect(() => { localStorage.setItem('still.island.graph', graphOpen ? 'on' : 'off') }, [graphOpen])
+
+  // Count active minutes for today's numbers on the idle screen.
+  useEffect(() => {
+    if (idle) return
+    const timer = setInterval(() => { if (document.hasFocus()) { bump({ activeMs: 30000 }) } }, 30000)
+    return () => clearInterval(timer)
+  }, [idle])
+
+  // Remember where you were so Home can offer to continue there.
+  useEffect(() => {
+    if (!active || active.diff || workspace.sample) return
+    const timer = setTimeout(() => remember(workspace.root, { path: active.path, line: cursor.line, time: Date.now() }), 700)
+    return () => clearTimeout(timer)
+  }, [active?.path, cursor.line])
+
+  async function loadGraph() {
+    graphWanted.current = true
+    const id = ++graphBuild.current
+    try {
+      const entries = await fs.files()
+      const open = new Map(latest.current.tabs.filter(tab => !tab.diff).map(tab => [tab.path, tab.contents]))
+      const result = await buildGraph(entries, path => open.has(path) ? Promise.resolve(open.get(path)!) : fs.read(path), remote ? 150 : 400)
+      if (id === graphBuild.current) { setGraph(result); setGraphError('') }
+    } catch (error) { if (id === graphBuild.current) setGraphError(errorText(error)) }
+  }
+  useEffect(() => { if ((graphOpen || graphView) && !graphWanted.current) void loadGraph() }, [graphOpen, graphView])
 
   useEffect(() => { localStorage.setItem('still.sidebar.width', String(sideWidth)) }, [sideWidth])
   useEffect(() => { localStorage.setItem('still.drawer.height', String(drawerHeight)) }, [drawerHeight])
@@ -224,12 +288,17 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     void (async () => {
       const readme = ['README.md', 'readme.md', 'README.txt']
       const entries = await fs.list('').catch(() => [] as Entry[])
-      const paths = workspace.sample ? ['README.md', 'src/app.py', 'src/Main.java'] : entries.filter(entry => !entry.directory && readme.includes(entry.name)).map(entry => entry.path).slice(0, 1)
-      const opened = await Promise.all(paths.map(path => fs.read(path).then(contents => fileTab(path, contents, workspace.sample && path === 'src/app.py' ? 11 : undefined)).catch(() => null)))
+      const resume = initial?.file
+      const found = workspace.sample ? ['README.md', 'src/app.py', 'src/Main.java'] : entries.filter(entry => !entry.directory && readme.includes(entry.name)).map(entry => entry.path).slice(0, 1)
+      const paths = resume && !found.includes(resume) ? [...found, resume] : found
+      const lineFor = (path: string) => path === resume ? initial?.line : workspace.sample && path === 'src/app.py' ? 11 : undefined
+      const opened = await Promise.all(paths.map(path => fs.read(path).then(contents => fileTab(path, contents, lineFor(path))).catch(() => null)))
       if (generation.current !== id) return
       const available = opened.filter(tab => tab !== null)
       setTabs(previous => [...available.filter(tab => !previous.some(existing => existing.id === tab.id)), ...previous])
-      setSelected(previous => previous || (available.some(tab => tab.id === 'src/app.py') ? 'src/app.py' : available[0]?.id ?? ''))
+      const preferred = resume && available.some(tab => tab.id === resume) ? resume : available.some(tab => tab.id === 'src/app.py') ? 'src/app.py' : available[0]?.id ?? ''
+      setSelected(previous => previous || preferred)
+      if (resume) expandParents(resume)
     })()
     return () => { generation.current++ }
   }, [])
@@ -305,12 +374,22 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       if (payload.kind !== 'exit') return
       activeJob.current = null
       setJob(null)
-      if (current.kind === 'run') setDiagnostics(payload.diagnostics)
+      if (current.kind === 'run') {
+        setDiagnostics(payload.diagnostics)
+        if (current.action === 'run' && current.path) {
+          bump({ runs: 1, passed: payload.code === 0 ? 1 : 0 })
+          setLastRun({ path: current.path, code: payload.code ?? null, time: Date.now() })
+          if (latestRecord.current && !workspace.sample) journal.add({ kind: 'run', project: workspace.name, root: workspace.root, path: current.path, text: 'Ran ' + fileName(current.path), detail: payload.code === null || payload.code === undefined ? 'stopped' : 'exit ' + payload.code })
+        }
+      }
       if (current.kind === 'git') {
         void refreshGit()
         if (['pull', 'fetch'].includes(current.action)) void refreshLog()
         if (current.action === 'pull' && payload.code === 0) { void refreshFiles(); void refreshCleanTabs() }
-        if (current.action === 'commit' && payload.code === 0) { setCommit(''); void refreshLog() }
+        if (current.action === 'commit' && payload.code === 0) {
+          setCommit(''); void refreshLog()
+          if (latestRecord.current) journal.add({ kind: 'commit', project: workspace.name, root: workspace.root, text: 'Committed “' + (current.detail ?? '').split('\n')[0].slice(0, 80) + '”' })
+        }
       }
       if (current.kind === 'packages') {
         void refreshPackages()
@@ -416,6 +495,12 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     if (!current || !dirty(current)) return
     const task = fs.save(current.path, current.contents, current.saved).then(() => {
       if (generation.current !== id) return
+      const { added, removed } = lineChanges(current.saved, current.contents)
+      if (added || removed) {
+        bump({ added })
+        if (record && !workspace.sample) journal.add({ kind: 'edit', project: workspace.name, root: workspace.root, path: current.path, text: 'Edited ' + fileName(current.path), detail: '+' + added + ' −' + removed, added, removed })
+      }
+      if (graphWanted.current) { clearTimeout(graphTimer.current); graphTimer.current = setTimeout(() => { void loadGraph() }, 1200) }
       const markSaved = (items: Tab[]) => items.map(item => item.id === current.id ? { ...item, saved: current.contents } : item)
       latest.current.tabs = markSaved(latest.current.tabs)
       setTabs(markSaved)
@@ -594,9 +679,9 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     if (!next.length) terminal.current = null
   }
 
-  async function launch(kind: Job['kind'], action: string, command: string, args: object) {
+  async function launch(kind: Job['kind'], action: string, command: string, args: object, extra: Pick<Job, 'path' | 'detail'> = {}) {
     if (activeJob.current || !jobReady) { notify('The process runner is busy or still starting.'); return }
-    const current = { id: crypto.randomUUID(), kind, action }
+    const current: Job = { id: crypto.randomUUID(), kind, action, ...extra }
     activeJob.current = current
     setJob(current)
     setOutput([])
@@ -625,8 +710,8 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       await store(active)
       setDiagnostics([])
       const args = runArgs[active.path] || null
-      if (remote) await launch('run', 'run', 'ssh_run', { hostId: workspace.remote, root: workspace.root, path: active.path, args })
-      else await launch('run', buildOnly ? 'build' : 'run', 'run_file', { rootPath: workspace.root, path: active.path, buildOnly, args })
+      if (remote) await launch('run', 'run', 'ssh_run', { hostId: workspace.remote, root: workspace.root, path: active.path, args }, { path: active.path })
+      else await launch('run', buildOnly ? 'build' : 'run', 'run_file', { rootPath: workspace.root, path: active.path, buildOnly, args }, { path: active.path })
     } catch (error) { notify(error) }
     finally { setRunningRequest(false) }
   }
@@ -708,7 +793,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       } else if (action !== 'commit') notify('Remote Git operations are available in the Still desktop app.')
       return
     }
-    void launch('git', action, 'git_action', { rootPath: workspace.root, action, message: action === 'commit' ? commit : null })
+    void launch('git', action, 'git_action', { rootPath: workspace.root, action, message: action === 'commit' ? commit : null }, { detail: action === 'commit' ? commit : undefined })
   }
 
   function packageAction(action: string, name?: string) {
@@ -770,6 +855,20 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     if (parts.length) void openFile(parts.join('/'))
   }
 
+  const cursorLine = useRef(1)
+  cursorLine.current = cursor.line
+  function edited(tab: Tab, contents: string) {
+    setTabs(previous => previous.map(item => item.id === tab.id ? { ...item, contents } : item))
+    // One timeline mark per burst of typing: a new mark after a pause or a jump elsewhere in the file.
+    const now = Date.now(), line = cursorLine.current
+    setEdits(previous => {
+      const list = previous[tab.path] ?? []
+      const last = list.at(-1)
+      if (last && now - last.time < 90000 && Math.abs(last.line - line) < 12) return { ...previous, [tab.path]: [...list.slice(0, -1), { time: now, line }] }
+      return { ...previous, [tab.path]: [...list, { time: now, line }].slice(-40) }
+    })
+  }
+
   function cycleTab(step: number) {
     const list = latest.current.tabs
     if (!list.length) return
@@ -783,12 +882,15 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       if (document.querySelector('.settings-backdrop, .sheet')) return
       const key = event.key.toLowerCase()
       const shiftOnly = event.shiftKey && ['f', 'h', 'e', 'g', 'v', '`', '~'].includes(key)
-      if (event.altKey || !(['k', 'p', 's', 'w', 'b', 'j', 'o', 'enter', 'tab', ','].includes(key) || shiftOnly)) return
+      if (event.altKey || !(['k', 'p', 's', 'w', 'b', 'j', 'o', 'enter', 'tab', ',', 'arrowup', '.'].includes(key) || shiftOnly)) return
+      if ((overview || graphView) && !['k', 'p', '.'].includes(key)) return
       if (key === 'enter' && palette !== null) return
       event.preventDefault()
       if (key === 'p' || key === 'k') { palette !== null ? closePalette() : openPalette(event.shiftKey ? '>' : ''); return }
       if (palette !== null) return
       if (key === 'tab') { cycleTab(event.shiftKey ? -1 : 1); return }
+      if (key === 'arrowup') { openOverview(); return }
+      if (key === '.') { toggleFocus(); return }
       if (key === 'v' && event.shiftKey) { cycleDocView(); return }
       if (key === 'f') showSide('search')
       if (key === 'e' && event.shiftKey) showSide('explorer')
@@ -799,9 +901,10 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       if (key === 's') void (event.shiftKey ? storeAll() : store(active)).catch(notify)
       if (key === 'o') chooseFolder()
       if (key === 'enter') void run(event.shiftKey)
-      if (key === 'b') setSidebar(value => value ? null : lastSide)
+      if (key === 'b') { if (focusMode) setFocusMode(false); setSidebar(value => value ? null : lastSide) }
       if (key === 'j') {
-        if (drawerOpen) setDrawerOpen(false)
+        if (focusMode) { setFocusMode(false); showDrawer('terminal', true) }
+        else if (drawerOpen) setDrawerOpen(false)
         else showDrawer('terminal', true)
       }
       if (key === 'w' && active) closeTab(active)
@@ -810,10 +913,79 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     return () => document.removeEventListener('keydown', handle, true)
   })
 
+  useEffect(() => {
+    if (!focusMode) return
+    const escape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || event.defaultPrevented || overview || graphView || dialog || menu || palette !== null || shot) return
+      if ((event.target as Element | null)?.closest?.('.xterm, .modal-backdrop')) return
+      setFocusMode(false)
+    }
+    addEventListener('keydown', escape)
+    return () => removeEventListener('keydown', escape)
+  })
+
+  function toggleFocus() {
+    setFocusMode(value => !value)
+    setOverview(false)
+    requestAnimationFrame(() => editor.current?.focus())
+  }
+
+  function openOverview() {
+    setOverview(true)
+    if (!desktop) { setSpaces([{ id: 'home', label: 'Home', kind: 'home' }, { id: 'current', label: workspace.name, kind: remote ? 'server' : 'project', current: true }]); return }
+    void home.state().then(state => {
+      const others = state.projects.filter(project => !project.missing && project.path !== workspace.root && project.lastOpened)
+        .sort((a, b) => (b.lastOpened ?? 0) - (a.lastOpened ?? 0)).slice(0, 3)
+      setSpaces([
+        { id: 'home', label: 'Home', kind: 'home' },
+        { id: 'current', label: workspace.name, kind: remote ? 'server' : 'project', current: true, preview: remote ? ['$ ssh ' + workspace.hostName, '~ $ ls'] : undefined },
+        ...others.map(project => ({ id: project.path, label: project.name, kind: 'project' as const })),
+      ])
+    }).catch(() => setSpaces([{ id: 'home', label: 'Home', kind: 'home' }, { id: 'current', label: workspace.name, kind: 'project', current: true }]))
+  }
+
+  const islands: Islands = { side: sidebar, graph: graphOpen, drawer: drawerOpen }
+  const currentLayout = focusMode ? 'focus' : layouts.find(item => item.islands && item.islands.side === islands.side && item.islands.graph === islands.graph && item.islands.drawer === islands.drawer)?.id ?? null
+
+  function applyLayout(id: string) {
+    if (id === 'focus') { setFocusMode(true); setOverview(false); requestAnimationFrame(() => editor.current?.focus()); return }
+    const chosen = id === 'custom' ? savedLayout() : layouts.find(item => item.id === id)?.islands
+    if (!chosen) return
+    setFocusMode(false)
+    setOverview(false)
+    if (chosen.side) showSide(chosen.side); else setSidebar(null)
+    setGraphOpen(chosen.graph)
+    if (chosen.drawer) showDrawer(drawer); else setDrawerOpen(false)
+  }
+
+  function toggleIsland(key: string) {
+    if (key === 'graph') setGraphOpen(value => !value)
+    else if (key === 'terminal') { if (drawerOpen) setDrawerOpen(false); else showDrawer('terminal') }
+    else if (key === 'editor' || key.startsWith('tab:') || key === 'journal') return
+    else { const side = key as Side; setSidebar(value => value === side ? null : side); setLastSide(side) }
+  }
+
+  function jumpIsland(key: string) {
+    setOverview(false)
+    setFocusMode(false)
+    if (key === 'editor') { requestAnimationFrame(() => editor.current?.focus()); return }
+    if (key.startsWith('tab:')) { activate(key.slice(4)); return }
+    if (key === 'journal') { setJournalOpen(true); return }
+    if (key === 'graph') { setGraphOpen(true); return }
+    if (key === 'terminal') { showDrawer('terminal', true); return }
+    showSide(key as Side)
+  }
+
   const allThemes = [...presets, ...settings.customThemes]
   const commands: PaletteItem[] = [
     { id: 'home', label: 'Go to Home', shortcut: mod + '+Shift+H', icon: House, action: goHome },
     { id: 'folder', label: 'Open folder', shortcut: mod + '+O', icon: FolderOpen, action: chooseFolder },
+    { id: 'overview', label: 'Overview of everything', shortcut: mod + '+↑', icon: LayoutGrid, action: openOverview },
+    { id: 'focus', label: focusMode ? 'Leave focus mode' : 'Focus mode', shortcut: mod + '+.', icon: Maximize2, action: toggleFocus },
+    { id: 'graph-view', label: 'Open project graph', icon: Network, action: () => setGraphView(true) },
+    { id: 'graph-island', label: graphOpen ? 'Hide the graph island' : 'Show the graph island', icon: Network, action: () => setGraphOpen(value => !value) },
+    { id: 'journal', label: 'Open journal', icon: BookOpen, action: () => setJournalOpen(true) },
+    ...layouts.filter(item => item.islands).map(item => ({ id: 'layout-' + item.id, label: 'Layout: ' + item.label, icon: LayoutGrid, action: () => applyLayout(item.id) })),
     { id: 'new', label: 'New file', icon: FilePlus2, action: () => newFile() },
     ...(desktop || remote ? [{ id: 'new-folder', label: 'New folder', icon: FolderPlus, action: () => newFolder() }] : []),
     { id: 'save', label: 'Save active file', shortcut: mod + '+S', icon: Files, action: () => { void store(active).catch(notify) } },
@@ -850,18 +1022,11 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     { id: 'problems', label: 'Show compiler problems', icon: CircleAlert, action: () => showDrawer('problems') },
   ]
   const fileItems: PaletteItem[] = files.map(file => ({ id: file.path, label: file.name, detail: parentPath(file.path), path: file.path, action: () => { void openFile(file.path) } }))
-  const rail = ([
-    { key: 'explorer', label: 'Explorer', glyph: Files },
-    { key: 'search', label: 'Search', glyph: Search },
-    ...(!remote ? [{ key: 'git', label: 'Source Control', glyph: GitBranch }, { key: 'packages', label: 'Packages', glyph: Package }] : []),
-    { key: 'remote', label: 'Servers', glyph: Server },
-  ]) as { key: Side; label: string; glyph: typeof Files }[]
   const drawerTabs = [
     { key: 'terminal', label: 'Terminal', glyph: TerminalSquare },
     { key: 'output', label: 'Output', glyph: CodeXml },
     { key: 'problems', label: 'Problems', glyph: CircleAlert },
   ] as const
-  const breadcrumb = active?.path.split('/') ?? []
   const remoteActions = {
     onTerminal: (target: SshHost) => { setDrawer('terminal'); setDrawerOpen(true); newSession(target) },
     onOpenFolder: (target: SshHost) => setRemoteHost(target),
@@ -870,48 +1035,99 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     onTest: (target: SshHost) => { notify('Connecting to ' + target.name + '…'); void ssh.test(target.id).then(result => notify('Connected: ' + result)).catch(notify) },
   }
 
-  return <div className="app">
+  const sideItems = ([
+    { key: 'explorer', label: 'Files' },
+    { key: 'search', label: 'Search' },
+    ...(!remote ? [{ key: 'git', label: 'Git' }, { key: 'packages', label: 'Packages' }] : []),
+    { key: 'remote', label: 'Servers' },
+  ]) as { key: Side; label: string }[]
+  const editorProps = active ? {
+    path: active.path, text: active.contents, memory: active.memory, diff: active.diff, initialLine: active.line,
+    options: focusMode ? { ...editorOptions, lineNumbers: false, highlightLine: true } : editorOptions, diagnostics, handle: selectEditor, onCursor: setCursor,
+    onBlur: () => { if (settings.autoSave === 'blur') void store(latest.current.tabs.find(tab => tab.id === active.id)).catch(notify) },
+    onEdit: (contents: string) => edited(active, contents),
+  } : null
+  // On narrow windows the graph island steps aside on its own; the setting is kept for when there is room again.
+  const showGraph = graphOpen && frame.width >= 1080
+  const columns = [sidebar ? workspaceWidth + 'px' : '', 'minmax(0, 1fr)', showGraph ? '272px' : ''].filter(Boolean).join(' ')
+  const rows = drawerOpen ? 'minmax(0, 1fr) ' + actualDrawerHeight + 'px' : 'minmax(0, 1fr)'
+  const marks = active ? edits[active.path] ?? [] : []
+  const tabSlider = useSlider(selected + tabs.length + sidebar + graphOpen + focusMode)
+  const drawerSlider = useSlider(drawer + drawerOpen + sidebar)
+  const projectEntries = journalEntries.filter(entry => entry.root === workspace.root).slice(-3).reverse()
+  const otherTab = tabs.find(tab => tab.id !== selected && !tab.diff)
+  const excerpt = (text: string, count: number) => <pre>{text.split('\n').slice(0, count).join('\n')}</pre>
+  const cards: OverviewCard[] = [
+    { key: 'editor', title: active ? 'Editor · ' + fileName(active.path) : 'Editor', note: 'active', wide: true, current: true, body: active ? excerpt(active.diff ? active.diff.after : active.contents, 7) : <span>No file open</span> },
+    ...(otherTab ? [{ key: 'tab:' + otherTab.id, title: 'Editor · ' + fileName(otherTab.path), body: excerpt(otherTab.contents, 4) }] : []),
+    { key: 'explorer', title: 'Files', hidden: sidebar !== 'explorer', body: <span className="ov-list">{(directories[''] ?? []).slice(0, 5).map(entry => <span key={entry.path}>{entry.name}{entry.directory ? '/' : ''}</span>)}</span> },
+    { key: 'terminal', title: 'Terminal', hidden: !drawerOpen, body: excerpt(output.map(entry => entry.text).join('\n').split('\n').filter(Boolean).slice(-4).join('\n') || (sessions.length ? sessions.length + (sessions.length === 1 ? ' session open' : ' sessions open') : 'No output yet'), 4) },
+    { key: 'graph', title: 'Graph', hidden: !graphOpen, body: <span className="ov-dots" aria-hidden="true"><i /><i /><i /><i /><i /></span> },
+    { key: 'journal', title: 'Journal', body: <span className="ov-list">{projectEntries.length ? projectEntries.map(entry => <span key={entry.id}>{clock(entry.time)} {entry.text}</span>) : <span>Nothing noted yet</span>}</span> },
+    remote
+      ? { key: 'remote', title: 'Servers', hidden: sidebar !== 'remote', body: <span className="ov-list"><span>{workspace.hostName}</span><span>{workspace.root}</span></span> }
+      : { key: 'git', title: 'Git', hidden: sidebar !== 'git', body: <span className="ov-list"><span>{status.changes.length} {status.changes.length === 1 ? 'change' : 'changes'} on {status.branch ?? 'no branch'}</span>{sidebar !== 'git' && <span>Click to show</span>}</span> },
+  ]
+  const runButton = runnable && active && <button type="button" className="run" title={'Run ' + (remote ? 'on ' + workspace.hostName + ' ' : '') + '(' + mod + '+Enter). Right-click for arguments.'} disabled={Boolean(job) || runningRequest || !jobReady}
+    onClick={() => { void run() }} onContextMenu={event => { event.preventDefault(); askArguments() }}>{job?.kind === 'run' ? 'Running…' : 'Run'}</button>
+
+  return <div className={'app bench-app' + (focusMode ? ' is-focus' : '')}>
     <TitleBar onError={notify} onClose={desktop ? () => { void getCurrentWindow().close().catch(notify) } : undefined}
-      left={<>
-        <button className="brand" onClick={goHome} title={'Home (' + mod + '+Shift+H)'}>
-          <img src={mark} alt="" /><span className="brand-word">Still</span>
-        </button>
-        <span className="chrome-divider" />
-        <button className="chrome-project" onClick={event => {
-          const box = event.currentTarget.getBoundingClientRect()
-          setMenu({ x: box.left, y: box.bottom + 4, items: [
-            { label: 'Go to Home', icon: House, shortcut: mod + '+Shift+H', action: goHome },
-            { label: 'Open another folder…', icon: FolderOpen, shortcut: mod + '+O', action: chooseFolder },
-            ...(desktop && !remote ? [{ label: 'Reveal in file manager', icon: FolderSearch, action: () => { void home.reveal(workspace.root).catch(notify) } }] : []),
-            { label: 'Copy path', icon: Copy, action: () => copyText(workspace.root) },
-          ] })
-        }} title={remote ? workspace.hostName + ':' + workspace.root : workspace.root}>
-          {remote && <Icon glyph={Server} size={12} />}{workspace.name}
-        </button>
-      </>}
-      center={<button className="jump" aria-label="Open command palette" onClick={() => openPalette('')}>
-        <Icon glyph={Search} size={13} /><span>Jump to file or command…</span><kbd>{mod}+K</kbd>
-      </button>}
-      right={<>
-        <IconButton glyph={PanelLeft} label={'Toggle sidebar (' + mod + '+B)'} onClick={() => setSidebar(value => value ? null : lastSide)} />
-        <IconButton glyph={PanelBottom} label={'Toggle bottom drawer (' + mod + '+J)'} onClick={() => drawerOpen ? setDrawerOpen(false) : showDrawer(drawer)} />
-        <IconButton glyph={theme.kind === 'dark' ? Sun : Moon} label="Toggle light and dark" onClick={onToggleTheme} />
-        <IconButton glyph={Settings2} label={'Settings (' + mod + '+,)'} onClick={() => onSettings()} />
-      </>} />
-
-    <div className="workspace">
-      <nav className="rail" aria-label="Workspace views">
-        {rail.map(({ key, label, glyph }) => <button key={key} className={sidebar === key ? 'is-active' : ''} title={label} aria-label={label} aria-pressed={sidebar === key} onClick={() => showSide(key, true)}>
-          <Icon glyph={glyph} size={16} />
-          {key === 'git' && status.changes.length > 0 && <span className="rail-count">{Math.min(status.changes.length, 99)}</span>}
+      left={focusMode
+        ? <span className="focus-path">{workspace.name}{active && active.path.split('/').map((part, index, all) => <span key={index}><i>/</i>{index === all.length - 1 ? <b>{part}</b> : part}</span>)}</span>
+        : <>
+          <button className="brand" onClick={goHome} title={'Home (' + mod + '+Shift+H)'}><span className="brand-word">Still</span></button>
+          <span className="chrome-slash">/</span>
+          <button className="chrome-project" onClick={event => {
+            const box = event.currentTarget.getBoundingClientRect()
+            setMenu({ x: box.left, y: box.bottom + 4, items: [
+              { label: 'Go to Home', icon: House, shortcut: mod + '+Shift+H', action: goHome },
+              { label: 'Open another folder…', icon: FolderOpen, shortcut: mod + '+O', action: chooseFolder },
+              ...(desktop && !remote ? [{ label: 'Reveal in file manager', icon: FolderSearch, action: () => { void home.reveal(workspace.root).catch(notify) } }] : []),
+              { label: 'Copy path', icon: Copy, action: () => copyText(workspace.root) },
+              'separator',
+              { label: 'Journal', icon: BookOpen, action: () => setJournalOpen(true) },
+            ] })
+          }} title={remote ? workspace.hostName + ':' + workspace.root : workspace.root}>
+            {remote && <Icon glyph={Server} size={12} />}{workspace.name}
+          </button>
+        </>}
+      center={focusMode ? undefined : <nav className="islands-nav" aria-label="Show or hide islands">
+        {sideItems.map(item => <button key={item.key} aria-pressed={sidebar === item.key} className={sidebar === item.key ? 'is-on' : ''} onClick={() => showSide(item.key, true)}>
+          {item.label}{item.key === 'git' && status.changes.length > 0 && <span className="nav-count">{Math.min(status.changes.length, 99)}</span>}
         </button>)}
-        <div className="flex-1" />
-        <button className={drawerOpen && drawer === 'terminal' ? 'is-active' : ''} aria-label="Toggle terminal" title="Toggle terminal"
-          onClick={() => drawerOpen && drawer === 'terminal' ? setDrawerOpen(false) : showDrawer('terminal', true)}><Icon glyph={TerminalSquare} size={16} /></button>
-        <button aria-label="Settings" title="Settings" onClick={() => onSettings()}><Icon glyph={Settings2} size={16} /></button>
-      </nav>
+        <span className="nav-rule" />
+        <button aria-pressed={graphOpen} className={graphOpen ? 'is-on' : ''} onClick={() => setGraphOpen(value => !value)}>Graph</button>
+        <button aria-pressed={drawerOpen} className={drawerOpen ? 'is-on' : ''} onClick={() => drawerOpen && drawer === 'terminal' ? setDrawerOpen(false) : showDrawer('terminal', true)}>Terminal</button>
+        <span className="nav-rule" />
+        <button onClick={toggleFocus} title={'Focus mode (' + mod + '+.)'}>Focus</button>
+        <button onClick={openOverview} title={'Overview (' + mod + '+↑)'}>Overview</button>
+      </nav>}
+      right={focusMode
+        ? <button className="quiet-link" onClick={() => setFocusMode(false)}>Esc to show everything</button>
+        : <>
+          <button className="chrome-jump" onClick={() => openPalette('')} title="Find a file or run a command"><span>Go to</span><kbd>{mod}+K</kbd></button>
+          <IconButton glyph={theme.kind === 'dark' ? Sun : Moon} label="Toggle light and dark" onClick={onToggleTheme} />
+          <IconButton glyph={Settings2} label={'Settings (' + mod + '+,)'} onClick={() => onSettings()} />
+          {remote ? <span className="chrome-branch"><Icon glyph={Server} size={12} />{workspace.hostName}</span>
+            : <button className="chrome-branch" onClick={event => { void branchMenu(event) }} title="Switch branch">{status.branch ?? 'No branch'}</button>}
+          {runButton}
+        </>} />
 
-      {sidebar && <aside className="side" style={{ width: workspaceWidth }} aria-label={rail.find(item => item.key === sidebar)?.label + ' panel'}>
+    {focusMode && active && <div className="focus-ghost" aria-hidden="true">{fileName(active.path)}</div>}
+    {focusMode && active && !active.diff && <aside className="focus-edits" aria-label="Edits this session">
+      <span>Edits</span>
+      <div className="focus-track">
+        {marks.map((mark, index) => {
+          const first = marks[0].time, span = Math.max(60000, Date.now() - first)
+          return <button key={index} className={index === marks.length - 1 ? 'is-last' : ''} style={{ top: ((mark.time - first) / span) * 100 + '%' }}
+            title={clock(mark.time) + ' · line ' + mark.line} aria-label={'Edit at ' + clock(mark.time) + ', line ' + mark.line} onClick={() => editor.current?.jump(mark.line)} />
+        })}
+      </div>
+    </aside>}
+
+    <div className="bench" style={{ gridTemplateColumns: focusMode ? undefined : columns, gridTemplateRows: focusMode ? undefined : rows }}>
+      {sidebar && <aside className={'island side' + (drawerOpen ? ' tall' : '')} key={'side-' + sidebar} aria-label={sideItems.find(item => item.key === sidebar)?.label + ' island'}>
         {sidebar === 'explorer' && <Explorer workspace={workspace} directories={directories} expanded={expanded} active={active?.path} changes={status} symbols={symbols}
           onOpen={path => { void openFile(path) }} onExpand={toggleFolder} onNew={() => newFile()} onNewFolder={() => newFolder()} onWorkspace={chooseFolder}
           onRefresh={() => { void refreshFiles() }} onJump={line => editor.current?.jump(line)} onContext={explorerMenu} onKey={explorerKey} />}
@@ -924,13 +1140,13 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
           onSearch={api.search} onAction={packageAction} onRefresh={() => { void refreshPackages() }} />}
         {sidebar === 'remote' && <RemotePanel overview={servers} onRefresh={() => { void refreshServers() }} {...remoteActions}
           onMenu={(event, items) => setMenu({ x: event.clientX, y: event.clientY, items })} />}
-        <SplitGrip vertical value={workspaceWidth} min={160} max={sideMax} change={setSideWidth} />
+        <SplitGrip vertical value={workspaceWidth} min={180} max={sideMax} change={setSideWidth} />
       </aside>}
 
-      <main className="main">
+      <main className="island main">
         <div className="tab-strip">
-          <div className="tab-scroll" role="tablist" aria-label="Open files">
-            {tabs.map((tab, index) => <div key={tab.id} className={'tab' + (tab.id === selected ? ' is-active' : '')}
+          <div className="tab-scroll" role="tablist" aria-label="Open files" ref={tabSlider.ref}>
+            {tabs.map((tab, index) => <div key={tab.id} className={'tab' + (tab.id === selected ? ' is-active' : '')} data-slide={tab.id === selected ? '' : undefined}
               onAuxClick={event => { if (event.button === 1) closeTab(tab) }}
               onContextMenu={event => { event.preventDefault(); setMenu({ x: event.clientX, y: event.clientY, items: [
                 { label: 'Close', icon: X, shortcut: mod + '+W', action: () => closeTab(tab) },
@@ -948,26 +1164,18 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
                   const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (index + (event.key === 'ArrowLeft' ? tabs.length - 1 : 1)) % tabs.length
                   activate(tabs[next].id)
                 }}>
-                {tab.diff ? <Icon glyph={GitCompareArrows} /> : <FileIcon path={tab.path} />}
-                <span>{fileName(tab.path)}{tab.diff && (tab.staged ? ' · Staged' : ' · Diff')}</span>
+                {tab.diff && <Icon glyph={GitCompareArrows} size={13} />}
+                <span>{fileName(tab.path)}{tab.diff && (tab.staged ? ' · staged' : ' · diff')}</span>
               </button>
-              <IconButton glyph={dirty(tab) ? Circle : X} className={'tab-close' + (dirty(tab) ? ' dirty' : '')} label={'Close ' + fileName(tab.path)} size={dirty(tab) ? 9 : 12} onClick={() => closeTab(tab)} />
+              <IconButton glyph={dirty(tab) ? Circle : X} className={'tab-close' + (dirty(tab) ? ' dirty' : '')} label={(dirty(tab) ? 'Unsaved. Close ' : 'Close ') + fileName(tab.path)} size={dirty(tab) ? 7 : 12} onClick={() => closeTab(tab)} />
             </div>)}
+            {tabSlider.bar}
+            <IconButton glyph={Plus} className="tab-add" label="Find and open a file" onClick={() => openPalette('')} />
           </div>
-          <IconButton glyph={Plus} className="tab-add" label="Find and open a file" onClick={() => openPalette('')} />
-        </div>
-
-        {active && <div className="crumbs">
-          <span className="inline-flex min-w-0 items-center gap-1.5 truncate">
-            {remote && <><span className="crumb-host"><Icon glyph={Server} size={12} />{workspace.hostName}</span><Icon glyph={ChevronRight} size={12} /></>}
-            {breadcrumb.map((part, index) => index === breadcrumb.length - 1
-              ? <span key={index} className="crumb-current flex items-center gap-1.5 truncate"><FileIcon path={active.path} size={13} />{part}</span>
-              : <span key={index} className="inline-flex items-center gap-1.5"><button onClick={() => { showSide('explorer'); expandParents(active.path) }}>{part}</button><Icon glyph={ChevronRight} size={12} /></span>)}
-            {currentSymbol && <><Icon glyph={ChevronRight} size={12} /><button className="crumb-symbol inline-flex items-center gap-1" onClick={() => editor.current?.jump(currentSymbol.line)}>
-              <Icon glyph={currentSymbol.kind === 'class' ? Braces : CodeXml} size={12} />{currentSymbol.name}</button></>}
-            {active.diff && <><Icon glyph={ChevronRight} size={12} /><span>{active.staged ? 'Staged' : 'Working tree'}</span></>}
-          </span>
-          <div className="ml-auto flex shrink-0 items-center gap-1">
+          {active && <div className="tab-tools">
+            {remote && <span className="crumb-host" title={workspace.hostName + ':' + workspace.root + '/' + active.path}><Icon glyph={Server} size={12} />{workspace.hostName}</span>}
+            {currentSymbol && !active.diff && <button className="crumb-symbol" onClick={() => editor.current?.jump(currentSymbol.line)} title="Jump to the start of this symbol">{currentSymbol.name}</button>}
+            {active.diff && <span className="crumb-symbol">{active.staged ? 'Staged changes' : 'Working tree'}</span>}
             {!active.diff && (cursor.selected ?? 0) > 0 && docView !== 'preview' && <IconButton glyph={Camera} label="Create image of selected code" onClick={captureCode} />}
             {doc && <div className="doc-switch" role="radiogroup" aria-label="Document view">
               <IconButton glyph={PenLine} label="Edit" role="radio" aria-checked={docView === 'edit'} className={docView === 'edit' ? 'is-on' : ''} onClick={() => setDocView('edit')} />
@@ -977,29 +1185,19 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
             {active.diff && <IconButton glyph={settings.diffLayout === 'split' ? Rows2 : Columns2} label={settings.diffLayout === 'split' ? 'Show inline diff' : 'Show side-by-side diff'}
               onClick={() => update({ diffLayout: settings.diffLayout === 'split' ? 'inline' : 'split' })} />}
             {runnable && runArgs[active.path] && <span className="run-args" title="Program arguments">{runArgs[active.path]}</span>}
-            {runnable && <button type="button" className="run" title={'Run ' + (remote ? 'on ' + workspace.hostName + ' ' : '') + '(' + mod + '+Enter)'} disabled={Boolean(job) || runningRequest || !jobReady}
-              onClick={() => { void run() }} onContextMenu={event => { event.preventDefault(); askArguments() }}>
-              <Icon glyph={Play} />Run</button>}
             {runnable && !remote && <IconButton glyph={Hammer} label={(mode === 'Java' ? 'Compile' : 'Check') + ' active file (' + mod + '+Shift+Enter)'} disabled={Boolean(job) || runningRequest || !jobReady} onClick={() => { void run(true) }} />}
             {active.diff && <IconButton glyph={Files} label="Open working file" onClick={() => { void openFile(active.path) }} />}
-          </div>
-        </div>}
+          </div>}
+        </div>
 
         <section className="editor-wrap" id="editor-panel" role="tabpanel" aria-labelledby={active ? 'file-tab-' + tabs.indexOf(active) : undefined}>
-          {active ? (doc && docView !== 'edit'
+          {active && editorProps ? (doc && docView !== 'edit'
             ? <div className={'doc-split' + (docView === 'preview' ? ' preview-only' : '')}>
-                {docView === 'split' && <div className="doc-pane"><Editor path={active.path} text={active.contents} memory={active.memory} diff={active.diff} initialLine={active.line}
-            options={editorOptions} diagnostics={diagnostics} handle={selectEditor} onCursor={setCursor}
-            onBlur={() => { if (settings.autoSave === 'blur') void store(latest.current.tabs.find(tab => tab.id === active.id)).catch(notify) }}
-            onEdit={contents => setTabs(previous => previous.map(tab => tab.id === active.id ? { ...tab, contents } : tab))} /></div>}
+                {docView === 'split' && <div className="doc-pane"><Editor {...editorProps} /></div>}
                 <div className="doc-pane doc-pane-preview"><Preview text={active.contents} kind={doc} onLink={openLink} /></div>
               </div>
-            : <Editor path={active.path} text={active.contents} memory={active.memory} diff={active.diff} initialLine={active.line}
-            options={editorOptions} diagnostics={diagnostics} handle={selectEditor} onCursor={setCursor}
-            onBlur={() => { if (settings.autoSave === 'blur') void store(latest.current.tabs.find(tab => tab.id === active.id)).catch(notify) }}
-            onEdit={contents => setTabs(previous => previous.map(tab => tab.id === active.id ? { ...tab, contents } : tab))} />) : <div className="empty-editor">
+            : <Editor {...editorProps} />) : <div className="empty-editor">
             <div className="empty-inner">
-              <img src={mark} alt="" />
               <p className="empty-title">{workspace.name}</p>
               <div className="empty-keys">
                 <button onClick={() => openPalette('')}><span>Find a file</span><kbd>{mod}+P</kbd></button>
@@ -1007,60 +1205,76 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
                 <button onClick={() => newFile()}><span>New file</span><kbd>…</kbd></button>
                 <button onClick={() => showSide('search')}><span>Find in files</span><kbd>{mod}+Shift+F</kbd></button>
                 <button onClick={() => showDrawer('terminal', true)}><span>Open terminal</span><kbd>{mod}+J</kbd></button>
+                <button onClick={openOverview}><span>Overview</span><kbd>{mod}+↑</kbd></button>
                 <button onClick={goHome}><span>Back to Home</span><kbd>{mod}+Shift+H</kbd></button>
               </div>
             </div>
           </div>}
         </section>
-
-        {(drawerOpen || sessions.length > 0) && <section className="drawer" style={{ height: actualDrawerHeight, display: drawerOpen ? undefined : 'none' }} aria-label="Bottom drawer">
-          <SplitGrip value={actualDrawerHeight} min={128} max={drawerMax} change={setDrawerHeight} />
-          <div className="drawer-nav">
-            <div className="drawer-tabs" role="tablist" aria-label="Console views">
-              {drawerTabs.map(({ key, label, glyph }) => <button key={key} type="button" role="tab" aria-selected={drawer === key}
-                className={'drawer-tab' + (drawer === key ? ' is-active' : '')} onClick={() => showDrawer(key, true)}>
-                <Icon glyph={glyph} size={14} />{label}{key === 'problems' && diagnostics.length > 0 && <span className="help">{diagnostics.length}</span>}
-              </button>)}
-            </div>
-            {drawer === 'terminal' && sessions.length > 0 && <div className="session-tabs" role="tablist" aria-label="Terminal sessions">
-              {sessions.map(session => <div key={session.id} className={'session' + (session.id === activeSession ? ' is-active' : '') + (session.exited ? ' exited' : '')}>
-                <button role="tab" aria-selected={session.id === activeSession} onClick={() => { setActiveSession(session.id); requestAnimationFrame(() => terminal.current?.focus()) }}>
-                  <Icon glyph={session.ssh ? Server : SquareTerminal} size={12} />{session.label}
-                </button>
-                <IconButton glyph={X} size={11} label={'Close ' + session.label} className="small" onClick={() => closeSession(session.id)} />
-              </div>)}
-            </div>}
-            <div className="drawer-actions">
-              {drawer === 'terminal' && desktop && <IconButton glyph={Plus} label={'New terminal (' + mod + '+Shift+`)'} onClick={() => remote ? remoteSession() : newSession()} />}
-              {job && <IconButton glyph={Square} label="Stop process" onClick={() => { void invoke('stop_job', { id: job.id }).catch(notify) }} />}
-              {drawer !== 'problems' && <IconButton glyph={Trash2} label={drawer === 'terminal' ? 'Clear terminal' : 'Clear output'} onClick={() => {
-                if (drawer === 'terminal') terminal.current?.clear()
-                else { setOutput([]); setSampleRun(false) }
-              }} />}
-              <IconButton glyph={actualDrawerHeight > frame.height * .45 ? ArrowDown : ArrowUp} label={actualDrawerHeight > frame.height * .45 ? 'Restore drawer height' : 'Expand drawer'} onClick={() => setDrawerHeight(actualDrawerHeight > frame.height * .45 ? 242 : drawerMax)} />
-              <IconButton glyph={X} label="Close drawer" onClick={() => { setDrawerOpen(false); editor.current?.focus() }} />
-            </div>
-          </div>
-          <div className="drawer-body">
-            {desktop && sessions.map(session => <Terminal key={session.id} session={session} root={remote ? null : workspace.root} visible={drawerOpen && drawer === 'terminal' && session.id === activeSession}
-              theme={theme} fontSize={settings.terminalFontSize} fontFamily={settings.editorFont} cursor={settings.terminalCursor} shell={settings.terminalShell}
-              onReady={value => { if (session.id === activeSession || !terminal.current) terminal.current = value }}
-              onExit={id => setSessions(previous => previous.map(item => item.id === id ? { ...item, exited: true } : item))} />)}
-            {desktop && drawer === 'terminal' && !sessions.length && <div className="console-scroll"><button className="text-btn" onClick={() => remote ? remoteSession() : newSession()}><Icon glyph={Plus} size={13} />New terminal</button></div>}
-            {!desktop && drawer === 'terminal' && <div className="console-scroll"><div className="console-banner"><Icon glyph={TerminalSquare} />The local shell is available in the Still desktop app.</div></div>}
-            {drawer === 'output' && <Output entries={output} sample={sampleRun}
-              onInput={job?.kind === 'run' ? text => { void invoke('job_input', { id: job.id, text }).catch(notify) } : undefined} />}
-            {drawer === 'problems' && <Problems items={diagnostics} jump={jumpTo} />}
-          </div>
-        </section>}
       </main>
+
+      {showGraph && <aside className="island graph-island" aria-label="Graph island">
+        <MiniGraph graph={graph} active={active && !active.diff ? active.path : undefined} onOpen={path => { void openFile(path) }} onExpand={() => setGraphView(true)} />
+      </aside>}
+
+      {(drawerOpen || sessions.length > 0) && <section className="island drawer" style={{ display: drawerOpen ? undefined : 'none', gridColumn: sidebar ? '2 / -1' : '1 / -1' }} aria-label="Terminal island">
+        <SplitGrip value={actualDrawerHeight} min={128} max={drawerMax} change={setDrawerHeight} />
+        <div className="drawer-nav">
+          <div className="drawer-tabs" role="tablist" aria-label="Console views" ref={drawerSlider.ref}>
+            {drawerTabs.map(({ key, label }) => <button key={key} type="button" role="tab" aria-selected={drawer === key} data-slide={drawer === key ? '' : undefined}
+              className={'drawer-tab' + (drawer === key ? ' is-active' : '')} onClick={() => showDrawer(key, true)}>
+              {label}{key === 'problems' && diagnostics.length > 0 && <span className="nav-count">{diagnostics.length}</span>}
+            </button>)}
+            {drawerSlider.bar}
+          </div>
+          {drawer === 'terminal' && sessions.length > 0 && <div className="session-tabs" role="tablist" aria-label="Terminal sessions">
+            {sessions.map(session => <div key={session.id} className={'session' + (session.id === activeSession ? ' is-active' : '') + (session.exited ? ' exited' : '')}>
+              <button role="tab" aria-selected={session.id === activeSession} onClick={() => { setActiveSession(session.id); requestAnimationFrame(() => terminal.current?.focus()) }}>
+                {session.ssh && <Icon glyph={Server} size={11} />}{session.label}
+              </button>
+              <IconButton glyph={X} size={11} label={'Close ' + session.label} className="small" onClick={() => closeSession(session.id)} />
+            </div>)}
+          </div>}
+          <div className="drawer-actions">
+            {drawer === 'terminal' && desktop && <IconButton glyph={Plus} label={'New terminal (' + mod + '+Shift+`)'} onClick={() => remote ? remoteSession() : newSession()} />}
+            {job && <IconButton glyph={Square} label="Stop process" onClick={() => { void invoke('stop_job', { id: job.id }).catch(notify) }} />}
+            {drawer !== 'problems' && <IconButton glyph={Trash2} label={drawer === 'terminal' ? 'Clear terminal' : 'Clear output'} onClick={() => {
+              if (drawer === 'terminal') terminal.current?.clear()
+              else { setOutput([]); setSampleRun(false) }
+            }} />}
+            <IconButton glyph={actualDrawerHeight > frame.height * .45 ? ArrowDown : ArrowUp} label={actualDrawerHeight > frame.height * .45 ? 'Restore height' : 'Make taller'} onClick={() => setDrawerHeight(actualDrawerHeight > frame.height * .45 ? 242 : drawerMax)} />
+            <IconButton glyph={X} label={'Hide (' + mod + '+J)'} onClick={() => { setDrawerOpen(false); editor.current?.focus() }} />
+          </div>
+        </div>
+        <div className="drawer-body">
+          {desktop && sessions.map(session => <Terminal key={session.id} session={session} root={remote ? null : workspace.root} visible={drawerOpen && drawer === 'terminal' && session.id === activeSession}
+            theme={theme} fontSize={settings.terminalFontSize} fontFamily={settings.editorFont} cursor={settings.terminalCursor} shell={settings.terminalShell}
+            onReady={value => { if (session.id === activeSession || !terminal.current) terminal.current = value }}
+            onExit={id => setSessions(previous => previous.map(item => item.id === id ? { ...item, exited: true } : item))} />)}
+          {desktop && drawer === 'terminal' && !sessions.length && <div className="console-scroll"><button className="text-btn" onClick={() => remote ? remoteSession() : newSession()}><Icon glyph={Plus} size={13} />New terminal</button></div>}
+          {!desktop && drawer === 'terminal' && <div className="console-scroll"><div className="console-banner"><Icon glyph={TerminalSquare} />The local shell is available in the Still desktop app.</div></div>}
+          {drawer === 'output' && <Output entries={output} sample={sampleRun}
+            onInput={job?.kind === 'run' ? text => { void invoke('job_input', { id: job.id, text }).catch(notify) } : undefined} />}
+          {drawer === 'problems' && <Problems items={diagnostics} jump={jumpTo} />}
+        </div>
+      </section>}
     </div>
 
-    <footer className="status" aria-label="Workspace status">
-      {remote ? <button className="status-item status-branch" onClick={() => showSide('remote')} title="Connected over SSH"><Icon glyph={Server} size={12} />{workspace.hostName}</button>
-        : <button className="status-item status-branch" onClick={() => showSide('git')} title="Show source control"><Icon glyph={GitBranch} size={13} />{status.branch ?? 'No branch'}</button>}
+    {focusMode ? <footer className="status focus-foot" aria-label="Focus status">
+      <span className="status-item">{active ? 'Ln ' + cursor.line + ', Col ' + cursor.column : workspace.name}</span>
+      <span className="flex-1" />
+      <button className="status-item" onClick={() => { setFocusMode(false); showSide('explorer') }}>Files</button>
+      <button className="status-item" onClick={() => { setFocusMode(false); showSide('search') }}>Search</button>
+      {!remote && <button className="status-item" onClick={() => { setFocusMode(false); showSide('git') }}>Git {status.changes.length > 0 && <span className="muted">{status.changes.length}</span>}</button>}
+      <button className="status-item" onClick={() => { setFocusMode(false); showDrawer('terminal', true) }}>Terminal</button>
+      {runButton}
+      <span className="flex-1" />
+      <span className="status-item">{lastRun ? 'Last run ' + clock(lastRun.time) + ' · ' + (lastRun.code === null ? 'stopped' : 'exit ' + lastRun.code) : ''}</span>
+    </footer> : <footer className="status" aria-label="Workspace status">
+      {remote ? <button className="status-item" onClick={() => showSide('remote')} title="Connected over SSH">{host ? (host.user ? host.user + '@' : '') + (host.address || host.host) : workspace.hostName}</button>
+        : <button className="status-item" onClick={() => showSide('git')} title="Show source control">{status.branch ?? 'No branch'}{status.changes.length > 0 && <span className="status-amber"> · {status.changes.length} changed</span>}</button>}
       <button className="status-item" onClick={() => showDrawer('problems')} aria-label={problemCount + ' errors and ' + warningCount + ' warnings'}>
-        <Icon glyph={CircleAlert} size={12} />{problemCount}<span className="ml-0.5" aria-hidden="true">/</span>{warningCount}
+        {problemCount} {problemCount === 1 ? 'error' : 'errors'} · {warningCount} {warningCount === 1 ? 'warning' : 'warnings'}
       </button>
       {job && <button className="status-item" onClick={() => showDrawer('output')}><span className="status-dot busy" />{job.kind === 'run' ? 'Running' : job.kind === 'git' ? 'Git ' + job.action : 'Packages'}…</button>}
       {settings.autoSave !== 'off' && <span className="status-item status-optional" title="Auto save is on">Auto save</span>}
@@ -1071,12 +1285,22 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       {!remote && <button className="status-item" title="Show runtimes and packages" onClick={() => showSide('packages')}>
         <span className={'status-dot' + (!runtime ? ' inactive' : '')} />{!desktop ? 'Browser preview' : runtime ? runtime + (mode === 'Python' && (runtimes?.pythonVenv || isVirtual(packageState)) ? ' · .venv' : '') : runtimes ? runtimeMissing : 'Detecting runtimes…'}
       </button>}
-      {remote && host && <span className="status-item">{host.user ? host.user + '@' : ''}{host.address || host.host}</span>}
-    </footer>
+    </footer>}
 
+    {overview && <Overview title={workspace.name} cards={cards} spaces={spaces} layouts={[...layouts, ...(savedLayout() ? [{ id: 'custom', label: 'Saved' }] : [])]} layout={currentLayout}
+      onJump={jumpIsland} onToggle={toggleIsland} onClose={() => { setOverview(false); requestAnimationFrame(() => editor.current?.focus()) }}
+      onSpace={id => { setOverview(false); if (id === 'home') goHome(); else leave(() => { void home.open(id).then(onSwitch).catch(notify) }, 'Switch project?') }}
+      onNewSpace={() => { setOverview(false); chooseFolder() }}
+      onLayout={id => applyLayout(id)}
+      onSaveLayout={() => { try { localStorage.setItem('still.layout.custom', JSON.stringify(islands)) } catch { /* ignore */ } notify('Saved this layout. Pick it under Layouts as Saved.') }} />}
+    {graphView && <GraphView graph={graph} error={graphError} project={workspace.name} active={active && !active.diff ? active.path : undefined} changed={changedPaths}
+      onOpen={path => { setGraphView(false); void openFile(path) }} onClose={() => { setGraphView(false); requestAnimationFrame(() => editor.current?.focus()) }} />}
+    {idle && <Idle sources={tabs.filter(tab => !tab.diff).map(tab => ({ path: tab.path, project: workspace.name, text: tab.contents, edited: edits[tab.path]?.at(-1)?.time }))} onWake={wake} />}
     {palette !== null && <Palette commands={commands} files={fileItems} start={palette} onClose={closePalette} />}
     {dialog && <Dialog dialog={dialog} close={() => setDialog(null)} />}
     {menu && <Menu {...menu} onClose={() => setMenu(null)} />}
+    {journalOpen && <JournalSheet root={workspace.root} onClose={() => setJournalOpen(false)}
+      onOpen={entry => { if (entry.root === workspace.root && entry.path) { setJournalOpen(false); void openFile(entry.path) } }} />}
     {shot && <CodeShot capture={shot} onClose={() => { setShot(null); editor.current?.focus() }} notify={notify} />}
     {editingHost && <HostDialog host={editingHost} onClose={() => setEditingHost(null)} onSaved={() => { void refreshServers() }} />}
     {remoteHost && <OpenRemoteDialog host={remoteHost} onClose={() => setRemoteHost(null)} onOpen={async path => {
