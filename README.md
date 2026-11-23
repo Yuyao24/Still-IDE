@@ -20,6 +20,14 @@ SQL, YAML, TOML, XML, shell, PowerShell, Dockerfiles and more. Multiple tabs,
 outline, breadcrumbs, find and replace, bracket matching, autocomplete, auto
 save, and inline or side-by-side diffs.
 
+**Markdown and text.** `.md`, `.txt` and `.text` files have Edit, Split and
+Preview views (Ctrl/Cmd + Shift + V cycles them). The preview renders tables,
+task lists and code blocks, and opens web links in your browser.
+
+**Code images.** Select some code and click the camera button (or run "Create
+image of selected code" from the palette) to get a framed image in your theme's
+colours. Copy it or save it as a PNG.
+
 **Run.** Ctrl/Cmd + Enter runs the active file. Python uses the project's
 `.venv` (or `venv`, or `VIRTUAL_ENV`) and falls back to Python 3 on PATH. Java
 compiles with `javac -d bin` and shows compiler errors in the gutter and the
@@ -69,6 +77,7 @@ and ligatures are adjustable.
 | Ctrl/Cmd + Tab / Shift + Tab | Next / previous tab |
 | Ctrl/Cmd + Enter | Run the active file |
 | Ctrl/Cmd + Shift + Enter | Check or compile only |
+| Ctrl/Cmd + Shift + V | Markdown/text: edit, split, preview |
 | Ctrl/Cmd + F | Find in file |
 | Ctrl/Cmd + Shift + F | Find in all files |
 | Ctrl/Cmd + B | Toggle the sidebar |

@@ -7,6 +7,7 @@ import {
   ArrowDown, ArrowUp, Braces, Check, ChevronRight, Circle, CircleAlert, CodeXml, Columns2, Copy, FilePlus2, Files, FolderOpen, FolderPlus,
   FolderSearch, GitBranch, GitCompareArrows, GitPullRequestArrow, Hammer, House, Moon, Package, PanelBottom, PanelLeft, Pencil, Play, Plus,
   RefreshCw, Rows2, Search, Server, Settings2, Square, SquareTerminal, Sun, TerminalSquare, Trash2, WrapText, X,
+  Camera, Eye, PenLine,
 } from 'lucide-react'
 import {
   api, desktop, fileName, fileSystem, home, mod, parentPath, pickFolder, ssh,
@@ -14,7 +15,9 @@ import {
   type SshHost, type SshOverview, type Workspace,
 } from './bridge'
 import mark from './still.svg?inline'
-import Editor, { defaultIndent, language, type Cursor, type EditorHandle, type EditorMemory, type EditorOptions } from './Editor'
+import Editor, { defaultIndent, language, type CodeCapture, type Cursor, type EditorHandle, type EditorMemory, type EditorOptions } from './Editor'
+import CodeShot from './CodeShot'
+import { Preview, docKind } from './Preview'
 import type { OpenOptions } from './Home'
 import { Explorer, PackagesPanel, Palette, SourceControl, isVirtual, symbolsFor, type PaletteItem } from './Panels'
 import { HostDialog, OpenRemoteDialog, RemotePanel, blankHost } from './Remote'
@@ -29,7 +32,8 @@ import { FileIcon, Icon, IconButton, Menu, type MenuEntry, type MenuState } from
 
 type Side = 'explorer' | 'search' | 'git' | 'packages' | 'remote'
 type Drawer = 'terminal' | 'output' | 'problems'
-type Tab = { id: string; path: string; contents: string; saved: string; memory?: EditorMemory; diff?: Diff; staged?: boolean; line?: number }
+type DocView = 'edit' | 'split' | 'preview'
+type Tab = { id: string; path: string; contents: string; saved: string; memory?: EditorMemory; diff?: Diff; staged?: boolean; line?: number; view?: DocView }
 type Job = { id: string; kind: 'run' | 'git' | 'packages'; action: string }
 
 const emptyStatus: GitStatus = { branch: null, changes: [] }
@@ -100,6 +104,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const [editingHost, setEditingHost] = useState<SshHost | null>(null)
   const [remoteHost, setRemoteHost] = useState<SshHost | null>(null)
   const [searchFocus, setSearchFocus] = useState(0)
+  const [shot, setShot] = useState<CodeCapture | null>(null)
   const generation = useRef(0)
   const editor = useRef<EditorHandle | null>(null)
   const terminal = useRef<Xterm | null>(null)
@@ -127,7 +132,9 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const drawerMax = Math.max(128, frame.height - 220)
   const actualDrawerHeight = Math.min(drawerHeight, drawerMax)
   const tabSize = settings.tabSize === 'auto' ? (active ? defaultIndent(active.path) : 4) : settings.tabSize
-  const editorOptions: EditorOptions = { wrap: settings.wordWrap, lineNumbers: settings.lineNumbers, highlightLine: settings.highlightLine, tabSize, layout: settings.diffLayout }
+  const doc = active && !active.diff ? docKind(active.path) : null
+  const docView: DocView = doc ? active?.view ?? 'edit' : 'edit'
+  const editorOptions: EditorOptions = { wrap: settings.wordWrap || Boolean(doc), lineNumbers: settings.lineNumbers, highlightLine: settings.highlightLine, tabSize, layout: settings.diffLayout }
   const host = remote ? [...(servers?.saved ?? []), ...(servers?.imported ?? [])].find(item => item.id === workspace.remote) : undefined
 
   const notify = useCallback((error: unknown) => toast(errorText(error)), [toast])
@@ -730,6 +737,39 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     })
   }
 
+  function setDocView(view: DocView) {
+    if (!active) return
+    const id = active.id
+    setTabs(previous => previous.map(tab => tab.id === id ? { ...tab, view } : tab))
+  }
+
+  function cycleDocView() {
+    if (!doc) return
+    setDocView(docView === 'edit' ? 'split' : docView === 'split' ? 'preview' : 'edit')
+  }
+
+  function captureCode() {
+    const captured = editor.current?.capture() ?? null
+    if (captured) setShot(captured)
+    else notify('Select some code first, then create the image.')
+  }
+
+  function openLink(href: string) {
+    if (/^(https?:|mailto:)/i.test(href)) {
+      if (desktop) void invoke('open_external', { url: href }).catch(notify)
+      else window.open(href, '_blank', 'noopener')
+      return
+    }
+    if (href.startsWith('#') || !active) return
+    // A link to another file in the project, relative to this file.
+    const parts = (parentPath(active.path) ? parentPath(active.path).split('/') : [])
+    for (const part of decodeURIComponent(href.split('#')[0]).split('/')) {
+      if (part === '..') parts.pop()
+      else if (part && part !== '.') parts.push(part)
+    }
+    if (parts.length) void openFile(parts.join('/'))
+  }
+
   function cycleTab(step: number) {
     const list = latest.current.tabs
     if (!list.length) return
@@ -742,13 +782,14 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       if (!(event.ctrlKey || event.metaKey) || dialog || menu) return
       if (document.querySelector('.settings-backdrop, .sheet')) return
       const key = event.key.toLowerCase()
-      const shiftOnly = event.shiftKey && ['f', 'h', 'e', 'g', '`', '~'].includes(key)
+      const shiftOnly = event.shiftKey && ['f', 'h', 'e', 'g', 'v', '`', '~'].includes(key)
       if (event.altKey || !(['k', 'p', 's', 'w', 'b', 'j', 'o', 'enter', 'tab', ','].includes(key) || shiftOnly)) return
       if (key === 'enter' && palette !== null) return
       event.preventDefault()
       if (key === 'p' || key === 'k') { palette !== null ? closePalette() : openPalette(event.shiftKey ? '>' : ''); return }
       if (palette !== null) return
       if (key === 'tab') { cycleTab(event.shiftKey ? -1 : 1); return }
+      if (key === 'v' && event.shiftKey) { cycleDocView(); return }
       if (key === 'f') showSide('search')
       if (key === 'e' && event.shiftKey) showSide('explorer')
       if (key === 'g' && event.shiftKey && !remote) showSide('git')
@@ -783,6 +824,8 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       { id: 'run-args', label: 'Run active file with arguments…', icon: Play, action: askArguments },
       ...(!remote ? [{ id: 'build', label: mode === 'Java' ? 'Compile active file' : 'Check active file', shortcut: mod + '+Shift+Enter', icon: Hammer, action: () => { void run(true) } }] : []),
     ] : []),
+    ...(doc ? [{ id: 'doc-preview', label: docView === 'preview' ? 'Edit ' + (doc === 'markdown' ? 'Markdown' : 'text') : 'Preview ' + (doc === 'markdown' ? 'Markdown' : 'text') + ' file', shortcut: mod + '+Shift+V', icon: Eye, action: cycleDocView }] : []),
+    ...(active && !active.diff && docView !== 'preview' ? [{ id: 'code-image', label: 'Create image of selected code', icon: Camera, action: captureCode }] : []),
     { id: 'close-saved', label: 'Close saved tabs', icon: X, action: () => closeTabs(latest.current.tabs.filter(tab => !dirty(tab))) },
     { id: 'settings', label: 'Open settings', shortcut: mod + '+,', icon: Settings2, action: () => onSettings() },
     { id: 'appearance', label: 'Customize theme…', icon: Settings2, action: () => onSettings('appearance') },
@@ -925,6 +968,12 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
             {active.diff && <><Icon glyph={ChevronRight} size={12} /><span>{active.staged ? 'Staged' : 'Working tree'}</span></>}
           </span>
           <div className="ml-auto flex shrink-0 items-center gap-1">
+            {!active.diff && (cursor.selected ?? 0) > 0 && docView !== 'preview' && <IconButton glyph={Camera} label="Create image of selected code" onClick={captureCode} />}
+            {doc && <div className="doc-switch" role="radiogroup" aria-label="Document view">
+              <IconButton glyph={PenLine} label="Edit" role="radio" aria-checked={docView === 'edit'} className={docView === 'edit' ? 'is-on' : ''} onClick={() => setDocView('edit')} />
+              <IconButton glyph={Columns2} label="Edit and preview side by side" role="radio" aria-checked={docView === 'split'} className={docView === 'split' ? 'is-on' : ''} onClick={() => setDocView('split')} />
+              <IconButton glyph={Eye} label={'Preview (' + mod + '+Shift+V)'} role="radio" aria-checked={docView === 'preview'} className={docView === 'preview' ? 'is-on' : ''} onClick={() => setDocView('preview')} />
+            </div>}
             {active.diff && <IconButton glyph={settings.diffLayout === 'split' ? Rows2 : Columns2} label={settings.diffLayout === 'split' ? 'Show inline diff' : 'Show side-by-side diff'}
               onClick={() => update({ diffLayout: settings.diffLayout === 'split' ? 'inline' : 'split' })} />}
             {runnable && runArgs[active.path] && <span className="run-args" title="Program arguments">{runArgs[active.path]}</span>}
@@ -937,10 +986,18 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
         </div>}
 
         <section className="editor-wrap" id="editor-panel" role="tabpanel" aria-labelledby={active ? 'file-tab-' + tabs.indexOf(active) : undefined}>
-          {active ? <Editor path={active.path} text={active.contents} memory={active.memory} diff={active.diff} initialLine={active.line}
+          {active ? (doc && docView !== 'edit'
+            ? <div className={'doc-split' + (docView === 'preview' ? ' preview-only' : '')}>
+                {docView === 'split' && <div className="doc-pane"><Editor path={active.path} text={active.contents} memory={active.memory} diff={active.diff} initialLine={active.line}
             options={editorOptions} diagnostics={diagnostics} handle={selectEditor} onCursor={setCursor}
             onBlur={() => { if (settings.autoSave === 'blur') void store(latest.current.tabs.find(tab => tab.id === active.id)).catch(notify) }}
-            onEdit={contents => setTabs(previous => previous.map(tab => tab.id === active.id ? { ...tab, contents } : tab))} /> : <div className="empty-editor">
+            onEdit={contents => setTabs(previous => previous.map(tab => tab.id === active.id ? { ...tab, contents } : tab))} /></div>}
+                <div className="doc-pane doc-pane-preview"><Preview text={active.contents} kind={doc} onLink={openLink} /></div>
+              </div>
+            : <Editor path={active.path} text={active.contents} memory={active.memory} diff={active.diff} initialLine={active.line}
+            options={editorOptions} diagnostics={diagnostics} handle={selectEditor} onCursor={setCursor}
+            onBlur={() => { if (settings.autoSave === 'blur') void store(latest.current.tabs.find(tab => tab.id === active.id)).catch(notify) }}
+            onEdit={contents => setTabs(previous => previous.map(tab => tab.id === active.id ? { ...tab, contents } : tab))} />) : <div className="empty-editor">
             <div className="empty-inner">
               <img src={mark} alt="" />
               <p className="empty-title">{workspace.name}</p>
@@ -1020,6 +1077,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     {palette !== null && <Palette commands={commands} files={fileItems} start={palette} onClose={closePalette} />}
     {dialog && <Dialog dialog={dialog} close={() => setDialog(null)} />}
     {menu && <Menu {...menu} onClose={() => setMenu(null)} />}
+    {shot && <CodeShot capture={shot} onClose={() => { setShot(null); editor.current?.focus() }} notify={notify} />}
     {editingHost && <HostDialog host={editingHost} onClose={() => setEditingHost(null)} onSaved={() => { void refreshServers() }} />}
     {remoteHost && <OpenRemoteDialog host={remoteHost} onClose={() => setRemoteHost(null)} onOpen={async path => {
       const root = await ssh.resolve(remoteHost.id, path)

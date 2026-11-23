@@ -458,3 +458,44 @@ pub fn app_paths(app: AppHandle, store: State<Store>) -> Result<serde_json::Valu
         "platform": std::env::consts::OS,
     }))
 }
+
+/// Open a web or mail link in the system's default app (used by Markdown previews).
+#[tauri::command]
+pub fn open_external(url: String) -> Result<()> {
+    let url = url.trim().to_owned();
+    if !(url.starts_with("https://") || url.starts_with("http://") || url.starts_with("mailto:")) || url.chars().any(char::is_control) {
+        return Err("Only web and mail links can be opened.".into());
+    }
+    let cwd = std::env::temp_dir();
+    let mut cmd = if cfg!(windows) {
+        // rundll32 opens the URL without going through a shell, so it can't be misread as a command.
+        let mut cmd = command("rundll32", &cwd);
+        cmd.args(["url.dll,FileProtocolHandler", &url]);
+        cmd
+    } else if cfg!(target_os = "macos") {
+        let mut cmd = command("open", &cwd);
+        cmd.arg(&url);
+        cmd
+    } else {
+        let mut cmd = command("xdg-open", &cwd);
+        cmd.arg(&url);
+        cmd
+    };
+    cmd.spawn().map_err(err)?;
+    Ok(())
+}
+
+/// Write a PNG produced in the app (code images) to a path the user picked in the save dialog.
+#[tauri::command]
+pub fn save_png(path: String, data: String) -> Result<()> {
+    use base64::Engine;
+    let path = PathBuf::from(path);
+    if !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("png")) {
+        return Err("Images are saved as .png files.".into());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data.trim_start_matches("data:image/png;base64,")).map_err(err)?;
+    if !bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        return Err("That image data is not a PNG.".into());
+    }
+    fs::write(path, bytes).map_err(err)
+}

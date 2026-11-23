@@ -436,3 +436,50 @@ select.field { padding-block: 5px; }
   .settings { grid-template-columns: 1fr; }
   .settings-nav { display: none; }
 }
+
+/* ---- Markdown and text preview ------------------------------------------- */
+.doc-switch { display: flex; gap: 1px; padding: 1px; border: 1px solid var(--line); border-radius: 6px; margin-right: 4px; }
+.doc-switch .icon-btn { width: 24px; height: 22px; }
+.doc-split { position: absolute; inset: 0; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+.doc-split.preview-only { grid-template-columns: minmax(0, 1fr); }
+.doc-pane { position: relative; min-width: 0; min-height: 0; }
+.doc-pane + .doc-pane { border-left: 1px solid var(--line); }
+.doc-preview { position: absolute; inset: 0; overflow: auto; padding: 44px 48px 64px; background: var(--editor); }
+.doc-body { max-width: 72ch; margin: 0 auto; color: var(--ink); font-size: 15px; line-height: 1.75; overflow-wrap: break-word; }
+.doc-text { white-space: pre-wrap; font-family: var(--font-sans); }
+.doc-count { max-width: 72ch; margin: 40px auto 0; padding-top: 12px; border-top: 1px solid var(--line); color: var(--muted); font-size: 11px; }
+.doc-markdown > :first-child { margin-top: 0; }
+.doc-markdown h1, .doc-markdown h2, .doc-markdown h3, .doc-markdown h4 { line-height: 1.25; letter-spacing: -0.015em; margin: 1.8em 0 0.6em; font-weight: 600; }
+.doc-markdown h1 { font-size: 30px; letter-spacing: -0.025em; }
+.doc-markdown h2 { font-size: 22px; padding-bottom: 6px; border-bottom: 1px solid var(--line); }
+.doc-markdown h3 { font-size: 17px; }
+.doc-markdown h4 { font-size: 15px; }
+.doc-markdown p, .doc-markdown ul, .doc-markdown ol, .doc-markdown blockquote, .doc-markdown pre, .doc-markdown table { margin: 0 0 1.1em; }
+.doc-markdown ul, .doc-markdown ol { padding-left: 1.4em; }
+.doc-markdown li + li { margin-top: 0.25em; }
+.doc-markdown li input[type="checkbox"] { margin: 0 0.5em 0 -1.3em; accent-color: var(--ink); }
+.doc-markdown ul:has(> li > input[type="checkbox"]) { list-style: none; }
+.doc-markdown a { color: var(--ink); text-decoration: underline; text-decoration-color: var(--muted); text-underline-offset: 3px; }
+.doc-markdown a:hover { text-decoration-color: var(--ink); }
+.doc-markdown blockquote { padding: 0 0 0 16px; border-left: 2px solid var(--line); color: var(--secondary); }
+.doc-markdown code { font-family: var(--font-mono); font-size: 0.86em; padding: 1px 5px; border-radius: 4px; background: var(--panel); border: 1px solid var(--line); }
+.doc-markdown pre { padding: 14px 16px; border-radius: 8px; background: var(--panel); border: 1px solid var(--line); overflow: auto; line-height: 1.6; }
+.doc-markdown pre code { padding: 0; border: 0; background: none; font-size: 13px; }
+.doc-markdown hr { border: 0; border-top: 1px solid var(--line); margin: 2em 0; }
+.doc-markdown table { border-collapse: collapse; display: block; overflow-x: auto; font-size: 13px; }
+.doc-markdown th, .doc-markdown td { padding: 7px 12px; border: 1px solid var(--line); text-align: left; }
+.doc-markdown th { background: var(--panel); font-weight: 600; }
+.doc-markdown img { max-width: 100%; }
+.doc-image { display: inline-block; padding: 4px 10px; border: 1px dashed var(--line); border-radius: 6px; color: var(--muted); font-size: 12px; }
+
+/* ---- Code image ----------------------------------------------------------- */
+.shot-sheet { width: min(1000px, calc(100% - 30px)); }
+.shot-body { display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 18px; }
+.shot-body .sheet-actions { grid-column: 1 / -1; }
+.shot-stage { display: grid; place-items: center; min-height: 320px; max-height: 62vh; overflow: auto; padding: 16px; border: 1px solid var(--line); border-radius: 8px; background-color: var(--editor); background-image: linear-gradient(45deg, var(--hover) 25%, transparent 25%, transparent 75%, var(--hover) 75%), linear-gradient(45deg, var(--hover) 25%, transparent 25%, transparent 75%, var(--hover) 75%); background-size: 16px 16px; background-position: 0 0, 8px 8px; }
+.shot-stage canvas { display: block; max-width: 100%; height: auto; }
+.shot-controls { display: flex; flex-direction: column; gap: 12px; }
+.shot-title { display: grid; gap: 5px; color: var(--muted); font-size: 11px; }
+.shot-row { display: flex; flex-direction: column; gap: 6px; color: var(--muted); font-size: 11px; }
+.shot-row .segmented { align-self: flex-start; flex-wrap: wrap; }
+@media (max-width: 760px) { .shot-body { grid-template-columns: 1fr; } }

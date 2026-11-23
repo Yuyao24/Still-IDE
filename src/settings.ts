@@ -38,7 +38,7 @@ export const defaults: Settings = {
   editorFont: '"JetBrains Mono Variable"',
   editorFontSize: 14,
   editorLineHeight: 1.6,
-  ligatures: true,
+  ligatures: false,
   tabSize: 'auto',
   wordWrap: true,
   lineNumbers: true,

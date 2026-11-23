@@ -34,6 +34,8 @@ fn main() {
             projects::clone_project,
             projects::reveal_path,
             projects::app_paths,
+            projects::open_external,
+            projects::save_png,
             workspace::workspace_info,
             workspace::list_directory,
             workspace::list_files,

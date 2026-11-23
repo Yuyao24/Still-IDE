@@ -4,12 +4,12 @@ import {
   EditorView, crosshairCursor, drawSelection, dropCursor, highlightActiveLine, highlightActiveLineGutter,
   highlightSpecialChars, keymap, lineNumbers, rectangularSelection,
 } from '@codemirror/view'
-import { HighlightStyle, StreamLanguage, bracketMatching, foldGutter, foldKeymap, indentOnInput, indentUnit, syntaxHighlighting } from '@codemirror/language'
+import { HighlightStyle, StreamLanguage, bracketMatching, ensureSyntaxTree, foldGutter, foldKeymap, indentOnInput, indentUnit, syntaxHighlighting, syntaxTree } from '@codemirror/language'
 import { highlightSelectionMatches, searchKeymap } from '@codemirror/search'
 import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap } from '@codemirror/autocomplete'
 import { lintGutter, lintKeymap, setDiagnostics, type Diagnostic as EditorDiagnostic } from '@codemirror/lint'
 import { MergeView, unifiedMergeView } from '@codemirror/merge'
-import { tags } from '@lezer/highlight'
+import { highlightTree, tagHighlighter, tags } from '@lezer/highlight'
 import { python } from '@codemirror/lang-python'
 import { java } from '@codemirror/lang-java'
 import { json } from '@codemirror/lang-json'
@@ -153,7 +153,56 @@ const onCursor = (view: EditorView) => {
 }
 
 export interface Cursor { line: number; column: number; selected?: number }
-export interface EditorHandle { focus: () => void; jump: (line: number, column?: number, length?: number) => void }
+export type TokenKind = 'keyword' | 'string' | 'number' | 'type' | 'function' | 'variable' | 'property' | 'comment' | 'tag' | 'attribute' | 'operator' | 'plain'
+export interface CodeToken { text: string; kind: TokenKind }
+export interface CodeCapture { path: string; startLine: number; lines: CodeToken[][] }
+
+// Same groups as the on-screen highlighter, but as names, so the code image can colour them itself.
+const tokenNames = tagHighlighter([
+  { tag: [tags.keyword, tags.operatorKeyword, tags.controlKeyword, tags.moduleKeyword, tags.definitionKeyword, tags.modifier, tags.self], class: 'keyword' },
+  { tag: [tags.string, tags.special(tags.string), tags.regexp, tags.character], class: 'string' },
+  { tag: [tags.number, tags.bool, tags.null, tags.atom, tags.constant(tags.variableName)], class: 'number' },
+  { tag: [tags.className, tags.typeName, tags.annotation, tags.meta, tags.processingInstruction, tags.namespace], class: 'type' },
+  { tag: [tags.function(tags.variableName), tags.function(tags.propertyName), tags.function(tags.definition(tags.variableName)), tags.macroName], class: 'function' },
+  { tag: [tags.variableName, tags.definition(tags.variableName)], class: 'variable' },
+  { tag: [tags.propertyName, tags.definition(tags.propertyName)], class: 'property' },
+  { tag: [tags.comment, tags.lineComment, tags.blockComment, tags.docComment], class: 'comment' },
+  { tag: [tags.tagName], class: 'tag' },
+  { tag: [tags.attributeName], class: 'attribute' },
+  { tag: [tags.operator, tags.punctuation, tags.separator, tags.bracket], class: 'operator' },
+])
+
+/** The selected lines (whole lines) split into coloured tokens, or null when nothing is selected. */
+export function captureSelection(state: EditorState, path: string): CodeCapture | null {
+  const selection = state.selection.main
+  if (selection.empty) return null
+  const first = state.doc.lineAt(selection.from)
+  let last = state.doc.lineAt(selection.to)
+  if (selection.to === last.from && last.number > first.number) last = state.doc.line(last.number - 1)
+  const from = first.from, to = last.to
+  if (to - from > 60000) return null
+  const kinds: TokenKind[] = new Array(to - from).fill('plain')
+  const tree = ensureSyntaxTree(state, to, 400) ?? syntaxTree(state)
+  highlightTree(tree, tokenNames, (start, end, name) => {
+    for (let index = Math.max(start, from); index < Math.min(end, to); index++) kinds[index - from] = name.split(' ')[0] as TokenKind
+  }, from, to)
+  const lines: CodeToken[][] = []
+  for (let number = first.number; number <= last.number; number++) {
+    const line = state.doc.line(number)
+    const tokens: CodeToken[] = []
+    for (let index = line.from; index < line.to; index++) {
+      const char = state.doc.sliceString(index, index + 1)
+      const kind = kinds[index - from]
+      const previous = tokens.at(-1)
+      if (previous && previous.kind === kind) previous.text += char
+      else tokens.push({ text: char, kind })
+    }
+    lines.push(tokens)
+  }
+  return { path, startLine: first.number, lines }
+}
+
+export interface EditorHandle { focus: () => void; jump: (line: number, column?: number, length?: number) => void; capture: () => CodeCapture | null }
 export interface EditorMemory { state?: EditorState; top?: number; left?: number }
 interface Props {
   path: string
@@ -170,8 +219,9 @@ interface Props {
   handle: (value: EditorHandle | null) => void
 }
 
-function handleFor(editor: EditorView): EditorHandle {
+function handleFor(editor: EditorView, path: string): EditorHandle {
   return {
+    capture: () => captureSelection(editor.state, path),
     focus: () => editor.focus(),
     jump: (line, column = 1, length = 0) => {
       const row = editor.state.doc.line(Math.max(1, Math.min(line, editor.state.doc.lines)))
@@ -210,7 +260,7 @@ export default function Editor(props: Props) {
       })
       view.current = merge.b
       current.onCursor(onCursor(merge.b))
-      current.handle(handleFor(merge.b))
+      current.handle(handleFor(merge.b, current.path))
       return () => { merge.destroy(); view.current = null; callbacks.current.handle(null) }
     }
 
@@ -233,7 +283,7 @@ export default function Editor(props: Props) {
     }
     view.current = editor
     current.onCursor(onCursor(editor))
-    current.handle(handleFor(editor))
+    current.handle(handleFor(editor, current.path))
     return () => {
       if (current.memory) {
         current.memory.state = editor.state
