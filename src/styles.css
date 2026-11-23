@@ -178,11 +178,11 @@ button.crumb-symbol:hover { color: var(--ink); }
 /* The caret glides between positions instead of jumping. */
 .smooth-caret .cm-cursorLayer .cm-cursor { transition: left 80ms var(--ease), top 80ms var(--ease), height 80ms var(--ease); }
 
-.empty-editor { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); }
+.empty-editor { position: absolute; inset: 0; display: grid; place-items: center; padding: 24px 0; overflow: auto; color: var(--muted); }
 .empty-inner { width: min(340px, 90%); }
 .empty-title { color: var(--ink); font-size: 20px; font-weight: 600; letter-spacing: -.015em; margin-bottom: 14px; }
 .empty-keys { display: grid; border-top: 1px solid var(--line); }
-.empty-keys button { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--line); color: var(--muted); transition: color var(--fast) var(--ease); }
+.empty-keys button { display: flex; justify-content: space-between; align-items: center; min-height: 38px; padding: 6px 0; border-bottom: 1px solid var(--line); color: var(--muted); transition: color var(--fast) var(--ease); }
 .empty-keys button:hover { color: var(--ink); }
 
 .grip { position: absolute; z-index: 3; background: transparent; touch-action: none; transition: background-color var(--fast) var(--ease); }
@@ -241,6 +241,7 @@ button.mini-node:hover i { background: var(--ink); }
 .status-item { display: flex; align-items: center; gap: 6px; height: 24px; padding: 0 6px; transition: color var(--fast) var(--ease); }
 button.status-item:hover { color: var(--ink); }
 .status-amber { color: var(--amber); }
+.status-strong { color: var(--ink); }
 .status-dot { width: 5px; height: 5px; background: var(--green); }
 .status-dot.inactive { background: var(--faint); }
 .status-dot.busy { background: var(--amber); animation: pulse 1s ease-in-out infinite alternate; }
@@ -270,8 +271,42 @@ button.status-item:hover { color: var(--ink); }
 .focus-track button { position: absolute; left: 50%; width: 7px; height: 7px; transform: translate(-50%, -50%); background: var(--faint); transition: transform var(--fast) var(--ease), background-color var(--fast) var(--ease); }
 .focus-track button.is-last { width: 9px; height: 9px; background: var(--ink); }
 .focus-track button:hover { transform: translate(-50%, -50%) scale(1.5); background: var(--ink); }
-.focus-foot { position: relative; z-index: 2; margin: 0 28px; background: var(--editor); height: 52px; border-top: 1px solid var(--line); font-size: 12.5px; padding: 0; gap: 14px; }
+.focus-foot { position: relative; z-index: 3; display: grid; grid-template-columns: minmax(120px, 1fr) auto minmax(120px, 1fr); align-items: center; gap: 20px; height: 52px; padding: 0 28px; background: var(--editor); box-shadow: inset 0 1px 0 var(--line); font-size: 12.5px; }
+.focus-pos { padding: 0; }
+.focus-files { display: flex; align-items: center; gap: 18px; min-width: 0; overflow: auto hidden; scrollbar-width: none; }
+.focus-files button { position: relative; display: flex; align-items: center; gap: 5px; height: 28px; color: var(--muted); white-space: nowrap; transition: color var(--fast) var(--ease); }
+.focus-files button::after { content: ""; position: absolute; left: 0; right: 0; bottom: 2px; height: 1px; background: var(--ink); transform: scaleX(0); transition: transform var(--base) var(--ease); }
+.focus-files button:hover, .focus-files button.is-active { color: var(--ink); }
+.focus-files button.is-active::after { transform: scaleX(1); }
+.focus-files .dot { width: 5px; height: 5px; background: var(--ink); }
+.focus-files .focus-open { margin-left: 6px; gap: 8px; }
+.focus-files .focus-open::after { display: none; }
+.focus-actions { display: flex; align-items: center; justify-content: flex-end; gap: 14px; }
+.focus-toggle { position: relative; height: 28px; color: var(--muted); transition: color var(--fast) var(--ease); }
+.focus-toggle::after { content: ""; position: absolute; left: 0; right: 0; bottom: 2px; height: 1px; background: var(--ink); transform: scaleX(0); transition: transform var(--base) var(--ease); }
+.focus-toggle:hover, .focus-toggle.is-on { color: var(--ink); }
+.focus-toggle.is-on::after { transform: scaleX(1); }
+.focus-output { position: fixed; z-index: 3; left: 50%; bottom: 52px; width: min(880px, calc(100% - 56px)); height: min(36vh, 340px); transform: translateX(-50%); display: flex; flex-direction: column; background: var(--editor); border: 1px solid var(--line); border-bottom: 0; animation: sheet-up var(--base) var(--ease); }
+@keyframes sheet-up { from { opacity: 0; transform: translate(-50%, 12px); } }
+.focus-output-head { display: flex; align-items: center; gap: 16px; height: 40px; padding: 0 20px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 12px; flex-shrink: 0; }
+.focus-output-head > span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.focus-output-head .quiet-link { display: flex; align-items: center; gap: 6px; }
+.focus-output-body { position: relative; flex: 1; min-height: 0; }
+.is-focus .bench.with-output .island.main { height: calc(100% - min(36vh, 340px)); transition: height var(--base) var(--ease); }
+.is-focus .cm-scroller { scrollbar-width: none; }
+.is-focus .cm-scroller::-webkit-scrollbar { display: none; }
 .app.is-focus { grid-template-rows: 56px minmax(0, 1fr) 52px; }
+
+/* ---- Fullscreen islands ----------------------------------------------------- */
+.bench.max-editor > .island:not(.main), .bench.max-side > .island:not(.side), .bench.max-terminal > .island:not(.drawer) { display: none !important; }
+.bench[class*="max-"] > .island { grid-row: 1 !important; grid-column: 1 / -1 !important; animation: settle var(--base) var(--ease); }
+.tab-max { align-self: center; margin-left: 4px; flex-shrink: 0; color: var(--faint); }
+.chrome-restore { margin-right: 6px; }
+
+/* ---- Hover hints: what a control does and its shortcut ----------------------- */
+[data-tip] { position: relative; }
+[data-tip]::before { content: attr(data-tip); position: absolute; z-index: 30; left: 50%; top: calc(100% + 8px); transform: translate(-50%, -3px); padding: 5px 9px; background: var(--ink); color: var(--editor); font: 11.5px/1.3 var(--font-sans); white-space: nowrap; pointer-events: none; opacity: 0; transition: opacity var(--fast) var(--ease), transform var(--fast) var(--ease); }
+[data-tip]:hover::before, [data-tip]:focus-visible::before { opacity: 1; transform: translate(-50%, 0); transition-delay: 350ms; }
 
 /* ---- Overview ---------------------------------------------------------------- */
 .overview { position: fixed; inset: 0; z-index: 20; display: flex; flex-direction: column; gap: 28px; padding: 32px 48px; background: var(--editor); animation: settle var(--base) var(--ease); overflow: auto; }
@@ -295,17 +330,21 @@ button.status-item:hover { color: var(--ink); }
 .ov-title { display: flex; align-items: baseline; justify-content: space-between; gap: 20px; }
 .ov-title h1 { font-size: 28px; font-weight: 600; letter-spacing: -.02em; }
 .ov-title span { color: var(--muted); }
-.ov-grid { flex: 1; min-height: 320px; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); grid-auto-rows: minmax(0, 1fr); gap: 24px; }
-.ov-card { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; text-align: left; background: var(--panel); border: 1px solid var(--line); color: var(--ink); animation: rise 240ms var(--ease) both; transition: border-color var(--fast) var(--ease), transform var(--base) var(--ease); }
-.ov-card.wide { grid-column: span 2; }
+.ov-grid { flex: 1; min-height: 360px; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); grid-auto-rows: minmax(0, 1fr); gap: 24px; }
+.ov-slot { position: relative; min-width: 0; min-height: 0; animation: rise 240ms var(--ease) both; }
+.ov-slot.wide { grid-column: span 2; }
+.ov-card { width: 100%; height: 100%; display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; text-align: left; background: var(--panel); border: 1px solid var(--line); color: var(--ink); transition: border-color var(--fast) var(--ease), transform var(--base) var(--ease); }
 .ov-card:hover { border-color: var(--dash); transform: translateY(-2px); }
+.ov-full { position: absolute; right: 12px; bottom: 12px; padding: 5px 10px; background: var(--ink); color: var(--editor); font-size: 12px; opacity: 0; transform: translateY(4px); transition: opacity var(--fast) var(--ease), transform var(--fast) var(--ease); }
+.ov-slot:hover .ov-full, .ov-slot:focus-within .ov-full { opacity: 1; transform: none; }
+.ov-slot:hover .ov-card { transform: translateY(-2px); }
 .ov-card:focus-visible { outline: none; border-color: var(--ink); }
 .ov-card.is-current { border: 1.5px solid var(--ink); }
 .ov-card.is-hidden { border-style: dashed; border-color: var(--dash); background: transparent; color: var(--muted); }
 .ov-card-head { display: flex; justify-content: space-between; gap: 10px; padding: 16px 20px 6px; }
 .ov-card-head b { font-weight: 600; }
 .ov-card-head span { color: var(--muted); }
-.ov-card-body { position: relative; flex: 1; min-height: 0; padding: 10px 20px 16px; overflow: hidden; }
+.ov-card-body { position: relative; flex: 1; min-height: 0; padding: 10px 20px 16px; overflow: hidden; -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 36px), transparent calc(100% - 8px)); mask-image: linear-gradient(to bottom, #000 calc(100% - 36px), transparent calc(100% - 8px)); }
 .ov-card-body pre { margin: 0; font: 11.5px/1.75 var(--font-mono); color: var(--muted); white-space: pre; overflow: hidden; }
 .ov-list { display: flex; flex-direction: column; gap: 7px; color: var(--muted); }
 .ov-list span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -336,7 +375,7 @@ button.status-item:hover { color: var(--ink); }
 .under-tabs button.is-active { color: var(--ink); border-color: var(--ink); }
 .under-tabs.small { margin-bottom: 14px; font-size: 12px; }
 .graph-body { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 280px; border-top: 1px solid var(--line); }
-.graph-canvas { position: relative; min-width: 0; overflow: hidden; }
+.graph-canvas { position: relative; min-width: 0; overflow: hidden; user-select: none; -webkit-user-select: none; touch-action: none; }
 .graph-canvas svg { width: 100%; height: 100%; cursor: grab; display: block; }
 .graph-canvas svg:active { cursor: grabbing; }
 .graph-note { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); pointer-events: none; }
@@ -637,7 +676,7 @@ button.journal-row:not(:disabled):hover span { text-decoration: underline; text-
   .islands-nav { gap: 14px; }
 }
 @media (max-width: 900px) {
-  .islands-nav .nav-rule ~ button:nth-last-child(-n+2) { display: none; }
+  .islands-nav .nav-rule ~ button:nth-last-child(-n+2), .islands-nav .nav-rule:nth-last-child(3) { display: none; }
   .paper-columns { grid-template-columns: 1fr; gap: 40px; }
   .settings { grid-template-columns: 160px minmax(0, 1fr); }
   .ov-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -661,7 +700,7 @@ button.journal-row:not(:disabled):hover span { text-decoration: underline; text-
   .settings { grid-template-columns: 1fr; }
   .settings-nav { display: none; }
   .ov-grid { grid-template-columns: 1fr; }
-  .ov-card.wide { grid-column: auto; }
+  .ov-slot.wide { grid-column: auto; }
 }
 
 /* ---- Markdown and text preview ------------------------------------------- */

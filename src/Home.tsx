@@ -245,7 +245,7 @@ export default function Home(props: Props) {
                 <time>{clock(entry.time)}</time><span>{entryText(entry)}</span>
               </button>)}
               {!todays.length && <p className="paper-row paper-quiet">Nothing yet today.</p>}
-              <button className="paper-row journal-line paper-quiet" onClick={() => setJournal(true)}><time /><span>Open journal</span></button>
+              <button className="paper-row journal-line paper-quiet journal-open" onClick={() => setJournal(true)}><span>Open journal</span></button>
             </div>
           </div>
         </section>

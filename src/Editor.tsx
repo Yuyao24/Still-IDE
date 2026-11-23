@@ -5,7 +5,7 @@ import {
   highlightSpecialChars, keymap, lineNumbers, rectangularSelection,
 } from '@codemirror/view'
 import { HighlightStyle, StreamLanguage, bracketMatching, ensureSyntaxTree, foldGutter, foldKeymap, indentOnInput, indentUnit, syntaxHighlighting, syntaxTree } from '@codemirror/language'
-import { highlightSelectionMatches, searchKeymap } from '@codemirror/search'
+import { highlightSelectionMatches, openSearchPanel, searchKeymap } from '@codemirror/search'
 import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap } from '@codemirror/autocomplete'
 import { lintGutter, lintKeymap, setDiagnostics, type Diagnostic as EditorDiagnostic } from '@codemirror/lint'
 import { MergeView, unifiedMergeView } from '@codemirror/merge'
@@ -202,7 +202,7 @@ export function captureSelection(state: EditorState, path: string): CodeCapture 
   return { path, startLine: first.number, lines }
 }
 
-export interface EditorHandle { focus: () => void; jump: (line: number, column?: number, length?: number) => void; capture: () => CodeCapture | null }
+export interface EditorHandle { focus: () => void; find: () => void; reveal: () => void; jump: (line: number, column?: number, length?: number) => void; capture: () => CodeCapture | null }
 export interface EditorMemory { state?: EditorState; top?: number; left?: number }
 interface Props {
   path: string
@@ -223,6 +223,8 @@ function handleFor(editor: EditorView, path: string): EditorHandle {
   return {
     capture: () => captureSelection(editor.state, path),
     focus: () => editor.focus(),
+    find: () => { editor.focus(); openSearchPanel(editor) },
+    reveal: () => editor.dispatch({ effects: EditorView.scrollIntoView(editor.state.selection.main.head, { y: 'center' }) }),
     jump: (line, column = 1, length = 0) => {
       const row = editor.state.doc.line(Math.max(1, Math.min(line, editor.state.doc.lines)))
       const anchor = Math.min(row.to, row.from + Math.max(0, column - 1))

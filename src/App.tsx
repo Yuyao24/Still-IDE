@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useState } from 'react'
 import { CircleAlert, X } from 'lucide-react'
-import { type SshHost, type Workspace, ssh } from './bridge'
+import { type SshHost, type Workspace, nameHost, setPasswordPrompt, ssh } from './bridge'
 import Home, { type OpenOptions } from './Home'
 import Ide from './Ide'
 import SettingsView, { type SettingsSection } from './SettingsView'
+import { PasswordDialog } from './Remote'
 import { type Settings, SettingsContext, activeTheme, applySettings, cachedSettings, loadSettings, saveSettings } from './settings'
 import { findTheme } from './themes'
 import { Icon, IconButton } from './ui'
@@ -18,6 +19,11 @@ export default function App() {
   const [view, setView] = useState<View>({ kind: 'home' })
   const [settingsSection, setSettingsSection] = useState<SettingsSection | null>(null)
   const [toast, setToast] = useState('')
+  const [asking, setAsking] = useState<{ host: string; retry: boolean; answer: (value: string | null) => void } | null>(null)
+  useEffect(() => {
+    setPasswordPrompt((host, retry) => new Promise(answer => setAsking({ host, retry, answer })))
+    return () => setPasswordPrompt(null)
+  }, [])
   const theme = useMemo(() => activeTheme(settings, systemDark), [settings, systemDark])
 
   useLayoutEffect(() => { applySettings(settings, systemDark) }, [settings, systemDark])
@@ -28,6 +34,23 @@ export default function App() {
     query.addEventListener('change', change)
     return () => query.removeEventListener('change', change)
   }, [])
+  // This is an app, not a web page: no reload keys, no print dialog, and no browser menu outside text.
+  useEffect(() => {
+    const keys = (event: KeyboardEvent) => {
+      const key = event.key.toLowerCase()
+      const meta = event.ctrlKey || event.metaKey
+      if (key === 'f5' || (meta && key === 'r') || (meta && key === 'g' && !(event.target as Element | null)?.closest?.('.cm-editor'))) event.preventDefault()
+    }
+    const menu = (event: MouseEvent) => {
+      const target = event.target as Element | null
+      if (event.defaultPrevented || target?.closest('input, textarea, [contenteditable="true"], .cm-content, .xterm, .console-scroll, .doc-preview')) return
+      event.preventDefault()
+    }
+    addEventListener('keydown', keys)
+    addEventListener('contextmenu', menu)
+    return () => { removeEventListener('keydown', keys); removeEventListener('contextmenu', menu) }
+  }, [])
+
   useEffect(() => {
     if (!toast) return
     const timer = setTimeout(() => setToast(''), 5600)
@@ -61,6 +84,7 @@ export default function App() {
   }, [theme, settings, update])
 
   const openRemote = useCallback(async (host: SshHost, path: string) => {
+    nameHost(host.id, host.name)
     const root = await ssh.resolve(host.id, path)
     setView({ kind: 'workspace', workspace: { root, name: root.split('/').filter(Boolean).at(-1) ?? root, remote: host.id, hostName: host.name } })
   }, [])
@@ -76,6 +100,7 @@ export default function App() {
           onHome={() => setView({ kind: 'home' })} onSwitch={workspace => setView({ kind: 'workspace', workspace })}
           onSettings={openSettings} onToggleTheme={toggleTheme} notify={notify} />}
     {settingsSection && <SettingsView section={settingsSection} onSection={setSettingsSection} onClose={() => setSettingsSection(null)} notify={notify} />}
+    {asking && <PasswordDialog host={asking.host} retry={asking.retry} onAnswer={value => { asking.answer(value); setAsking(null) }} />}
     {toast && <div className="toast" role="status"><Icon glyph={CircleAlert} /><span className="flex-1">{toast}</span><IconButton glyph={X} label="Dismiss message" onClick={() => setToast('')} /></div>}
   </SettingsContext.Provider>
 }

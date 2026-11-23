@@ -1,7 +1,7 @@
 import { useEffect, useState, type FormEvent, type MouseEvent } from 'react'
 import { open } from '@tauri-apps/plugin-dialog'
 import { Ellipsis, FileKey, FolderOpen, Pencil, Plug, Plus, RefreshCw, Server, SquareTerminal, Trash2 } from 'lucide-react'
-import { type SshHost, type SshOverview, desktop, hostLabel, ssh } from './bridge'
+import { type SshHost, type SshOverview, desktop, hostLabel, nameHost, ssh } from './bridge'
 import { Icon, IconButton, Modal, type MenuEntry } from './ui'
 
 export const blankHost: SshHost = { id: '', name: '', host: '', user: '', port: null, identityFile: '', jump: '', forwards: [], remotePath: '', source: 'saved' }
@@ -64,6 +64,7 @@ export function OpenRemoteDialog({ host, onClose, onOpen }: { host: SshHost; onC
   const [path, setPath] = useState(host.remotePath || '~')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  useEffect(() => { nameHost(host.id, host.name) }, [host])
   return <Modal title={'Open folder on ' + host.name} onClose={onClose}>
     <form className="sheet-body form-grid" onSubmit={event => {
       event.preventDefault()
@@ -71,9 +72,7 @@ export function OpenRemoteDialog({ host, onClose, onOpen }: { host: SshHost; onC
       onOpen(path).then(onClose).catch(failure => setError(String(failure))).finally(() => setBusy(false))
     }}>
       <label>Folder on the server<input className="field" value={path} onChange={event => setPath(event.target.value)} autoFocus spellCheck={false} placeholder="~/projects/app" /></label>
-      <p className="help">{hostLabel(host)} · Files are read and saved over SSH. {navigator.userAgent.includes('Windows')
-        ? 'On Windows the file explorer needs an SSH key or agent.'
-        : 'If the server asks for a password, open a terminal to it first; the explorer reuses that connection.'}</p>
+      <p className="help">{hostLabel(host)} · Files are read and saved over SSH. If the server needs a password, Still asks for it once and keeps it in memory until you quit.</p>
       {error && <p className="form-error" role="alert">{error}</p>}
       <div className="sheet-actions">
         <button type="button" className="text-btn" onClick={onClose}>Cancel</button>
@@ -145,4 +144,20 @@ export function RemotePanel(props: PanelProps) {
       {overview?.client && <p className="help mt-4">{overview.client}. Keys, agents, ProxyJump and known hosts follow your normal SSH setup.</p>}
     </div>
   </>
+}
+
+/** Asks for a server password. The answer stays in memory for this session only. */
+export function PasswordDialog({ host, retry, onAnswer }: { host: string; retry: boolean; onAnswer: (password: string | null) => void }) {
+  const [value, setValue] = useState('')
+  return <Modal title={'Password for ' + host} onClose={() => onAnswer(null)}>
+    <form className="sheet-body form-grid" onSubmit={event => { event.preventDefault(); onAnswer(value) }}>
+      <label>Password<input className="field field-lg" type="password" value={value} onChange={event => setValue(event.target.value)} autoFocus autoComplete="current-password" /></label>
+      {retry && <p className="form-error" role="alert">That password didn't work. Try again.</p>}
+      <p className="help">Used to browse, save and run files on {host}. Still keeps it in memory until you quit and never writes it to disk. An SSH key avoids this prompt entirely.</p>
+      <div className="sheet-actions">
+        <button type="button" className="text-btn" onClick={() => onAnswer(null)}>Cancel</button>
+        <button type="submit" className="text-btn primary" disabled={!value}>Connect</button>
+      </div>
+    </form>
+  </Modal>
 }

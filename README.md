@@ -25,18 +25,26 @@ graph on the right and the terminal below. The underlined names at the top show
 or hide each one. On narrow windows the graph steps aside by itself.
 
 **Overview.** Ctrl/Cmd + ↑ shows every island and your recent projects at once.
-Click or press Enter to jump, Delete to hide or show an island, and pick a
-layout (Classic, Code and graph, Review, Writing, Focus, or one you saved).
+Hover a card for Fullscreen (or press F), click or press Enter to jump, Delete
+to hide or show an island, and pick a layout (Classic, Code and graph, Review, Writing, Focus, or one you saved).
 
 **Focus.** Ctrl/Cmd + . hides everything but the code. The file's name sits
 large in the background, lines other than the current one are dimmed, and a thin
 timeline on the right marks where you edited this session (click a mark to go
-back there). Esc shows everything again.
+back there). The bottom bar has only your open files, Open… (Ctrl/Cmd + P),
+Output and Run: running shows the output in a panel without leaving focus. Esc
+hides the output, and Esc again shows everything.
+
+**Fullscreen.** Any island can fill the window: the button in its corner,
+Ctrl/Cmd + Shift + M, double-clicking the tab bar, or F on a card in Overview.
+Esc restores the layout.
 
 **Graph.** Still reads imports (Python, JavaScript/TypeScript, Java, Kotlin) and
 Markdown links to see how files connect. The right island shows the files around
 the one you are editing; Open graph shows the whole project, the files around
 this one, or only changed files, with tests, packages and data files on or off.
+It is live: files spread out when it opens, you can drag a file and its
+neighbours follow, scroll to zoom and drag the page to move around.
 
 **Journal and idle screen.** Saves, runs and commits are noted in a journal on
 this computer (turn it off in Settings → Editor). After a few minutes without
@@ -82,7 +90,8 @@ the hosts already in `~/.ssh/config`. Open a terminal on a server, or open a
 folder on it as a project: browse, search, edit and save files over SSH, and
 run Python, JavaScript, shell, Java, Go or Ruby files remotely. Still uses your
 system's OpenSSH client, so keys, agents and known hosts work exactly as they do
-in a terminal, and Still never stores passwords.
+in a terminal. If a server needs a password, Still asks once and keeps it in
+memory until you quit; it is never written to disk.
 
 **Themes.** Still Dark and Light, One Dark and One Light (Atom), GitHub Dark and
 Light, Darcula, JetBrains Dark and IntelliJ Light, Solarized Dark and Light,
@@ -111,6 +120,9 @@ and ligatures are adjustable.
 | Ctrl/Cmd + Shift + F | Find in all files |
 | Ctrl/Cmd + ↑ | Overview (Esc or Ctrl/Cmd + ↓ to return) |
 | Ctrl/Cmd + . | Focus mode (Esc to leave) |
+| Ctrl/Cmd + Shift + M | Fullscreen the current island (Esc to restore) |
+| Ctrl/Cmd + Shift + D | Show or hide the graph island |
+| Ctrl/Cmd + Shift + U / R | Packages / Servers |
 | Ctrl/Cmd + B | Show or hide the left island |
 | Ctrl/Cmd + J | Show or hide the terminal island |
 | Ctrl/Cmd + Shift + ` | New terminal |

@@ -124,12 +124,46 @@ export const home = {
   uninstall: (confirm: string) => invoke<void>('uninstall_start', { confirm }),
 }
 
+// ---- Passwords for remote files ------------------------------------------------
+// When a server needs a password, the app shows one prompt (registered by App),
+// sends the answer to the backend's in-memory store and retries the call.
+type PasswordPrompt = (host: string, retry: boolean) => Promise<string | null>
+let prompt: PasswordPrompt | null = null
+const pending = new Map<string, Promise<boolean>>()
+const hostNames = new Map<string, string>()
+export function setPasswordPrompt(value: PasswordPrompt | null) { prompt = value }
+export function nameHost(id: string, name: string) { hostNames.set(id, name) }
+
+async function askFor(id: string, retry: boolean): Promise<boolean> {
+  const running = pending.get(id)
+  if (running) return running
+  const task = (async () => {
+    const answer = prompt ? await prompt(hostNames.get(id) ?? id, retry) : null
+    if (answer === null) return false
+    await invoke('ssh_set_password', { id, password: answer })
+    return true
+  })().finally(() => pending.delete(id))
+  pending.set(id, task)
+  return task
+}
+
+/** Runs an SSH call; if the server wants a password, asks for it (up to three tries) and runs it again. */
+export async function withPassword<T>(id: string, call: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try { return await call() } catch (error) {
+      const message = String(error)
+      if (!message.startsWith('PASSWORD:') || attempt >= 3) throw message.replace(/^PASSWORD:\s*/, '')
+      if (!await askFor(id, attempt > 0 || message.includes("didn't work"))) throw 'This server needs a password to open files.'
+    }
+  }
+}
+
 export const ssh = {
   hosts: async (): Promise<SshOverview> => desktop ? invoke('ssh_hosts') : { saved: [], imported: [], client: null },
   save: (host: SshHost) => invoke<SshHost>('ssh_save_host', { host }),
   remove: (id: string) => invoke<void>('ssh_delete_host', { id }),
-  test: (id: string) => invoke<string>('ssh_test', { id }),
-  resolve: (id: string, path: string) => invoke<string>('ssh_resolve', { id, path }),
+  test: (id: string) => withPassword(id, () => invoke<string>('ssh_test', { id })),
+  resolve: (id: string, path: string) => withPassword(id, () => invoke<string>('ssh_resolve', { id, path })),
 }
 
 export const hostLabel = (host: SshHost) => (host.user ? host.user + '@' : '') + (host.address || host.host) + (host.port && host.port !== 22 ? ':' + host.port : '')
@@ -152,16 +186,18 @@ export function fileSystem(workspace: Workspace): FileSystem {
   if (workspace.remote) {
     const id = workspace.remote
     const root = workspace.root
+    if (workspace.hostName) nameHost(id, workspace.hostName)
+    const call = <T>(command: string, args: object) => withPassword(id, () => invoke<T>(command, { id, root, ...args }))
     return {
-      list: (path = '') => invoke('ssh_list', { id, root, path }),
-      files: () => invoke('ssh_files', { id, root }),
-      read: async path => normalize(await invoke<string>('ssh_read', { id, root, path })),
-      save: (path, contents) => invoke('ssh_write', { id, root, path, contents }),
-      create: path => invoke('ssh_fs', { id, root, op: 'touch', path, target: null }),
-      createFolder: path => invoke('ssh_fs', { id, root, op: 'mkdir', path, target: null }),
-      rename: (from, to) => invoke('ssh_fs', { id, root, op: 'rename', path: from, target: to }),
-      remove: path => invoke('ssh_fs', { id, root, op: 'delete', path, target: null }),
-      search: (query, options) => invoke('ssh_search', { id, root, query, ...options }),
+      list: (path = '') => call('ssh_list', { path }),
+      files: () => call('ssh_files', {}),
+      read: async path => normalize(await call<string>('ssh_read', { path })),
+      save: (path, contents) => call('ssh_write', { path, contents }),
+      create: path => call('ssh_fs', { op: 'touch', path, target: null }),
+      createFolder: path => call('ssh_fs', { op: 'mkdir', path, target: null }),
+      rename: (from, to) => call('ssh_fs', { op: 'rename', path: from, target: to }),
+      remove: path => call('ssh_fs', { op: 'delete', path, target: null }),
+      search: (query, options) => call('ssh_search', { query, ...options }),
     }
   }
   if (desktop) return {

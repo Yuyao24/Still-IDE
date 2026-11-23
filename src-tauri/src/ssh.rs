@@ -3,8 +3,11 @@
 //!
 //! Interactive sessions run `ssh` inside a PTY. Remote file browsing and
 //! editing run short non-interactive `ssh` commands against a POSIX shell. On
-//! macOS and Linux those reuse the terminal's connection (ControlMaster), so a
-//! password typed once in the terminal also unlocks the remote explorer.
+//! macOS and Linux those reuse one connection (ControlMaster).
+//!
+//! Servers that need a password: Still asks for it once, keeps it in memory for
+//! as long as the app runs (never on disk), and hands it to OpenSSH through
+//! SSH_ASKPASS, with the Still executable itself acting as the askpass helper.
 
 use crate::{
     config::{now, SshHost, Store},
@@ -13,6 +16,8 @@ use crate::{
 };
 use serde::Serialize;
 use std::{
+    collections::HashMap,
+    sync::Mutex,
     io::{Read, Write},
     path::PathBuf,
     process::{Command, Stdio},
@@ -20,6 +25,52 @@ use std::{
     time::{Duration, Instant},
 };
 use tauri::{AppHandle, Manager, State};
+
+/// Passwords typed this session, by host id. Memory only.
+#[derive(Default)]
+pub struct Passwords(Mutex<HashMap<String, String>>);
+
+const ASKPASS_ENV: &str = "STILL_ASKPASS_SECRET";
+
+/// When OpenSSH runs Still as its askpass helper, print the password and exit
+/// before any window is created. Returns true if this process was an askpass call.
+pub fn askpass_mode() -> bool {
+    let Ok(secret) = std::env::var(ASKPASS_ENV) else { return false };
+    let prompt = std::env::args().nth(1).unwrap_or_default().to_lowercase();
+    // Host key questions are answered by StrictHostKeyChecking, never with the password.
+    if prompt.contains("yes/no") || prompt.contains("fingerprint") {
+        std::process::exit(1);
+    }
+    let mut out = std::io::stdout();
+    let _ = writeln!(out, "{secret}");
+    let _ = out.flush();
+    true
+}
+
+fn password_for(app: &AppHandle, id: &str) -> Option<String> {
+    app.try_state::<Passwords>()?.0.lock().ok()?.get(id).cloned()
+}
+
+/// Let `cmd` answer password prompts with `password`, without a terminal.
+fn use_password(cmd: &mut Command, password: &str) {
+    if let Ok(exe) = std::env::current_exe() {
+        cmd.env("SSH_ASKPASS", exe).env("SSH_ASKPASS_REQUIRE", "force").env(ASKPASS_ENV, password);
+        if std::env::var_os("DISPLAY").is_none() {
+            cmd.env("DISPLAY", "still:0");
+        }
+    }
+}
+
+#[tauri::command]
+pub fn ssh_set_password(app: AppHandle, id: String, password: Option<String>) -> Result<()> {
+    let state = app.state::<Passwords>();
+    let mut map = state.0.lock().map_err(err)?;
+    match password {
+        Some(value) if !value.is_empty() => { map.insert(id, value); }
+        _ => { map.remove(&id); }
+    }
+    Ok(())
+}
 
 pub fn program() -> String {
     format!("ssh{}", std::env::consts::EXE_SUFFIX)
@@ -148,6 +199,7 @@ fn control_dir(app: &AppHandle) -> Option<PathBuf> {
 fn base_args(app: &AppHandle, host: &SshHost, batch: bool) -> Result<Vec<String>> {
     validate(host)?;
     let mut args = Vec::new();
+    let password = batch && password_for(app, &host.id).is_some();
     if let Some(dir) = control_dir(app) {
         args.extend([
             "-o".into(),
@@ -158,7 +210,10 @@ fn base_args(app: &AppHandle, host: &SshHost, batch: bool) -> Result<Vec<String>
             "ControlPersist=300".into(),
         ]);
     }
-    if batch {
+    if password {
+        // The password is answered by askpass; new host keys are trusted on first use, as a terminal would ask.
+        args.extend(["-o".into(), "NumberOfPasswordPrompts=1".into(), "-o".into(), "StrictHostKeyChecking=accept-new".into(), "-o".into(), "ConnectTimeout=12".into()]);
+    } else if batch {
         args.extend(["-o".into(), "BatchMode=yes".into(), "-o".into(), "ConnectTimeout=12".into()]);
     }
     if host.source != "config" {
@@ -215,11 +270,8 @@ fn friendly(stderr: &str) -> String {
     if stderr.contains("Host key verification failed") {
         "Confirm this server's host key first: open a terminal to it once, then try again.".into()
     } else if stderr.contains("Permission denied") {
-        if cfg!(windows) {
-            "The server asked for a password. Remote files need an SSH key or agent on Windows; the terminal accepts passwords.".into()
-        } else {
-            "The server asked for a password. Open a terminal to it and sign in once; the file explorer then shares that connection.".into()
-        }
+        // The front end recognises this prefix and asks for the password.
+        "PASSWORD: The server asked for a password.".into()
     } else if stderr.contains("Could not resolve hostname") {
         "Could not find that server. Check the host name.".into()
     } else if stderr.contains("Connection refused") || stderr.contains("timed out") {
@@ -233,6 +285,10 @@ fn friendly(stderr: &str) -> String {
 fn exec(app: &AppHandle, host: &SshHost, script: &str, input: Option<Vec<u8>>, timeout: u64) -> Result<Vec<u8>> {
     let mut cmd: Command = command(program(), &std::env::temp_dir());
     cmd.args(base_args(app, host, true)?).arg("--").arg(destination(host)).arg(script);
+    let password = password_for(app, &host.id);
+    if let Some(password) = &password {
+        use_password(&mut cmd, password);
+    }
     cmd.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|error| match error.kind() {
         std::io::ErrorKind::NotFound => "The ssh command was not found. Install OpenSSH and try again.".to_string(),
@@ -271,6 +327,7 @@ fn exec(app: &AppHandle, host: &SshHost, script: &str, input: Option<Vec<u8>>, t
     let stderr = errors.join().unwrap_or_default();
     match status.code() {
         Some(0) => Ok(bytes),
+        Some(255) if password.is_some() && stderr.contains("Permission denied") => Err("PASSWORD: That password didn't work.".into()),
         Some(255) => Err(friendly(&stderr)),
         _ => Err(stderr.lines().rfind(|line| !line.trim().is_empty()).unwrap_or("The remote command failed.").trim().to_owned()),
     }
@@ -569,10 +626,14 @@ pub fn ssh_run(
     let quoted_args: String = args.iter().map(|arg| format!(" {}", quote(arg))).collect();
     ssh_args.push(format!("cd -- {} && {runner} {}{quoted_args}", quote(&root), quote(&full)));
     let label = format!("$ ssh {} {runner} {path}{}\n", host.name, quoted_args);
+    let password = password_for(&app, &host.id);
     jobs.start(app, id, true, move |job| {
         job.emit("command", label);
         let mut cmd = command(program(), &std::env::temp_dir());
         cmd.args(&ssh_args);
+        if let Some(password) = &password {
+            use_password(&mut cmd, password);
+        }
         let (code, _) = job.run(&mut cmd, false)?;
         Ok((code, Vec::new()))
     })

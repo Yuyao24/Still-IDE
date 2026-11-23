@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
-import { type Graph, type GraphNode, type Point, layout, neighbours } from './graph'
+import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
+import { type Graph, type GraphEdge, type GraphNode, type Point, neighbours } from './graph'
 import { Segmented, Toggle } from './ui'
 
 type Scope = 'all' | 'around' | 'changed'
@@ -10,34 +10,111 @@ function storedFilters(): Filters {
   try { return { ...defaultsFilters, ...JSON.parse(localStorage.getItem('still.graph') ?? '{}') } } catch { return defaultsFilters }
 }
 
-/** Moves points toward new targets over a short, eased transition instead of jumping. */
-function useEased(target: Map<string, Point>) {
-  const [current, setCurrent] = useState(target)
-  const shown = useRef(target)
-  useEffect(() => {
-    const from = shown.current
-    if (matchMedia('(prefers-reduced-motion: reduce)').matches || !from.size) { shown.current = target; setCurrent(target); return }
-    const start = performance.now()
-    let frame = 0
-    const tick = (now: number) => {
-      const t = Math.min(1, (now - start) / 240)
-      const ease = 1 - (1 - t) ** 3
-      const next = new Map<string, Point>()
-      for (const [id, to] of target) {
-        const was = from.get(id) ?? to
-        next.set(id, { x: was.x + (to.x - was.x) * ease, y: was.y + (to.y - was.y) * ease })
+interface Body { x: number; y: number; vx: number; vy: number; fixed: boolean }
+
+/**
+ * A live force simulation: files push apart, links pull together, and everything drifts
+ * gently toward the middle. It runs while there is energy left and goes still when settled.
+ */
+function useSimulation(nodes: GraphNode[], edges: GraphEdge[], spacing: number) {
+  const bodies = useRef(new Map<string, Body>())
+  const energy = useRef(1)
+  const frame = useRef(0)
+  const [, setTick] = useState(0)
+  const reduced = useMemo(() => matchMedia('(prefers-reduced-motion: reduce)').matches, [])
+
+  const step = useCallback(() => {
+    const list = nodes.map(node => [node.id, bodies.current.get(node.id)!] as const).filter(([, body]) => body)
+    const index = new Map(list.map(([id], i) => [id, i]))
+    const ideal = (list.length > 1 ? 520 / Math.sqrt(list.length) : 100) * spacing
+    const heat = energy.current
+    for (let a = 0; a < list.length; a++) {
+      const one = list[a][1]
+      for (let b = a + 1; b < list.length; b++) {
+        const two = list[b][1]
+        let dx = one.x - two.x, dy = one.y - two.y
+        let distance = Math.hypot(dx, dy)
+        if (distance < .01) { dx = Math.random() - .5; dy = Math.random() - .5; distance = 1 }
+        if (distance > ideal * 4) continue
+        const push = Math.min(40, (ideal * ideal) / (distance * distance)) * .9 * heat
+        one.vx += dx / distance * push; one.vy += dy / distance * push
+        two.vx -= dx / distance * push; two.vy -= dy / distance * push
       }
-      shown.current = next
-      setCurrent(next)
-      if (t < 1) frame = requestAnimationFrame(tick)
     }
-    frame = requestAnimationFrame(tick)
-    return () => cancelAnimationFrame(frame)
-  }, [target])
-  return current
+    for (const edge of edges) {
+      const a = index.get(edge.from), b = index.get(edge.to)
+      if (a === undefined || b === undefined) continue
+      const one = list[a][1], two = list[b][1]
+      const dx = two.x - one.x, dy = two.y - one.y
+      const distance = Math.max(1, Math.hypot(dx, dy))
+      const pull = (distance - ideal) / distance * .07 * heat
+      one.vx += dx * pull; one.vy += dy * pull
+      two.vx -= dx * pull; two.vy -= dy * pull
+    }
+    for (const [, body] of list) {
+      if (body.fixed) { body.vx = 0; body.vy = 0; continue }
+      body.vx += (500 - body.x) * .006 * heat
+      body.vy += (500 - body.y) * .006 * heat
+      const speed = Math.hypot(body.vx, body.vy)
+      if (speed > 28) { body.vx *= 28 / speed; body.vy *= 28 / speed }
+      body.x += body.vx; body.y += body.vy
+      body.vx *= .62; body.vy *= .62
+    }
+    energy.current *= .975
+  }, [nodes, edges, spacing])
+
+  const run = useCallback(() => {
+    cancelAnimationFrame(frame.current)
+    const loop = () => {
+      step()
+      setTick(value => value + 1)
+      const dragging = [...bodies.current.values()].some(body => body.fixed)
+      if (energy.current > .02 || dragging) frame.current = requestAnimationFrame(loop)
+    }
+    frame.current = requestAnimationFrame(loop)
+  }, [step])
+
+  // New or filtered nodes: keep where existing files are, start new ones near the middle.
+  useEffect(() => {
+    const next = new Map<string, Body>()
+    const random = (() => { let seed = 7; return () => (seed = (seed * 16807) % 2147483647) / 2147483647 })()
+    const fresh = !bodies.current.size
+    for (const node of nodes) {
+      const old = bodies.current.get(node.id)
+      const neighbour = edges.find(edge => edge.from === node.id || edge.to === node.id)
+      const anchor = neighbour && bodies.current.get(neighbour.from === node.id ? neighbour.to : neighbour.from)
+      next.set(node.id, old ? { ...old, fixed: false } : {
+        x: (anchor?.x ?? 500) + (random() - .5) * (fresh ? 120 : 40),
+        y: (anchor?.y ?? 500) + (random() - .5) * (fresh ? 120 : 40),
+        vx: 0, vy: 0, fixed: false,
+      })
+    }
+    bodies.current = next
+    energy.current = fresh ? 1 : Math.max(energy.current, .5)
+    if (reduced) { for (let i = 0; i < 300; i++) step(); energy.current = 0; setTick(value => value + 1) }
+    else run()
+    return () => cancelAnimationFrame(frame.current)
+  }, [nodes, edges, spacing])
+
+  return {
+    points: bodies.current as Map<string, Point>,
+    hold(id: string, x: number, y: number) {
+      const body = bodies.current.get(id)
+      if (!body) return
+      body.x = x; body.y = y; body.fixed = true
+      energy.current = Math.max(energy.current, .35)
+      if (!reduced) run()
+    },
+    release(id: string) {
+      const body = bodies.current.get(id)
+      if (body) body.fixed = false
+      energy.current = Math.max(energy.current, .25)
+      if (!reduced) run()
+    },
+  }
 }
 
-const size = (node: GraphNode) => Math.round(6 + Math.sqrt(node.degree) * 2.6)
+const size = (node: GraphNode) => Math.round(8 + Math.sqrt(node.degree) * 3)
 
 function visible(graph: Graph, filters: Filters, scope: Scope, active: string | undefined, changed: Set<string>) {
   let nodes = graph.nodes.filter(node => (filters.tests || node.group !== 'test') && (filters.packages || node.group !== 'package') && (filters.data || node.group !== 'data'))
@@ -85,12 +162,13 @@ export function GraphView({ graph, error, project, active, changed, onOpen, onCl
   const [hover, setHover] = useState<string | null>(null)
   const [view, setView] = useState({ x: 0, y: 0, k: 1 })
   const svg = useRef<SVGSVGElement>(null)
-  const drag = useRef<{ x: number; y: number; moved: boolean } | null>(null)
+  const layer = useRef<SVGGElement>(null)
+  const drag = useRef<{ x: number; y: number; moved: boolean; node?: string } | null>(null)
   const set = (change: Partial<Filters>) => setFilters(value => { const next = { ...value, ...change }; try { localStorage.setItem('still.graph', JSON.stringify(next)) } catch { /* ignore */ } return next })
 
   const shown = useMemo(() => graph ? visible(graph, filters, scope, active, changed) : { nodes: [], edges: [] }, [graph, filters, scope, active, changed])
-  const target = useMemo(() => layout(shown.nodes, shown.edges, filters.spacing), [shown, filters.spacing])
-  const points = useEased(target)
+  const simulation = useSimulation(shown.nodes, shown.edges, filters.spacing)
+  const points = simulation.points
   const focus = hover ?? selected
   const near = useMemo(() => {
     if (!focus) return null
@@ -111,31 +189,58 @@ export function GraphView({ graph, error, project, active, changed, onOpen, onCl
     return () => removeEventListener('keydown', key)
   }, [selected, onClose, onOpen])
 
-  function wheel(event: React.WheelEvent) {
-    const box = svg.current!.getBoundingClientRect()
-    const px = (event.clientX - box.left) / box.width * 1000, py = (event.clientY - box.top) / box.height * 1000
-    setView(value => {
-      const k = Math.max(.4, Math.min(5, value.k * Math.exp(-event.deltaY * .0015)))
-      return { k, x: px - (px - value.x) * (k / value.k), y: py - (py - value.y) * (k / value.k) }
-    })
+  /** A screen point in the SVG's own units (root) or in the zoomed layer's units. */
+  function toSvg(x: number, y: number, inLayer = false) {
+    const target = inLayer ? layer.current : svg.current
+    const matrix = target?.getScreenCTM()
+    if (!matrix) return { x: 0, y: 0 }
+    const point = new DOMPoint(x, y).matrixTransform(matrix.inverse())
+    return { x: point.x, y: point.y }
   }
+
+  // Wheel zoom around the pointer. Attached natively so the page itself never scrolls.
+  useEffect(() => {
+    const node = svg.current
+    if (!node) return
+    const wheel = (event: WheelEvent) => {
+      event.preventDefault()
+      const at = toSvg(event.clientX, event.clientY)
+      setView(value => {
+        const k = Math.max(.3, Math.min(6, value.k * Math.exp(-event.deltaY * .0015)))
+        return { k, x: at.x - (at.x - value.x) * (k / value.k), y: at.y - (at.y - value.y) * (k / value.k) }
+      })
+    }
+    node.addEventListener('wheel', wheel, { passive: false })
+    return () => node.removeEventListener('wheel', wheel)
+  }, [])
+
   function down(event: ReactPointerEvent) {
-    if ((event.target as Element).closest('[data-node]')) return
-    drag.current = { x: event.clientX, y: event.clientY, moved: false }
+    const nodeElement = (event.target as Element).closest('[data-node]')
+    drag.current = { x: event.clientX, y: event.clientY, moved: false, node: nodeElement?.getAttribute('data-node') ?? undefined }
     ;(event.currentTarget as Element).setPointerCapture(event.pointerId)
   }
   function move(event: ReactPointerEvent) {
     const start = drag.current
     if (!start) return
-    const box = svg.current!.getBoundingClientRect()
-    const dx = (event.clientX - start.x) / box.width * 1000, dy = (event.clientY - start.y) / box.height * 1000
-    if (Math.abs(dx) + Math.abs(dy) > 1) start.moved = true
+    if (Math.abs(event.clientX - start.x) + Math.abs(event.clientY - start.y) > 3) start.moved = true
+    if (!start.moved) return
+    if (start.node) {
+      const at = toSvg(event.clientX, event.clientY, true)
+      simulation.hold(start.node, at.x, at.y)
+      return
+    }
+    const from = toSvg(start.x, start.y), to = toSvg(event.clientX, event.clientY)
     start.x = event.clientX; start.y = event.clientY
-    setView(value => ({ ...value, x: value.x + dx, y: value.y + dy }))
+    setView(value => ({ ...value, x: value.x + to.x - from.x, y: value.y + to.y - from.y }))
   }
   function up() {
-    if (drag.current && !drag.current.moved) setSelected(undefined)
+    const start = drag.current
     drag.current = null
+    if (!start) return
+    if (start.node) {
+      if (start.moved) simulation.release(start.node)
+      else setSelected(start.node)
+    } else if (!start.moved) setSelected(undefined)
   }
 
   const label = (node: GraphNode) => filters.labels === 'all' || (filters.labels === 'some' && (node.degree >= 4 || near?.has(node.id) || node.id === active))
@@ -153,8 +258,9 @@ export function GraphView({ graph, error, project, active, changed, onOpen, onCl
       <div className="graph-canvas">
         {!graph && <p className="graph-note">{error || 'Reading files…'}</p>}
         {graph && !shown.nodes.length && <p className="graph-note">{scope === 'changed' ? 'No changed files.' : 'No linked files yet. Imports and Markdown links appear here.'}</p>}
-        <svg ref={svg} viewBox="0 0 1000 1000" preserveAspectRatio="xMidYMid meet" onWheel={wheel} onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up}>
-          <g transform={`translate(${view.x} ${view.y}) scale(${view.k})`}>
+        <svg ref={svg} viewBox="0 0 1000 1000" preserveAspectRatio="xMidYMid meet" onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up}
+          onDoubleClick={event => { const id = (event.target as Element).closest('[data-node]')?.getAttribute('data-node'); if (id && !id.startsWith('package:')) onOpen(id) }}>
+          <g ref={layer} transform={`translate(${view.x} ${view.y}) scale(${view.k})`}>
             {shown.edges.map(edge => {
               const a = points.get(edge.from), b = points.get(edge.to)
               if (!a || !b) return null
@@ -166,9 +272,8 @@ export function GraphView({ graph, error, project, active, changed, onOpen, onCl
               if (!point) return null
               const s = size(node) / Math.sqrt(view.k)
               const classes = ['graph-node', 'group-' + node.group, node.id === selected && 'selected', node.id === active && 'active', near && !near.has(node.id) && 'dim', changed.has(node.id) && 'changed'].filter(Boolean).join(' ')
-              return <g key={node.id} data-node className={classes} transform={`translate(${point.x} ${point.y})`}
-                onPointerEnter={() => setHover(node.id)} onPointerLeave={() => setHover(null)}
-                onClick={() => setSelected(node.id)} onDoubleClick={() => { if (node.group !== 'package') onOpen(node.id) }}>
+              return <g key={node.id} data-node={node.id} className={classes} transform={`translate(${point.x} ${point.y})`}
+                onPointerEnter={() => { if (!drag.current) setHover(node.id) }} onPointerLeave={() => { if (!drag.current) setHover(null) }}>
                 <rect x={-s / 2 - 8} y={-s / 2 - 8} width={s + 16} height={s + 16} className="graph-hit" />
                 <rect x={-s / 2} y={-s / 2} width={s} height={s} rx={1} />
                 {label(node) && <text y={s / 2 + 14 / Math.sqrt(view.k)} style={{ fontSize: 11.5 / Math.sqrt(view.k) }}>{node.name}</text>}
@@ -176,7 +281,7 @@ export function GraphView({ graph, error, project, active, changed, onOpen, onCl
             })}
           </g>
         </svg>
-        <p className="graph-foot">{graph ? shown.nodes.length + ' files, ' + shown.edges.length + ' links' + (graph.truncated ? ' · first 400 files' : '') : ''}<span>Scroll to zoom · drag to move · double-click opens</span></p>
+        <p className="graph-foot">{graph ? shown.nodes.length + ' files, ' + shown.edges.length + ' links' + (graph.truncated ? ' · first 400 files' : '') : ''}<span>Scroll to zoom · drag the page to move · drag a file to pull it · double-click opens · 0 resets</span></p>
       </div>
       <aside className="graph-side">
         <section>

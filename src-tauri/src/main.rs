@@ -13,10 +13,14 @@ mod workspace;
 use tauri::Manager;
 
 fn main() {
+    if ssh::askpass_mode() {
+        return;
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(process::Jobs::default())
         .manage(terminal::TerminalState::default())
+        .manage(ssh::Passwords::default())
         .setup(|app| {
             let store = config::Store::load(app.handle());
             app.manage(store);
@@ -36,6 +40,7 @@ fn main() {
             projects::app_paths,
             projects::open_external,
             projects::save_png,
+            ssh::ssh_set_password,
             workspace::workspace_info,
             workspace::list_directory,
             workspace::list_files,
