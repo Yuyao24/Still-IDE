@@ -59,12 +59,29 @@ jobs:
       - name: Install JavaScript dependencies
         run: npm ci
 
+      # Every build gets a higher version (0.4.<run number>), so installed copies see it as an update.
+      - name: Stamp the version
+        shell: bash
+        run: node -e "const f='src-tauri/tauri.conf.json';const c=JSON.parse(require('fs').readFileSync(f));c.version='0.4.${{ github.run_number }}';require('fs').writeFileSync(f,JSON.stringify(c,null,2))"
+
+      # Updates are signed with the key in the TAURI_SIGNING_PRIVATE_KEY secret. Without it, the build still works, just without update files.
+      - name: Check for the update signing key
+        id: signing
+        shell: bash
+        env:
+          KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -n "$KEY" ]; then echo "args=" >> "$GITHUB_OUTPUT"; echo "on=true" >> "$GITHUB_OUTPUT"
+          else echo '{"bundle":{"createUpdaterArtifacts":false}}' > src-tauri/no-updater.json; echo "args=--config src-tauri/no-updater.json" >> "$GITHUB_OUTPUT"; echo "on=false" >> "$GITHUB_OUTPUT"; echo "::warning::No TAURI_SIGNING_PRIVATE_KEY secret, so this build has no in-app update files."; fi
+
       - name: Build installers
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
         with:
-          args: --bundles ${{ matrix.bundles }}
+          args: --bundles ${{ matrix.bundles }} ${{ steps.signing.outputs.args }}
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           releaseName: ${{ github.ref_type == 'tag' && format('Still {0}', github.ref_name) || '' }}
           releaseBody: Download the installer for your system below. See INSTALL.md for details.
@@ -90,7 +107,7 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          files=(src-tauri/target/release/bundle/nsis/*.exe src-tauri/target/release/bundle/dmg/*.dmg src-tauri/target/release/bundle/deb/*.deb src-tauri/target/release/bundle/appimage/*.AppImage)
+          files=(src-tauri/target/release/bundle/nsis/*.exe src-tauri/target/release/bundle/nsis/*.exe.sig src-tauri/target/release/bundle/dmg/*.dmg src-tauri/target/release/bundle/macos/*.app.tar.gz src-tauri/target/release/bundle/macos/*.app.tar.gz.sig src-tauri/target/release/bundle/deb/*.deb src-tauri/target/release/bundle/appimage/*.AppImage src-tauri/target/release/bundle/appimage/*.AppImage.sig)
           if [ "${{ runner.os }}" = "Windows" ]; then files+=(uninstall/uninstall.ps1); fi
           if [ "${{ runner.os }}" != "Windows" ]; then files+=(uninstall/uninstall.sh); fi
           # Point the "latest" tag at this commit (all three jobs agree on the same commit).
@@ -101,9 +118,41 @@ jobs:
           # Remove this system's older files (they carry the old version in their name), then upload.
           for name in $(gh release view latest --json assets -q '.assets[].name'); do
             case "$name" in
-              *.exe|uninstall.ps1) [ "${{ runner.os }}" = "Windows" ] && gh release delete-asset latest "$name" -y || true ;;
-              *.dmg) [ "${{ runner.os }}" = "macOS" ] && gh release delete-asset latest "$name" -y || true ;;
-              *.deb|*.AppImage) [ "${{ runner.os }}" = "Linux" ] && gh release delete-asset latest "$name" -y || true ;;
+              *.exe|*.exe.sig|uninstall.ps1) [ "${{ runner.os }}" = "Windows" ] && gh release delete-asset latest "$name" -y || true ;;
+              *.dmg|*.app.tar.gz|*.app.tar.gz.sig) [ "${{ runner.os }}" = "macOS" ] && gh release delete-asset latest "$name" -y || true ;;
+              *.deb|*.AppImage|*.AppImage.sig) [ "${{ runner.os }}" = "Linux" ] && gh release delete-asset latest "$name" -y || true ;;
             esac
           done
           gh release upload latest "${files[@]}" --clobber
+
+  # Writes latest.json, the file installed copies of Still check for updates.
+  update-manifest:
+    name: Update manifest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish latest.json
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$KEY" ]; then echo "No signing key; skipping the update manifest."; exit 0; fi
+          mkdir sigs && cd sigs
+          gh release download latest --repo "$GITHUB_REPOSITORY" --pattern '*.sig'
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/latest"
+          node -e '
+            const fs = require("fs"); const files = fs.readdirSync(".");
+            const pick = end => files.find(f => f.endsWith(end));
+            const platforms = {};
+            const add = (key, sig) => { if (sig) platforms[key] = { signature: fs.readFileSync(sig, "utf8").trim(), url: process.argv[1] + "/" + encodeURIComponent(sig.replace(/\.sig$/, "")) } };
+            add("windows-x86_64", pick("-setup.exe.sig"));
+            add("darwin-aarch64", pick(".app.tar.gz.sig"));
+            add("linux-x86_64", pick(".AppImage.sig"));
+            fs.writeFileSync("../latest.json", JSON.stringify({ version: "0.4." + process.argv[2], notes: "Built from the newest commit on main.", pub_date: new Date().toISOString(), platforms }, null, 2));
+          ' "$base" "${{ github.run_number }}"
+          cd .. && cat latest.json
+          gh release upload latest latest.json --repo "$GITHUB_REPOSITORY" --clobber

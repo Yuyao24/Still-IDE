@@ -18,8 +18,14 @@ need any developer tools on your computer:
 Each run under **Actions → Build Still** also keeps a copy under **Artifacts**;
 GitHub always zips those, and the zip holds just the installer. Tagged versions
 (like `v0.4.0`) are published as their own releases too.
-To update, download the newer installer and run it over the old one; your
-settings and projects are kept.
+To update, Still checks for a newer build by itself and offers **Restart to
+update** (Settings → About has **Check for updates**). You can also download the
+newer installer and run it over the old one; your settings and projects are kept.
+
+In-app updates need two things on the GitHub side: the repository must be
+public (so Still can download releases without signing in), and a repository
+secret named `TAURI_SIGNING_PRIVATE_KEY` must hold the update signing key, so
+only your builds can be installed as updates.
 
 The installers are not code-signed, so Windows SmartScreen shows "Windows
 protected your PC": click **More info → Run anyway**. If Smart App Control is

@@ -39,12 +39,20 @@ hides the output, and Esc again shows everything.
 Ctrl/Cmd + Shift + M, double-clicking the tab bar, or F on a card in Overview.
 Esc restores the layout.
 
-**Graph.** Still reads imports (Python, JavaScript/TypeScript, Java, Kotlin) and
-Markdown links to see how files connect. The right island shows the files around
-the one you are editing; Open graph shows the whole project, the files around
-this one, or only changed files, with tests, packages and data files on or off.
-It is live: files spread out when it opens, you can drag a file and its
-neighbours follow, scroll to zoom and drag the page to move around.
+**Canvas.** Every file is a card on a dotted desk, with dashed lines for imports
+(Python, JavaScript/TypeScript, Java, Kotlin) and Markdown links. Drag cards to
+arrange them (Still remembers where you put them), add notes anywhere, zoom with
+the wheel, and double-click a card to open the file. The right island shows the
+files around the one you are editing.
+
+**Chat and agent.** Ctrl/Cmd + Shift + A opens the Chat island. Ask questions
+about the project, or switch to Agent and ask for a change: it reads the code,
+then shows each edit as a diff and each command for you to approve. It uses
+Claude with your own Anthropic API key (kept in the system keychain) or a local
+model through Ollama; choose in Settings → AI.
+
+**Updates.** Still checks for a newer build and offers to restart into it, so
+you only download the installer once.
 
 **Journal and idle screen.** Saves, runs and commits are noted in a journal on
 this computer (turn it off in Settings → Editor). After a few minutes without
@@ -93,7 +101,7 @@ system's OpenSSH client, so keys, agents and known hosts work exactly as they do
 in a terminal. If a server needs a password, Still asks once and keeps it in
 memory until you quit; it is never written to disk.
 
-**Themes.** Still Dark and Light, One Dark and One Light (Atom), GitHub Dark and
+**Themes.** Still Dark and Light, Paper Yellow, One Dark and One Light (Atom), GitHub Dark and
 Light, Darcula, JetBrains Dark and IntelliJ Light, Solarized Dark and Light,
 Nord, Gruvbox Dark, Monokai, Dracula, Tokyo Night, and Catppuccin Mocha and
 Latte. Edit any color to make your own theme, import and export themes as JSON,
@@ -121,7 +129,9 @@ and ligatures are adjustable.
 | Ctrl/Cmd + ↑ | Overview (Esc or Ctrl/Cmd + ↓ to return) |
 | Ctrl/Cmd + . | Focus mode (Esc to leave) |
 | Ctrl/Cmd + Shift + M | Fullscreen the current island (Esc to restore) |
-| Ctrl/Cmd + Shift + D | Show or hide the graph island |
+| Ctrl/Cmd + Shift + D | Show or hide the canvas island |
+| Ctrl/Cmd + Shift + A | Show or hide the chat |
+| Ctrl + Space | Show completions (Tab accepts, Enter always starts a new line) |
 | Ctrl/Cmd + Shift + U / R | Packages / Servers |
 | Ctrl/Cmd + B | Show or hide the left island |
 | Ctrl/Cmd + J | Show or hide the terminal island |

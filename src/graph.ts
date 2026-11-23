@@ -4,7 +4,7 @@
 import type { Entry } from './bridge'
 
 export type NodeGroup = 'source' | 'test' | 'doc' | 'data' | 'package'
-export interface GraphNode { id: string; name: string; group: NodeGroup; folder: string; lines: number; degree: number }
+export interface GraphNode { id: string; name: string; group: NodeGroup; folder: string; lines: number; degree: number; preview?: string[] }
 export interface GraphEdge { from: string; to: string }
 export interface Graph { nodes: GraphNode[]; edges: GraphEdge[]; truncated: boolean }
 
@@ -179,7 +179,9 @@ export async function buildGraph(entries: Entry[], read: (path: string) => Promi
       let text = ''
       try { text = await read(file.path) } catch { continue }
       if (text.length > 400000) continue
-      nodes.get(file.path)!.lines = text.split('\n').length
+      const all = text.split('\n')
+      nodes.get(file.path)!.lines = all.length
+      nodes.get(file.path)!.preview = all.slice(0, 10).map(line => line.slice(0, 90))
       const ext = extension(file.path)
       const references = ext === 'py' ? python(file.path, text, found)
         : ['js', 'mjs', 'cjs', 'jsx', 'ts', 'tsx'].includes(ext) ? script(file.path, text, found)

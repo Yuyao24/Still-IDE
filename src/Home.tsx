@@ -7,6 +7,7 @@ import {
 } from './bridge'
 import { blankHost, HostDialog, hostMenu, OpenRemoteDialog } from './Remote'
 import { useSettings } from './settings'
+import mark from './still.svg?inline'
 import { entryText, JournalSheet, useJournal } from './Journal'
 import { type Resume, clock, journal, resumeFor, sameDay } from './activity'
 import { TitleBar } from './TitleBar'
@@ -170,7 +171,7 @@ export default function Home(props: Props) {
 
   return <div className="app home-app">
     <TitleBar onError={props.notify}
-      left={<span className="brand"><span className="brand-word">Still</span></span>}
+      left={<span className="brand"><img src={mark} alt="" /><span className="brand-word">Still</span></span>}
       right={<>
         <label className="paper-search">
           <input ref={filterInput} value={filter} onChange={event => setFilter(event.target.value)} placeholder="Search" aria-label="Search projects" spellCheck={false}

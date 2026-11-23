@@ -1,15 +1,15 @@
-import { type Extension, Compartment, EditorState } from '@codemirror/state'
+import { type Extension, Compartment, EditorState, Prec } from '@codemirror/state'
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands'
 import {
   EditorView, crosshairCursor, drawSelection, dropCursor, highlightActiveLine, highlightActiveLineGutter,
   highlightSpecialChars, keymap, lineNumbers, rectangularSelection,
 } from '@codemirror/view'
-import { HighlightStyle, StreamLanguage, bracketMatching, ensureSyntaxTree, foldGutter, foldKeymap, indentOnInput, indentUnit, syntaxHighlighting, syntaxTree } from '@codemirror/language'
+import { HighlightStyle, Language, LanguageSupport, StreamLanguage, bracketMatching, ensureSyntaxTree, foldGutter, foldKeymap, indentOnInput, indentUnit, syntaxHighlighting, syntaxTree } from '@codemirror/language'
 import { highlightSelectionMatches, openSearchPanel, searchKeymap } from '@codemirror/search'
-import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap } from '@codemirror/autocomplete'
+import { acceptCompletion, autocompletion, closeBrackets, closeBracketsKeymap, closeCompletion, moveCompletionSelection, startCompletion } from '@codemirror/autocomplete'
 import { lintGutter, lintKeymap, setDiagnostics, type Diagnostic as EditorDiagnostic } from '@codemirror/lint'
 import { MergeView, unifiedMergeView } from '@codemirror/merge'
-import { highlightTree, tagHighlighter, tags } from '@lezer/highlight'
+import { highlightCode, highlightTree, tagHighlighter, tags } from '@lezer/highlight'
 import { python } from '@codemirror/lang-python'
 import { java } from '@codemirror/lang-java'
 import { json } from '@codemirror/lang-json'
@@ -73,8 +73,14 @@ const syntax = HighlightStyle.define([
   { tag: [tags.number, tags.bool, tags.null, tags.atom, tags.constant(tags.variableName)], color: 'var(--number)' },
   { tag: [tags.className, tags.typeName, tags.annotation, tags.meta, tags.processingInstruction, tags.namespace], color: 'var(--type)' },
   { tag: [tags.function(tags.variableName), tags.function(tags.propertyName), tags.function(tags.definition(tags.variableName)), tags.macroName], color: 'var(--function)' },
+  { tag: [tags.self, tags.special(tags.variableName)], color: 'var(--keyword)', fontStyle: 'italic' },
+  { tag: [tags.standard(tags.variableName), tags.standard(tags.function(tags.variableName))], color: 'var(--function)' },
+  { tag: [tags.definition(tags.className), tags.definition(tags.typeName)], color: 'var(--type)', fontWeight: '500' },
+  { tag: [tags.function(tags.definition(tags.variableName)), tags.function(tags.definition(tags.propertyName))], color: 'var(--function)', fontWeight: '500' },
   { tag: [tags.variableName, tags.definition(tags.variableName)], color: 'var(--variable)' },
-  { tag: [tags.propertyName, tags.definition(tags.propertyName)], color: 'var(--property)' },
+  { tag: [tags.propertyName, tags.definition(tags.propertyName), tags.attributeName], color: 'var(--property)' },
+  { tag: [tags.escape, tags.special(tags.string)], color: 'var(--number)' },
+  { tag: [tags.labelName, tags.macroName], color: 'var(--type)' },
   { tag: [tags.comment, tags.lineComment, tags.blockComment, tags.docComment], color: 'var(--comment)', fontStyle: 'var(--comment-style)' },
   { tag: [tags.heading], color: 'var(--keyword)', fontWeight: '600' },
   { tag: [tags.link, tags.url], color: 'var(--accent)', textDecoration: 'underline' },
@@ -123,7 +129,18 @@ function mode(path: string) {
 export const language = (path: string) => mode(path)?.name ?? 'Plain Text'
 export const defaultIndent = (path: string) => mode(path)?.indent ?? 2
 
-export interface EditorOptions { wrap: boolean; lineNumbers: boolean; highlightLine: boolean; tabSize: number; layout: 'inline' | 'split' }
+export interface EditorOptions { wrap: boolean; lineNumbers: boolean; highlightLine: boolean; tabSize: number; layout: 'inline' | 'split'; autocomplete: boolean }
+
+// Suggestions are accepted with Tab, never Enter, so Enter always makes a new line.
+const completionKeys = Prec.highest(keymap.of([
+  { key: 'Tab', run: acceptCompletion },
+  { key: 'Ctrl-Space', run: startCompletion },
+  { key: 'Escape', run: closeCompletion },
+  { key: 'ArrowDown', run: moveCompletionSelection(true) },
+  { key: 'ArrowUp', run: moveCompletionSelection(false) },
+  { key: 'PageDown', run: moveCompletionSelection(true, 'page') },
+  { key: 'PageUp', run: moveCompletionSelection(false, 'page') },
+]))
 
 const configuration = new Compartment()
 function configure(options: EditorOptions, path: string): Extension {
@@ -131,6 +148,8 @@ function configure(options: EditorOptions, path: string): Extension {
     options.wrap ? EditorView.lineWrapping : [],
     options.lineNumbers ? [lineNumbers(), highlightActiveLineGutter()] : [],
     options.highlightLine ? highlightActiveLine() : [],
+    // Off: suggestions only appear with Ctrl+Space. On: they appear while typing.
+    autocompletion({ activateOnTyping: options.autocomplete, defaultKeymap: false, icons: false }),
     EditorState.tabSize.of(options.tabSize),
     indentUnit.of(' '.repeat(options.tabSize)),
     mode(path)?.load() ?? [],
@@ -140,9 +159,9 @@ function configure(options: EditorOptions, path: string): Extension {
 function setup(): Extension {
   return [
     highlightSpecialChars(), history(), foldGutter(), drawSelection(), dropCursor(), EditorState.allowMultipleSelections.of(true),
-    indentOnInput(), syntaxHighlighting(syntax), bracketMatching(), closeBrackets(), autocompletion(), rectangularSelection(),
+    indentOnInput(), syntaxHighlighting(syntax), bracketMatching(), closeBrackets(), completionKeys, rectangularSelection(),
     crosshairCursor(), highlightSelectionMatches(), look,
-    keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...searchKeymap, ...historyKeymap, ...foldKeymap, ...completionKeymap, ...lintKeymap, indentWithTab]),
+    keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...searchKeymap, ...historyKeymap, ...foldKeymap, ...lintKeymap, indentWithTab]),
   ]
 }
 
@@ -202,7 +221,7 @@ export function captureSelection(state: EditorState, path: string): CodeCapture 
   return { path, startLine: first.number, lines }
 }
 
-export interface EditorHandle { focus: () => void; find: () => void; reveal: () => void; jump: (line: number, column?: number, length?: number) => void; capture: () => CodeCapture | null }
+export interface EditorHandle { focus: () => void; find: () => void; reveal: () => void; selection: () => string; jump: (line: number, column?: number, length?: number) => void; capture: () => CodeCapture | null }
 export interface EditorMemory { state?: EditorState; top?: number; left?: number }
 interface Props {
   path: string
@@ -224,6 +243,7 @@ function handleFor(editor: EditorView, path: string): EditorHandle {
     capture: () => captureSelection(editor.state, path),
     focus: () => editor.focus(),
     find: () => { editor.focus(); openSearchPanel(editor) },
+    selection: () => { const range = editor.state.selection.main; return range.empty ? '' : editor.state.sliceDoc(range.from, range.to) },
     reveal: () => editor.dispatch({ effects: EditorView.scrollIntoView(editor.state.selection.main.head, { y: 'center' }) }),
     jump: (line, column = 1, length = 0) => {
       const row = editor.state.doc.line(Math.max(1, Math.min(line, editor.state.doc.lines)))
@@ -298,10 +318,10 @@ export default function Editor(props: Props) {
     }
   }, [props.path, props.diff, props.memory, split])
 
-  const { wrap, lineNumbers: numbers, highlightLine, tabSize } = props.options
+  const { wrap, lineNumbers: numbers, highlightLine, tabSize, autocomplete } = props.options
   useEffect(() => {
     view.current?.dispatch({ effects: configuration.reconfigure(configure(props.options, props.path)) })
-  }, [wrap, numbers, highlightLine, tabSize])
+  }, [wrap, numbers, highlightLine, tabSize, autocomplete])
 
   useEffect(() => {
     const editor = view.current
@@ -315,4 +335,20 @@ export default function Editor(props: Props) {
   }, [props.diagnostics, props.diff, props.path])
 
   return <div className={'editor-host' + (split ? ' split-diff' : '')} ref={host} />
+}
+
+/** Highlighted HTML for a code block (used by the Markdown preview). Unknown languages come back escaped and plain. */
+export function highlightToHtml(code: string, languageName: string) {
+  const escape = (text: string) => text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  const alias: Record<string, string> = { python: 'py', py: 'py', js: 'js', javascript: 'js', ts: 'ts', typescript: 'ts', tsx: 'tsx', jsx: 'jsx', java: 'java', json: 'json', html: 'html', css: 'css', rust: 'rs', rs: 'rs', go: 'go', c: 'c', cpp: 'cpp', 'c++': 'cpp', sh: 'sh', bash: 'sh', shell: 'sh', zsh: 'sh', yaml: 'yml', yml: 'yml', toml: 'toml', sql: 'sql', xml: 'xml', kotlin: 'kt', ruby: 'rb', powershell: 'ps1', md: 'md', markdown: 'md' }
+  const found = mode('x.' + (alias[languageName.toLowerCase()] ?? languageName.toLowerCase()))
+  if (!found) return escape(code)
+  const loaded = found.load()
+  const parser = loaded instanceof LanguageSupport ? loaded.language.parser : loaded instanceof Language ? loaded.parser : null
+  if (!parser) return escape(code)
+  let html = ''
+  highlightCode(code, parser.parse(code), tokenNames, (text, classes) => {
+    html += classes ? `<span class="tok-${classes.split(' ')[0]}">${escape(text)}</span>` : escape(text)
+  }, () => { html += '\n' })
+  return html
 }

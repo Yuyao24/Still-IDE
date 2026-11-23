@@ -63,6 +63,7 @@ fn use_password(cmd: &mut Command, password: &str) {
 
 #[tauri::command]
 pub fn ssh_set_password(app: AppHandle, id: String, password: Option<String>) -> Result<()> {
+    drop_worker(&app, &id);
     let state = app.state::<Passwords>();
     let mut map = state.0.lock().map_err(err)?;
     match password {
@@ -210,6 +211,8 @@ fn base_args(app: &AppHandle, host: &SshHost, batch: bool) -> Result<Vec<String>
             "ControlPersist=300".into(),
         ]);
     }
+    // Keep idle connections alive through routers and firewalls, and notice dead ones quickly.
+    args.extend(["-o".into(), "ServerAliveInterval=15".into(), "-o".into(), "ServerAliveCountMax=4".into(), "-o".into(), "TCPKeepAlive=yes".into()]);
     if password {
         // The password is answered by askpass; new host keys are trusted on first use, as a terminal would ask.
         args.extend(["-o".into(), "NumberOfPasswordPrompts=1".into(), "-o".into(), "StrictHostKeyChecking=accept-new".into(), "-o".into(), "ConnectTimeout=12".into()]);
@@ -281,8 +284,173 @@ fn friendly(stderr: &str) -> String {
     }
 }
 
+// ---- One connection per server --------------------------------------------------
+//
+// Starting ssh for every file operation means a full handshake (and, without connection
+// sharing on Windows, a fresh login) each time. Instead Still keeps one ssh process per
+// server running a tiny shell loop: each request is a script (plus optional stdin), each
+// reply carries the exit code, stdout and stderr, all base64 so any bytes pass through.
+// If that connection drops, the next request starts a new one; if it can't, Still falls
+// back to a one-off ssh command.
+
+const WORKER_LOOP: &str = r#"d=$(mktemp -d 2>/dev/null || echo /tmp/still.$$); mkdir -p "$d"; trap 'rm -rf "$d"' EXIT
+b64d() { if command -v base64 >/dev/null 2>&1; then base64 -d 2>/dev/null || base64 -D; else openssl base64 -d -A; fi; }
+b64e() { if command -v base64 >/dev/null 2>&1; then base64 | tr -d '\n'; else openssl base64 -A; fi; }
+echo "STILL READY"
+while IFS= read -r id && IFS= read -r body && IFS= read -r input; do
+  printf '%s' "$body" | b64d > "$d/s"
+  if [ -n "$input" ]; then printf '%s' "$input" | b64d > "$d/i"; else : > "$d/i"; fi
+  sh "$d/s" < "$d/i" > "$d/o" 2> "$d/e"; c=$?
+  printf 'STILL %s %s %s %s
+' "$id" "$c" "$(b64e < "$d/o")" "$(b64e < "$d/e")"
+done"#;
+
+struct Worker {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    replies: std::sync::mpsc::Receiver<String>,
+    next: u64,
+}
+
+#[derive(Default)]
+pub struct Workers(Mutex<HashMap<String, std::sync::Arc<Mutex<Option<Worker>>>>>);
+
+fn worker_slot(app: &AppHandle, id: &str) -> Option<std::sync::Arc<Mutex<Option<Worker>>>> {
+    let state = app.try_state::<Workers>()?;
+    let mut map = state.0.lock().ok()?;
+    Some(map.entry(id.to_owned()).or_default().clone())
+}
+
+fn start_worker(app: &AppHandle, host: &SshHost) -> Result<Worker> {
+    let mut cmd: Command = command(program(), &std::env::temp_dir());
+    cmd.args(base_args(app, host, true)?).arg("-T").arg("--").arg(destination(host)).arg(format!("sh -c {}", quote(WORKER_LOOP)));
+    if let Some(password) = password_for(app, &host.id) {
+        use_password(&mut cmd, &password);
+    }
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => "The ssh command was not found. Install OpenSSH and try again.".to_string(),
+        _ => err(error),
+    })?;
+    let stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let (sender, replies) = std::sync::mpsc::channel::<String>();
+    thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            // Anything a login script prints is ignored; only protocol lines count.
+            if line.starts_with("STILL ") && sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let errors = std::sync::Arc::new(Mutex::new(String::new()));
+    let sink = errors.clone();
+    thread::spawn(move || {
+        let mut buffer = [0u8; 4096];
+        while let Ok(count) = stderr.read(&mut buffer) {
+            if count == 0 { break }
+            if let Ok(mut text) = sink.lock() {
+                text.push_str(&String::from_utf8_lossy(&buffer[..count]));
+                if text.len() > 16000 { let cut = text.len() - 8000; text.drain(..cut); }
+            }
+        }
+    });
+    match replies.recv_timeout(Duration::from_secs(30)) {
+        Ok(line) if line == "STILL READY" => Ok(Worker { child, stdin, replies, next: 1 }),
+        _ => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let stderr = errors.lock().map(|text| text.clone()).unwrap_or_default();
+            if password_for(app, &host.id).is_some() && stderr.contains("Permission denied") {
+                Err("PASSWORD: That password didn't work.".into())
+            } else if stderr.trim().is_empty() {
+                Err("WORKER: no reply".into())
+            } else {
+                Err(friendly(&stderr))
+            }
+        }
+    }
+}
+
+fn ask_worker(worker: &mut Worker, script: &str, input: Option<&[u8]>, timeout: u64) -> std::result::Result<std::result::Result<Vec<u8>, String>, String> {
+    use base64::Engine;
+    let engine = base64::engine::general_purpose::STANDARD;
+    let id = worker.next;
+    worker.next += 1;
+    let request = format!("{id}\n{}\n{}\n", engine.encode(script), input.map(|bytes| engine.encode(bytes)).unwrap_or_default());
+    worker.stdin.write_all(request.as_bytes()).and_then(|_| worker.stdin.flush()).map_err(|error| error.to_string())?;
+    let deadline = Instant::now() + Duration::from_secs(timeout);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err("timeout".into());
+        }
+        let line = worker.replies.recv_timeout(left).map_err(|error| error.to_string())?;
+        let mut parts = line.splitn(5, ' ');
+        let (_, got, code, out, errs) = (parts.next(), parts.next(), parts.next(), parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+        if got != Some(&id.to_string()) {
+            continue; // a late reply to a request that already timed out
+        }
+        let out = engine.decode(out.trim()).unwrap_or_default();
+        let errs = String::from_utf8_lossy(&engine.decode(errs.trim()).unwrap_or_default()).into_owned();
+        return Ok(if code == Some("0") {
+            Ok(out)
+        } else {
+            Err(errs.lines().rfind(|line| !line.trim().is_empty()).unwrap_or("The remote command failed.").trim().to_owned())
+        });
+    }
+}
+
 /// Run a short script on the server and return its standard output.
 fn exec(app: &AppHandle, host: &SshHost, script: &str, input: Option<Vec<u8>>, timeout: u64) -> Result<Vec<u8>> {
+    if let Some(slot) = worker_slot(app, &host.id) {
+        let mut guard = slot.lock().map_err(err)?;
+        for attempt in 0..2 {
+            if guard.is_none() {
+                match start_worker(app, host) {
+                    Ok(worker) => *guard = Some(worker),
+                    Err(message) if message.starts_with("PASSWORD:") => return Err(message),
+                    Err(message) if message.starts_with("WORKER:") => break,
+                    Err(message) if attempt == 1 => return Err(message),
+                    Err(_) => continue,
+                }
+            }
+            let worker = guard.as_mut().unwrap();
+            match ask_worker(worker, script, input.as_deref(), timeout) {
+                Ok(result) => return result,
+                Err(reason) => {
+                    // The connection broke (or hung): drop it and try once more on a new one.
+                    if let Some(mut dead) = guard.take() {
+                        let _ = dead.child.kill();
+                        let _ = dead.child.wait();
+                    }
+                    if reason == "timeout" {
+                        return Err("The server took too long to answer.".into());
+                    }
+                }
+            }
+        }
+    }
+    exec_once(app, host, script, input, timeout)
+}
+
+/// Forget a server's connection (after a password change or when it is removed).
+pub fn drop_worker(app: &AppHandle, id: &str) {
+    if let Some(slot) = worker_slot(app, id) {
+        if let Ok(mut guard) = slot.lock() {
+            if let Some(mut worker) = guard.take() {
+                let _ = worker.child.kill();
+                let _ = worker.child.wait();
+            }
+        }
+    }
+}
+
+/// Run a short script on the server with a one-off ssh command.
+fn exec_once(app: &AppHandle, host: &SshHost, script: &str, input: Option<Vec<u8>>, timeout: u64) -> Result<Vec<u8>> {
     let mut cmd: Command = command(program(), &std::env::temp_dir());
     cmd.args(base_args(app, host, true)?).arg("--").arg(destination(host)).arg(script);
     let password = password_for(app, &host.id);
@@ -637,4 +805,16 @@ pub fn ssh_run(
         let (code, _) = job.run(&mut cmd, false)?;
         Ok((code, Vec::new()))
     })
+}
+
+/// Runs a shell command in the remote project folder (only after the person approved it in the chat).
+#[tauri::command]
+pub async fn ssh_command(app: AppHandle, store: State<'_, Store>, id: String, root: String, command_line: String) -> Result<String> {
+    let host = find_host(&store, &id)?;
+    blocking(move || {
+        let script = format!("cd -- {} && {{ {}\n}} 2>&1; echo \"[exit $?]\"", quote(&root), command_line);
+        let out = exec(&app, &host, &script, None, 300)?;
+        Ok(String::from_utf8_lossy(&out).into_owned())
+    })
+    .await
 }

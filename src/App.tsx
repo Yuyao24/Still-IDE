@@ -5,6 +5,7 @@ import Home, { type OpenOptions } from './Home'
 import Ide from './Ide'
 import SettingsView, { type SettingsSection } from './SettingsView'
 import { PasswordDialog } from './Remote'
+import { type Update, findUpdate, installUpdate } from './updates'
 import { type Settings, SettingsContext, activeTheme, applySettings, cachedSettings, loadSettings, saveSettings } from './settings'
 import { findTheme } from './themes'
 import { Icon, IconButton } from './ui'
@@ -19,6 +20,21 @@ export default function App() {
   const [view, setView] = useState<View>({ kind: 'home' })
   const [settingsSection, setSettingsSection] = useState<SettingsSection | null>(null)
   const [toast, setToast] = useState('')
+  const [pending, setPending] = useState<Update | null>(null)
+  const [installing, setInstalling] = useState<number | null>(null)
+  // Look for a newer build a few seconds after starting, and then every six hours.
+  useEffect(() => {
+    if (!settings.autoUpdate) return
+    const look = () => { void findUpdate().then(found => { if (found) setPending(found) }).catch(() => {}) }
+    const first = setTimeout(look, 5000)
+    const repeat = setInterval(look, 6 * 3600 * 1000)
+    return () => { clearTimeout(first); clearInterval(repeat) }
+  }, [settings.autoUpdate])
+  useEffect(() => {
+    const manual = (event: Event) => setPending((event as CustomEvent<Update>).detail)
+    addEventListener('still-update', manual)
+    return () => removeEventListener('still-update', manual)
+  }, [])
   const [asking, setAsking] = useState<{ host: string; retry: boolean; answer: (value: string | null) => void } | null>(null)
   useEffect(() => {
     setPasswordPrompt((host, retry) => new Promise(answer => setAsking({ host, retry, answer })))
@@ -101,6 +117,17 @@ export default function App() {
           onSettings={openSettings} onToggleTheme={toggleTheme} notify={notify} />}
     {settingsSection && <SettingsView section={settingsSection} onSection={setSettingsSection} onClose={() => setSettingsSection(null)} notify={notify} />}
     {asking && <PasswordDialog host={asking.host} retry={asking.retry} onAnswer={value => { asking.answer(value); setAsking(null) }} />}
+    {pending && <div className="update-bar" role="status">
+      <span>{installing === null ? <>Still {pending.version} is ready.</> : <>Downloading Still {pending.version}… {Math.round(installing * 100)}%</>}</span>
+      {installing === null && <>
+        <button className="text-btn primary" onClick={() => {
+          setInstalling(0)
+          void installUpdate(pending, setInstalling).catch(error => { setInstalling(null); notify('The update could not be installed: ' + (error instanceof Error ? error.message : String(error))) })
+        }}>Restart to update</button>
+        <button className="quiet-link" onClick={() => setPending(null)}>Later</button>
+      </>}
+      {installing !== null && <i className="update-progress" style={{ transform: `scaleX(${installing})` }} />}
+    </div>}
     {toast && <div className="toast" role="status"><Icon glyph={CircleAlert} /><span className="flex-1">{toast}</span><IconButton glyph={X} label="Dismiss message" onClick={() => setToast('')} /></div>}
   </SettingsContext.Provider>
 }

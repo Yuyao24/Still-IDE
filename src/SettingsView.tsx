@@ -1,18 +1,20 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
-  Check, Code2, Copy, FileDown, FolderOpen, FolderSearch, Import, Info, Keyboard, Palette, Pencil, Plus, Server, SquareTerminal, Trash2, X,
-} from 'lucide-react'
+  Check, Code2, Copy, FileDown, FolderOpen, FolderSearch, Import, Info, Keyboard, Palette, Pencil, Plus, Server, SquareTerminal, Trash2, X, Sparkles } from 'lucide-react'
 import { type AppPaths, type PlanItem, type ShellOption, type SshOverview, desktop, home, hostLabel, mod, pickFolder, ssh } from './bridge'
 import { blankHost, HostDialog } from './Remote'
 import { editorFonts, useSettings } from './settings'
+import { findUpdate } from './updates'
+import { claudeModels, keys, ollamaModels } from './ai'
 import { type Theme, type ThemeColors, editableColors, exportTheme, isHex, parseTheme, presets, resolve } from './themes'
 import { Icon, IconButton, Segmented, Toggle } from './ui'
 
-export type SettingsSection = 'appearance' | 'editor' | 'terminal' | 'projects' | 'remote' | 'shortcuts' | 'about'
+export type SettingsSection = 'appearance' | 'editor' | 'ai' | 'terminal' | 'projects' | 'remote' | 'shortcuts' | 'about'
 
 const sections: { id: SettingsSection; label: string; icon: typeof Palette }[] = [
   { id: 'appearance', label: 'Appearance', icon: Palette },
   { id: 'editor', label: 'Editor', icon: Code2 },
+  { id: 'ai', label: 'AI', icon: Sparkles },
   { id: 'terminal', label: 'Terminal', icon: SquareTerminal },
   { id: 'projects', label: 'Projects', icon: FolderOpen },
   { id: 'remote', label: 'Servers', icon: Server },
@@ -40,6 +42,7 @@ export default function SettingsView({ section, onSection, onClose, notify }: {
         <div className="settings-scroll">
           {section === 'appearance' && <Appearance notify={notify} />}
           {section === 'editor' && <EditorSettings />}
+          {section === 'ai' && <AiSettingsView />}
           {section === 'terminal' && <TerminalSettings />}
           {section === 'projects' && <ProjectSettings notify={notify} />}
           {section === 'remote' && <ServerSettings notify={notify} />}
@@ -213,6 +216,7 @@ function EditorSettings() {
       <Toggle label="Wrap long lines" checked={settings.wordWrap} onChange={value => update({ wordWrap: value })} />
       <Toggle label="Line numbers" checked={settings.lineNumbers} onChange={value => update({ lineNumbers: value })} />
       <Toggle label="Highlight the current line" checked={settings.highlightLine} onChange={value => update({ highlightLine: value })} />
+      <Toggle label="Suggest completions while typing" description="Off: press Ctrl+Space to see suggestions. Either way, Tab accepts a suggestion and Enter always starts a new line." checked={settings.autocomplete} onChange={value => update({ autocomplete: value })} />
       <div className="setting-row"><span className="setting-text"><span>Auto save</span><small>Save after a short pause, or when the editor loses focus.</small></span>
         <Segmented label="Auto save" value={settings.autoSave} onChange={value => update({ autoSave: value })}
           options={[{ value: 'off', label: 'Off' }, { value: 'delay', label: 'After delay' }, { value: 'blur', label: 'On focus change' }]} /></div>
@@ -325,6 +329,78 @@ function Shortcuts() {
   </section>)}</>
 }
 
+function AiSettingsView() {
+  const { settings, update } = useSettings()
+  const [hasKey, setHasKey] = useState<boolean | null>(null)
+  const [draft, setDraft] = useState('')
+  const [message, setMessage] = useState('')
+  const [models, setModels] = useState<string[] | null>(null)
+  const [ollamaError, setOllamaError] = useState('')
+  useEffect(() => { void keys.status().then(setHasKey).catch(() => setHasKey(false)) }, [])
+  function loadModels() {
+    setOllamaError('')
+    void ollamaModels(settings.ollamaUrl).then(list => { setModels(list); if (!settings.ollamaModel && list[0]) update({ ollamaModel: list[0] }) })
+      .catch(() => { setModels(null); setOllamaError("Couldn't reach Ollama at that address. Is it running? (ollama serve)") })
+  }
+  useEffect(() => { if (settings.aiProvider === 'ollama') loadModels() }, [settings.aiProvider, settings.ollamaUrl])
+  return <>
+    <section className="settings-group">
+      <h3>Assistant</h3>
+      <div className="setting-row"><span className="setting-text"><span>Provider</span><small>Claude runs on Anthropic's servers with your API key. Ollama runs a model on this computer.</small></span>
+        <Segmented label="Provider" value={settings.aiProvider} onChange={value => update({ aiProvider: value })} options={[{ value: 'anthropic', label: 'Claude' }, { value: 'ollama', label: 'Ollama' }]} /></div>
+      <Toggle label="Apply the agent's file edits without asking" description="Off: every edit shows a diff to approve. Commands always ask first." checked={settings.aiAutoApprove} onChange={value => update({ aiAutoApprove: value })} />
+    </section>
+    {settings.aiProvider === 'anthropic' && <section className="settings-group">
+      <h3>Claude</h3>
+      <form className="form-grid" onSubmit={event => {
+        event.preventDefault()
+        void keys.set(draft).then(() => { setDraft(''); setHasKey(true); setMessage('Saved in the system keychain.') }).catch(error => setMessage(String(error)))
+      }}>
+        <label>Anthropic API key<input className="field" type="password" value={draft} onChange={event => setDraft(event.target.value)} placeholder={hasKey ? 'A key is saved. Paste a new one to replace it.' : 'sk-ant-…'} autoComplete="off" spellCheck={false} /></label>
+        <div className="flex items-center gap-2">
+          <button className="text-btn primary" type="submit" disabled={!draft.trim()}>Save key</button>
+          {hasKey && <button className="text-btn" type="button" onClick={() => { void keys.set(null).then(() => { setHasKey(false); setMessage('Key removed.') }) }}>Remove key</button>}
+          <span className="help">{message || (hasKey ? 'A key is saved.' : 'Create one at console.anthropic.com → API keys.')}</span>
+        </div>
+      </form>
+      <div className="setting-row"><span className="setting-text"><span>Model</span><small>Opus is the most capable; Sonnet is faster; Haiku is quickest and cheapest.</small></span>
+        <select className="field" style={{ width: 200 }} value={settings.aiModel} onChange={event => update({ aiModel: event.target.value })}>{claudeModels.map(model => <option key={model.id} value={model.id}>{model.label}</option>)}</select></div>
+      <div className="setting-row"><span className="setting-text"><span>Effort</span><small>How long Claude thinks before answering. Higher is slower and uses more tokens.</small></span>
+        <Segmented label="Effort" value={settings.aiEffort} onChange={value => update({ aiEffort: value })} options={[{ value: 'low', label: 'Low' }, { value: 'medium', label: 'Medium' }, { value: 'high', label: 'High' }]} /></div>
+      <p className="help">Requests go straight from Still to Anthropic with your key and are billed to your account. The key is kept in your system's keychain, not in Still's settings file.</p>
+    </section>}
+    {settings.aiProvider === 'ollama' && <section className="settings-group">
+      <h3>Ollama</h3>
+      <div className="form-grid">
+        <label>Server address<input className="field" value={settings.ollamaUrl} onChange={event => update({ ollamaUrl: event.target.value })} spellCheck={false} /></label>
+      </div>
+      <div className="setting-row"><span className="setting-text"><span>Model</span><small>Pick a model that supports tools (for example qwen3, llama3.1 or mistral-nemo) for the agent.</small></span>
+        {models?.length ? <select className="field" style={{ width: 200 }} value={settings.ollamaModel} onChange={event => update({ ollamaModel: event.target.value })}>{models.map(model => <option key={model}>{model}</option>)}</select>
+          : <button className="text-btn" onClick={loadModels}>Look for models</button>}</div>
+      {ollamaError && <p className="form-error">{ollamaError}</p>}
+      {models && !models.length && <p className="help">Ollama is running but has no models. Run <code>ollama pull qwen3</code> in a terminal.</p>}
+    </section>}
+  </>
+}
+
+function UpdateCheck() {
+  const { settings, update } = useSettings()
+  const [state, setState] = useState<'idle' | 'checking' | 'current' | 'error'>('idle')
+  return <div className="mt-3">
+    <div className="flex items-center gap-3">
+      <button className="text-btn" disabled={state === 'checking'} onClick={() => {
+        setState('checking')
+        void findUpdate().then(found => {
+          if (found) { dispatchEvent(new CustomEvent('still-update', { detail: found })); setState('idle') }
+          else setState('current')
+        }).catch(() => setState('error'))
+      }}>{state === 'checking' ? 'Checking…' : 'Check for updates'}</button>
+      <span className="help">{state === 'current' ? 'You have the newest build.' : state === 'error' ? "Couldn't reach GitHub. The repository needs to be public for updates." : ''}</span>
+    </div>
+    <Toggle label="Check for updates automatically" description="Looks for a newer build when Still starts and every few hours. Updates install only when you choose Restart to update." checked={settings.autoUpdate} onChange={value => update({ autoUpdate: value })} />
+  </div>
+}
+
 function About({ notify }: { notify: (message: unknown) => void }) {
   const [paths, setPaths] = useState<AppPaths | null>(null)
   const [plan, setPlan] = useState<PlanItem[] | null>(null)
@@ -344,6 +420,7 @@ function About({ notify }: { notify: (message: unknown) => void }) {
     <section className="settings-group">
       <h3>Still {paths?.version ?? ''}</h3>
       <p className="help">A keyboard-centric editor for Python, Java and more, built with Tauri, Rust and React.</p>
+      {desktop && <UpdateCheck />}
       {paths && <>
         <p className="settings-caption mt-4">Still keeps its own data here</p>
         {paths.directories.map(dir => <div key={dir} className="path-box mb-1"><span className="truncate flex-1 font-mono text-[11px]">{dir}</span>

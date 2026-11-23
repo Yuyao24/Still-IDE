@@ -77,7 +77,9 @@ mark { background: var(--accent-fill); color: var(--ink); outline: 1px solid var
 .chrome-left { display: flex; align-items: center; min-width: 0; gap: 8px; }
 .chrome-center { display: flex; min-width: 0; justify-content: center; }
 .chrome-actions { height: 100%; display: flex; gap: 6px; justify-content: flex-end; align-items: center; min-width: 0; }
-.brand { display: flex; align-items: center; height: 28px; color: var(--ink); flex-shrink: 0; }
+.brand { display: flex; align-items: center; gap: 8px; height: 28px; color: var(--ink); flex-shrink: 0; }
+.brand img { width: 18px; height: 18px; }
+:root[data-theme="dark"] .brand img { filter: invert(1) hue-rotate(180deg); }
 .brand-word { font-size: 14px; font-weight: 600; letter-spacing: -.01em; }
 button.brand:hover .brand-word { text-decoration: underline; text-underline-offset: 4px; text-decoration-thickness: 1px; }
 .chrome-slash { color: var(--faint); }
@@ -116,6 +118,9 @@ button.chrome-branch:hover { color: var(--ink); }
 .island.side { grid-row: 1; }
 .island.side.tall { grid-row: 1 / span 2; }
 .island.main { grid-row: 1; background: var(--editor); }
+/* When the editor is the only island, it is the page: no outline. */
+.bench.solo > .island.main { border-color: transparent; transition: border-color var(--base) var(--ease); }
+.bench.solo > .island.main .tab-strip { border-bottom-color: var(--line); }
 .island.graph-island { grid-row: 1; }
 .island.drawer { grid-row: 2; }
 .island-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 12px; }
@@ -176,7 +181,9 @@ button.crumb-symbol:hover { color: var(--ink); }
 .cm-collapsedLines { background: var(--hover) !important; color: var(--muted) !important; border-block: 1px solid var(--line); }
 .cm-diff { max-height: 100%; overflow: auto; }
 /* The caret glides between positions instead of jumping. */
-.smooth-caret .cm-cursorLayer .cm-cursor { transition: left 80ms var(--ease), top 80ms var(--ease), height 80ms var(--ease); }
+.smooth-caret .cm-cursorLayer .cm-cursor { transition: left 70ms var(--ease), top 70ms var(--ease); }
+/* While a key repeats, the caret follows instantly so it never lags behind the real position. */
+.smooth-caret.caret-repeat .cm-cursorLayer .cm-cursor { transition: none; }
 
 .empty-editor { position: absolute; inset: 0; display: grid; place-items: center; padding: 24px 0; overflow: auto; color: var(--muted); }
 .empty-inner { width: min(340px, 90%); }
@@ -599,8 +606,8 @@ select.field { padding-block: 5px; }
 
 
 /* ---- Home (Paper) ------------------------------------------------------------ */
-.home { overflow: auto; background: var(--editor); }
-.paper { max-width: 860px; margin: 0 auto; padding: 56px 32px 64px; display: flex; flex-direction: column; gap: 56px; animation: rise 260ms var(--ease); }
+.home { overflow: auto; background-color: var(--editor); background-image: radial-gradient(color-mix(in srgb, var(--muted) 30%, transparent) 1px, transparent 1.2px); background-size: 22px 22px; background-attachment: local; }
+.paper { max-width: 924px; min-height: 100%; margin: 0 auto; padding: 56px 64px 64px; background: var(--editor); box-shadow: 0 0 0 1px var(--line); display: flex; flex-direction: column; gap: 56px; animation: rise 260ms var(--ease); }
 .paper-hero h1 { font-size: 44px; font-weight: 600; letter-spacing: -.03em; line-height: 1.1; }
 .paper-hero p { margin-top: 12px; font-size: 15px; color: var(--muted); }
 .paper-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 26px; }
@@ -688,7 +695,7 @@ button.journal-row:not(:disabled):hover span { text-decoration: underline; text-
   .islands-nav { gap: 10px; overflow: auto hidden; scrollbar-width: none; }
   .bench { padding: 0 12px; --gap: 12px; }
   .status-optional, .session-tabs { display: none; }
-  .paper { padding: 32px 16px 48px; gap: 40px; }
+  .paper { padding: 32px 16px 48px; gap: 40px; box-shadow: none; }
   .paper-hero h1 { font-size: 32px; }
   .overview { padding: 24px 16px; }
   .ov-title { flex-direction: column; gap: 4px; }
@@ -731,6 +738,9 @@ button.journal-row:not(:disabled):hover span { text-decoration: underline; text-
 .doc-markdown code { font-family: var(--font-mono); font-size: 0.86em; padding: 1px 5px; border-radius: 4px; background: var(--panel); border: 1px solid var(--line); }
 .doc-markdown pre { padding: 14px 16px; border-radius: 8px; background: var(--panel); border: 1px solid var(--line); overflow: auto; line-height: 1.6; }
 .doc-markdown pre code { padding: 0; border: 0; background: none; font-size: 13px; }
+.tok-keyword { color: var(--keyword); } .tok-string { color: var(--string); } .tok-number { color: var(--number); } .tok-type { color: var(--type); }
+.tok-function { color: var(--function); } .tok-variable { color: var(--variable); } .tok-property { color: var(--property); } .tok-tag { color: var(--tag); }
+.tok-attribute { color: var(--attribute); } .tok-operator { color: var(--operator); } .tok-comment { color: var(--comment); font-style: var(--comment-style); }
 .doc-markdown hr { border: 0; border-top: 1px solid var(--line); margin: 2em 0; }
 .doc-markdown table { border-collapse: collapse; display: block; overflow-x: auto; font-size: 13px; }
 .doc-markdown th, .doc-markdown td { padding: 7px 12px; border: 1px solid var(--line); text-align: left; }
@@ -749,3 +759,98 @@ button.journal-row:not(:disabled):hover span { text-decoration: underline; text-
 .shot-row { display: flex; flex-direction: column; gap: 6px; color: var(--muted); font-size: 11px; }
 .shot-row .segmented { align-self: flex-start; flex-wrap: wrap; }
 @media (max-width: 760px) { .shot-body { grid-template-columns: 1fr; } }
+
+/* ---- Canvas (Paper) ---------------------------------------------------------- */
+.cv-desk { position: relative; flex: 1; min-height: 0; overflow: hidden; border-top: 1px solid var(--line); background-color: var(--editor); background-image: radial-gradient(color-mix(in srgb, var(--muted) 34%, transparent) 1px, transparent 1.2px); cursor: grab; touch-action: none; user-select: none; -webkit-user-select: none; }
+.cv-desk:active { cursor: grabbing; }
+.cv-world { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
+.cv-world.animate { transition: transform 420ms var(--ease); }
+.cv-links { position: absolute; left: 0; top: 0; width: 1px; height: 1px; overflow: visible; pointer-events: none; }
+.cv-links path { fill: none; stroke: var(--dash); stroke-width: 1.4; stroke-dasharray: 4 5; transition: stroke var(--fast) var(--ease); }
+.cv-links path.lit { stroke: var(--ink); stroke-dasharray: none; }
+.cv-card { position: absolute; background: var(--editor); border: 1px solid var(--line); cursor: grab; animation: fade var(--base) var(--ease); transition: border-color var(--fast) var(--ease), box-shadow var(--base) var(--ease); }
+.cv-card:hover { border-color: var(--dash); }
+.cv-card.is-selected { border-color: var(--ink); }
+.cv-card.is-active { box-shadow: inset 0 0 0 1px var(--ink); border-color: var(--ink); }
+.cv-card.is-dragging { box-shadow: 0 14px 34px var(--shadow); cursor: grabbing; z-index: 3; }
+.cv-card header { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; height: 46px; padding: 0 16px; border-bottom: 1px solid var(--line); }
+.cv-card header b { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 46px; }
+.cv-card header span { color: var(--muted); font-size: 11px; white-space: nowrap; }
+.cv-card.is-changed header span { color: var(--amber); }
+.cv-card.group-test header b::before { content: ""; display: inline-block; width: 6px; height: 6px; margin-right: 8px; vertical-align: 2px; background: var(--green); }
+.cv-card.group-doc header b::before { content: ""; display: inline-block; width: 6px; height: 6px; margin-right: 8px; vertical-align: 2px; background: var(--type); }
+.cv-card pre { margin: 0; padding: 9px 16px; font: 12px/17px var(--font-mono); white-space: pre; overflow: hidden; color: var(--ink); }
+.cv-note { position: absolute; width: 220px; background: color-mix(in srgb, #f6e7a1 70%, var(--editor)); color: #3a3220; border: 1px solid color-mix(in srgb, #d9c46a 60%, var(--editor)); cursor: grab; animation: fade var(--base) var(--ease); }
+.cv-note header { display: flex; justify-content: space-between; padding: 10px 12px 0; font-size: 11px; opacity: .75; }
+.cv-note header button { color: inherit; } .cv-note header button:hover { text-decoration: underline; }
+.cv-note textarea { width: 100%; min-height: 90px; padding: 6px 12px 12px; border: 0; background: transparent; color: inherit; font: 13px/1.5 var(--font-sans); resize: vertical; outline: none; cursor: text; }
+.cv-float { position: absolute; top: 14px; right: 14px; display: flex; align-items: center; gap: 2px; padding: 4px; background: var(--editor); border: 1px solid var(--line); z-index: 4; }
+.cv-float button { height: 28px; padding: 0 10px; color: var(--muted); transition: color var(--fast) var(--ease), background-color var(--fast) var(--ease); }
+.cv-float button:hover { color: var(--ink); background: var(--hover); }
+.cv-zoom { min-width: 48px; text-align: center; font: 11.5px var(--font-mono); color: var(--muted); }
+.cv-map { position: absolute; right: 14px; bottom: 14px; width: 188px; height: 120px; background: var(--editor); border: 1px solid var(--line); overflow: hidden; cursor: pointer; z-index: 4; }
+.cv-map i { position: absolute; background: var(--line); }
+.cv-map i.on { background: var(--ink); }
+.cv-map span { position: absolute; border: 1px solid var(--ink); }
+.cv-hint { position: absolute; left: 14px; bottom: 14px; z-index: 4; padding: 5px 10px; background: var(--editor); border: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+.mini-desk { position: relative; flex: 1; min-height: 140px; cursor: pointer; background-image: radial-gradient(color-mix(in srgb, var(--muted) 30%, transparent) 1px, transparent 1.2px); background-size: 12px 12px; }
+.mini-desk svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+.mini-desk line { stroke: var(--dash); stroke-width: 1; stroke-dasharray: 2 3; }
+.mini-card { position: absolute; padding: 3px 6px; background: var(--editor); border: 1px solid var(--line); font-size: 10.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: left; animation: fade var(--base) var(--ease) both; transition: color var(--fast) var(--ease), border-color var(--fast) var(--ease); }
+.mini-card:hover { color: var(--ink); border-color: var(--dash); }
+.mini-card.on { color: var(--ink); font-weight: 600; border-color: var(--ink); }
+@media (max-width: 720px) { .cv-hint, .cv-map { display: none; } }
+
+/* ---- Update bar ---------------------------------------------------------------- */
+.update-bar { position: fixed; z-index: 55; left: 24px; bottom: 44px; display: flex; align-items: center; gap: 14px; padding: 10px 12px 10px 16px; background: var(--editor); border: 1px solid var(--ink); overflow: hidden; animation: rise var(--base) var(--ease); }
+.update-progress { position: absolute; left: 0; right: 0; bottom: 0; height: 2px; background: var(--ink); transform-origin: left; transition: transform var(--base) var(--ease); }
+
+/* ---- Chat island --------------------------------------------------------------- */
+.island.chat-island { grid-row: 1 / span 2; }
+.bench[class*="max-"] > .island.chat-island { display: none !important; }
+.chat { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.chat-head { padding: 12px 12px 10px 20px; border-bottom: 1px solid var(--line); }
+.chat-head .under-tabs { gap: 16px; }
+.chat-head-actions { display: flex; gap: 2px; }
+.chat-head-actions button { padding: 3px 7px; font-size: 12px; color: var(--muted); }
+.chat-head-actions button:hover:not(:disabled) { color: var(--ink); background: var(--hover); }
+.chat-list { flex: 1; min-height: 0; overflow: auto; padding: 16px 20px 8px; display: flex; flex-direction: column; gap: 16px; }
+.chat-empty { margin: auto 0; display: flex; flex-direction: column; gap: 14px; color: var(--muted); line-height: 1.6; }
+.chat-suggestions { display: flex; flex-direction: column; border-top: 1px solid var(--line); }
+.chat-suggestions button { text-align: left; padding: 9px 0; border-bottom: 1px solid var(--line); color: var(--secondary); transition: color var(--fast) var(--ease); }
+.chat-suggestions button:hover { color: var(--ink); }
+.chat-turn { animation: rise var(--base) var(--ease); min-width: 0; }
+.chat-turn.user { align-self: flex-end; max-width: 88%; padding: 8px 12px; background: var(--hover); white-space: pre-wrap; overflow-wrap: anywhere; }
+.chat-turn.assistant { display: flex; flex-direction: column; gap: 8px; }
+.chat-text { font-size: 13px; line-height: 1.65; max-width: none; }
+.chat-text > :first-child { margin-top: 0; } .chat-text > :last-child { margin-bottom: 0; }
+.chat-text h1, .chat-text h2, .chat-text h3 { font-size: 14px; margin: 1em 0 .4em; border: 0; padding: 0; }
+.chat-text pre { font-size: 12px; position: relative; }
+.chat-thinking { align-self: flex-start; font-size: 12px; color: var(--muted); border-bottom: 1px dotted var(--dash); }
+.chat-thinking:hover { color: var(--ink); }
+.chat-thinking-text { color: var(--muted); font-size: 12px; line-height: 1.6; white-space: pre-wrap; padding-left: 10px; border-left: 1px solid var(--line); }
+.chat-tool { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.chat-tool i { width: 6px; height: 6px; flex-shrink: 0; background: var(--faint); }
+.chat-tool.state-running i { background: var(--ink); animation: pulse .8s ease-in-out infinite alternate; }
+.chat-tool.state-done i { background: var(--green); }
+.chat-tool.state-declined, .chat-tool.state-failed { color: var(--faint); }
+.chat-tool.state-failed i { background: var(--red); }
+.chat-approval { border: 1px solid var(--ink); background: var(--editor); display: flex; flex-direction: column; animation: rise var(--base) var(--ease); }
+.chat-approval-title { padding: 9px 12px; font-weight: 500; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.chat-approval-title small { color: var(--muted); font: 11px var(--font-mono); margin-left: 6px; }
+.chat-diff, .chat-command { margin: 0; padding: 8px 0; max-height: 260px; overflow: auto; font: 11.5px/1.6 var(--font-mono); white-space: pre; }
+.chat-command { padding: 10px 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.chat-diff span { display: block; padding: 0 12px; }
+.chat-diff .add { background: color-mix(in srgb, var(--green) 12%, var(--editor)); }
+.chat-diff .del { background: color-mix(in srgb, var(--red) 11%, var(--editor)); color: var(--secondary); }
+.chat-approval-actions { display: flex; gap: 8px; padding: 9px 12px; border-top: 1px solid var(--line); }
+.chat-error { color: var(--red); font-size: 12.5px; }
+.chat-working { display: flex; gap: 4px; padding: 4px 0; }
+.chat-working i { width: 5px; height: 5px; background: var(--muted); animation: pulse .7s ease-in-out infinite alternate; }
+.chat-working i:nth-child(2) { animation-delay: .15s; } .chat-working i:nth-child(3) { animation-delay: .3s; }
+.chat-input { border-top: 1px solid var(--line); padding: 10px 14px 12px; display: flex; flex-direction: column; gap: 8px; }
+.chat-input textarea { width: 100%; resize: none; border: 1px solid var(--line); background: var(--editor); color: var(--ink); padding: 8px 10px; font: inherit; line-height: 1.5; outline: none; transition: border-color var(--fast) var(--ease); }
+.chat-input textarea:focus { border-color: var(--ink); }
+.chat-input-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.chat-chip { align-self: flex-start; padding: 2px 8px; border: 1px dashed var(--dash); color: var(--muted); font-size: 11.5px; }
+.chat-chip.on { border-style: solid; border-color: var(--ink); color: var(--ink); }

@@ -1,6 +1,7 @@
 import { useMemo } from 'react'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
+import { highlightToHtml } from './Editor'
 
 export type DocKind = 'markdown' | 'text'
 
@@ -11,7 +12,7 @@ export function docKind(path: string): DocKind | null {
   return null
 }
 
-function renderMarkdown(source: string) {
+export function renderMarkdown(source: string) {
   const html = DOMPurify.sanitize(marked.parse(source, { gfm: true, breaks: false, async: false }) as string)
   const template = document.createElement('template')
   template.innerHTML = html
@@ -24,6 +25,11 @@ function renderMarkdown(source: string) {
     image.replaceWith(note)
   })
   template.content.querySelectorAll('input[type="checkbox"]').forEach(box => box.setAttribute('disabled', ''))
+  // Fenced code blocks get the same colours as the editor.
+  template.content.querySelectorAll('pre code[class*="language-"]').forEach(block => {
+    const language = [...block.classList].find(name => name.startsWith('language-'))?.slice(9) ?? ''
+    block.innerHTML = highlightToHtml(block.textContent ?? '', language)
+  })
   return template.innerHTML
 }
 

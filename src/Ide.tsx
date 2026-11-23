@@ -23,8 +23,11 @@ import { HostDialog, OpenRemoteDialog, RemotePanel, blankHost } from './Remote'
 import { SearchPanel } from './Search'
 import type { SettingsSection } from './SettingsView'
 import { useSettings } from './settings'
+import mark from './still.svg?inline'
 import { type Graph, buildGraph } from './graph'
-import { GraphView, MiniGraph } from './GraphView'
+import { CanvasView, MiniCanvas } from './Canvas'
+import { Chat } from './Chat'
+import type { AgentHost } from './ai'
 import { Idle, useIdle } from './Idle'
 import { JournalSheet, useJournal } from './Journal'
 import { bump, clock, journal, lineChanges, remember } from './activity'
@@ -44,7 +47,7 @@ type Edit = { time: number; line: number }
 type Islands = { side: Side | null; graph: boolean; drawer: boolean }
 const layouts: { id: string; label: string; islands?: Islands }[] = [
   { id: 'classic', label: 'Classic', islands: { side: 'explorer', graph: true, drawer: true } },
-  { id: 'code-graph', label: 'Code and graph', islands: { side: null, graph: true, drawer: false } },
+  { id: 'code-graph', label: 'Code and canvas', islands: { side: null, graph: true, drawer: false } },
   { id: 'review', label: 'Review', islands: { side: 'git', graph: false, drawer: true } },
   { id: 'writing', label: 'Writing', islands: { side: null, graph: false, drawer: false } },
   { id: 'focus', label: 'Focus' },
@@ -126,6 +129,8 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const [graphOpen, setGraphOpen] = useState(() => !workspace.remote && localStorage.getItem('still.island.graph') !== 'off' && window.innerWidth > 1180)
   const [focusMode, setFocusMode] = useState(false)
   const [focusOutput, setFocusOutput] = useState(false)
+  const [chatOpen, setChatOpen] = useState(() => localStorage.getItem('still.island.chat') === 'on')
+  const [chatFocus, setChatFocus] = useState(0)
   const [maximized, setMaximized] = useState<'editor' | 'side' | 'terminal' | null>(null)
   const [overview, setOverview] = useState(false)
   const [graphView, setGraphView] = useState(false)
@@ -167,7 +172,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const tabSize = settings.tabSize === 'auto' ? (active ? defaultIndent(active.path) : 4) : settings.tabSize
   const doc = active && !active.diff ? docKind(active.path) : null
   const docView: DocView = doc ? active?.view ?? 'edit' : 'edit'
-  const editorOptions: EditorOptions = { wrap: settings.wordWrap || Boolean(doc), lineNumbers: settings.lineNumbers, highlightLine: settings.highlightLine, tabSize, layout: settings.diffLayout }
+  const editorOptions: EditorOptions = { wrap: settings.wordWrap || Boolean(doc), lineNumbers: settings.lineNumbers, highlightLine: settings.highlightLine, tabSize, layout: settings.diffLayout, autocomplete: settings.autocomplete }
   const host = remote ? [...(servers?.saved ?? []), ...(servers?.imported ?? [])].find(item => item.id === workspace.remote) : undefined
 
   const notify = useCallback((error: unknown) => toast(errorText(error)), [toast])
@@ -179,6 +184,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const changedPaths = useMemo(() => new Set(status.changes.map(change => change.path)), [status])
 
   useEffect(() => { if (!remote) localStorage.setItem('still.island.graph', graphOpen ? 'on' : 'off') }, [graphOpen])
+  useEffect(() => { localStorage.setItem('still.island.chat', chatOpen ? 'on' : 'off') }, [chatOpen])
 
   // Count active minutes for today's numbers on the idle screen.
   useEffect(() => {
@@ -903,7 +909,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       if (!(event.ctrlKey || event.metaKey) || dialog || menu) return
       if (document.querySelector('.settings-backdrop, .sheet')) return
       const key = event.key.toLowerCase()
-      const shiftOnly = event.shiftKey && ['f', 'h', 'e', 'g', 'v', '`', '~', 'u', 'r', 'd', 'm'].includes(key)
+      const shiftOnly = event.shiftKey && ['f', 'h', 'e', 'g', 'v', '`', '~', 'u', 'r', 'd', 'm', 'a'].includes(key)
       // Plain Ctrl/Cmd+F outside the editor would open the web view's own find bar; send it to the editor instead.
       if (key === 'f' && !event.shiftKey && !event.altKey && !(event.target as Element | null)?.closest?.('.cm-editor, input, textarea, .xterm')) {
         event.preventDefault(); editor.current?.find(); return
@@ -918,13 +924,15 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       if (key === 'arrowup') { openOverview(); return }
       if (key === '.') { toggleFocus(); return }
       if (key === 'v' && event.shiftKey) { cycleDocView(); return }
-      if (key === 'f') showSide('search')
-      if (key === 'e' && event.shiftKey) showSide('explorer')
-      if (key === 'g' && event.shiftKey && !remote) showSide('git')
+      // The island shortcuts toggle: press once to show, again to hide.
+      if (key === 'f') { if (focusMode) setFocusMode(false); showSide('search', true) }
+      if (key === 'e' && event.shiftKey) { if (focusMode) setFocusMode(false); showSide('explorer', true) }
+      if (key === 'g' && event.shiftKey && !remote) { if (focusMode) setFocusMode(false); showSide('git', true) }
       if (key === 'u' && event.shiftKey && !remote) showSide('packages', true)
       if (key === 'r' && event.shiftKey) showSide('remote', true)
       if (key === 'd' && event.shiftKey) setGraphOpen(value => !value)
       if (key === 'm' && event.shiftKey) toggleMaximize()
+      if (key === 'a' && event.shiftKey) toggleChat()
       if (key === 'h' && event.shiftKey) goHome()
       if (key === '`' || key === '~') { setDrawer('terminal'); setDrawerOpen(true); if (desktop) { remote ? remoteSession() : newSession() } }
       if (key === ',') onSettings()
@@ -962,6 +970,11 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     addEventListener('keydown', escape)
     return () => removeEventListener('keydown', escape)
   })
+
+  function toggleChat() {
+    if (focusMode) setFocusMode(false)
+    setChatOpen(value => { if (!value) setChatFocus(count => count + 1); return !value })
+  }
 
   function toggleFocus() {
     setFocusMode(value => !value)
@@ -1049,9 +1062,10 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     { id: 'folder', label: 'Open folder', shortcut: mod + '+O', icon: FolderOpen, action: chooseFolder },
     { id: 'overview', label: 'Overview of everything', shortcut: mod + '+↑', icon: LayoutGrid, action: openOverview },
     { id: 'focus', label: focusMode ? 'Leave focus mode' : 'Focus mode', shortcut: mod + '+.', icon: Maximize2, action: toggleFocus },
-    { id: 'graph-view', label: 'Open project graph', icon: Network, action: () => setGraphView(true) },
-    { id: 'graph-island', label: graphOpen ? 'Hide the graph island' : 'Show the graph island', icon: Network, action: () => setGraphOpen(value => !value) },
+    { id: 'graph-view', label: 'Open the canvas', icon: Network, action: () => setGraphView(true) },
+    { id: 'graph-island', label: graphOpen ? 'Hide the canvas island' : 'Show the canvas island', icon: Network, action: () => setGraphOpen(value => !value) },
     { id: 'journal', label: 'Open journal', icon: BookOpen, action: () => setJournalOpen(true) },
+    { id: 'chat', label: chatOpen ? 'Hide chat' : 'Chat with the assistant', shortcut: mod + '+Shift+A', icon: BookOpen, action: toggleChat },
     ...layouts.filter(item => item.islands).map(item => ({ id: 'layout-' + item.id, label: 'Layout: ' + item.label, icon: LayoutGrid, action: () => applyLayout(item.id) })),
     { id: 'new', label: 'New file', icon: FilePlus2, action: () => newFile() },
     ...(desktop || remote ? [{ id: 'new-folder', label: 'New folder', icon: FolderPlus, action: () => newFolder() }] : []),
@@ -1115,8 +1129,9 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     onEdit: (contents: string) => edited(active, contents),
   } : null
   // On narrow windows the graph island steps aside on its own; the setting is kept for when there is room again.
-  const showGraph = graphOpen && frame.width >= 1080
-  const columns = maximized ? 'minmax(0, 1fr)' : [sidebar ? workspaceWidth + 'px' : '', 'minmax(0, 1fr)', showGraph ? '272px' : ''].filter(Boolean).join(' ')
+  const showChat = chatOpen && frame.width >= 760
+  const showGraph = graphOpen && frame.width >= (showChat ? 1560 : 1080)
+  const columns = maximized ? 'minmax(0, 1fr)' : [sidebar ? workspaceWidth + 'px' : '', 'minmax(0, 1fr)', showGraph ? '272px' : '', showChat ? (frame.width < 1100 ? '320px' : '380px') : ''].filter(Boolean).join(' ')
   const rows = maximized ? 'minmax(0, 1fr)' : drawerOpen ? 'minmax(0, 1fr) ' + actualDrawerHeight + 'px' : 'minmax(0, 1fr)'
   const marks = active ? edits[active.path] ?? [] : []
   const tabSlider = useSlider(selected + tabs.length + sidebar + graphOpen + focusMode)
@@ -1129,12 +1144,43 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     ...otherTabs.map(tab => ({ key: 'tab:' + tab.id, title: fileName(tab.path), note: dirty(tab) ? 'unsaved' : undefined, body: excerpt(tab.contents, 6) })),
     { key: 'explorer', title: 'Files', hidden: sidebar !== 'explorer', body: <span className="ov-list">{(directories[''] ?? []).slice(0, 5).map(entry => <span key={entry.path}>{entry.name}{entry.directory ? '/' : ''}</span>)}</span> },
     { key: 'terminal', title: 'Terminal', hidden: !drawerOpen, body: excerpt(output.map(entry => entry.text).join('\n').split('\n').filter(Boolean).slice(-4).join('\n') || (sessions.length ? sessions.length + (sessions.length === 1 ? ' session open' : ' sessions open') : 'No output yet'), 4) },
-    { key: 'graph', title: 'Graph', hidden: !graphOpen, fullLabel: 'Open graph', body: <span className="ov-dots" aria-hidden="true"><i /><i /><i /><i /><i /></span> },
+    { key: 'graph', title: 'Canvas', hidden: !graphOpen, fullLabel: 'Open canvas', body: <span className="ov-dots" aria-hidden="true"><i /><i /><i /><i /><i /></span> },
     { key: 'journal', title: 'Journal', fullLabel: 'Open journal', body: <span className="ov-list">{projectEntries.length ? projectEntries.map(entry => <span key={entry.id}>{clock(entry.time)} {entry.text}</span>) : <span>Nothing noted yet</span>}</span> },
     remote
       ? { key: 'remote', title: 'Servers', hidden: sidebar !== 'remote', body: <span className="ov-list"><span>{workspace.hostName}</span><span>{workspace.root}</span></span> }
       : { key: 'git', title: 'Git', hidden: sidebar !== 'git', body: <span className="ov-list"><span>{status.changes.length} {status.changes.length === 1 ? 'change' : 'changes'} on {status.branch ?? 'no branch'}</span>{sidebar !== 'git' && <span>Click to show</span>}</span> },
   ]
+  const agentHost: Omit<AgentHost, 'approve'> = {
+    root: workspace.root,
+    remote,
+    activeFile: active && !active.diff ? { path: active.path, text: active.contents, selection: editor.current?.selection() || undefined } : undefined,
+    listFiles: async () => (await fs.files()).map(entry => entry.path),
+    read: async path => latest.current.tabs.find(tab => tab.path === path && !tab.diff)?.contents ?? fs.read(path),
+    search: async query => {
+      const result = await fs.search(query, { regex: false, caseSensitive: false, wholeWord: false })
+      if (!result.matches.length) return 'No matches.'
+      return result.matches.slice(0, 200).map(match => `${match.path}:${match.line}: ${match.preview.trim()}`).join('\n') + (result.truncated || result.matches.length > 200 ? '\n… more matches not shown' : '')
+    },
+    write: async (path, contents) => {
+      const open = latest.current.tabs.find(tab => tab.path === path && !tab.diff)
+      const exists = open ? true : await fs.read(path).then(() => true, () => false)
+      if (!exists) await fs.create(path)
+      const previous = open?.saved ?? (exists ? await fs.read(path) : '')
+      await fs.save(path, contents, previous)
+      const { added, removed } = lineChanges(previous, contents)
+      if (record && !workspace.sample) journal.add({ kind: 'edit', project: workspace.name, root: workspace.root, path, text: 'Agent edited ' + fileName(path), detail: '+' + added + ' −' + removed, added, removed })
+      setTabs(previous => previous.map(tab => tab.path === path && !tab.diff ? { ...fileTab(path, contents), id: tab.id } : tab))
+      void refreshFiles(); void refreshGit()
+    },
+    run: async command => {
+      if (!desktop) return 'Commands run in the Still desktop app.'
+      if (remote) return invoke<string>('ssh_command', { id: workspace.remote, root: workspace.root, commandLine: command })
+      const result = await invoke<{ code: number | null; stdout: string; stderr: string; timed_out: boolean }>('ai_run_command', { rootPath: workspace.root, commandLine: command, timeoutSecs: 180 })
+      return [result.stdout && 'stdout:\n' + result.stdout, result.stderr && 'stderr:\n' + result.stderr, result.timed_out ? 'Stopped after 3 minutes.' : 'exit code ' + result.code].filter(Boolean).join('\n')
+    },
+    open: (path, line) => jumpTo({ path, line: line ?? 1 }),
+  }
+
   const runButton = runnable && active && <button type="button" className="run" title={'Run ' + (remote ? 'on ' + workspace.hostName + ' ' : '') + '(' + mod + '+Enter). Right-click for arguments.'} disabled={Boolean(job) || runningRequest || !jobReady}
     onClick={() => { void run() }} onContextMenu={event => { event.preventDefault(); askArguments() }}>{job?.kind === 'run' ? 'Running…' : 'Run'}</button>
 
@@ -1143,7 +1189,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       left={focusMode
         ? <span className="focus-path">{workspace.name}{active && active.path.split('/').map((part, index, all) => <span key={index}><i>/</i>{index === all.length - 1 ? <b>{part}</b> : part}</span>)}</span>
         : <>
-          <button className="brand" onClick={goHome} title={'Home (' + mod + '+Shift+H)'}><span className="brand-word">Still</span></button>
+          <button className="brand" onClick={goHome} title={'Home (' + mod + '+Shift+H)'}><img src={mark} alt="" /><span className="brand-word">Still</span></button>
           <span className="chrome-slash">/</span>
           <button className="chrome-project" onClick={event => {
             const box = event.currentTarget.getBoundingClientRect()
@@ -1165,7 +1211,8 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
           {item.label}{item.key === 'git' && status.changes.length > 0 && <span className="nav-count">{Math.min(status.changes.length, 99)}</span>}
         </button>)}
         <span className="nav-rule" />
-        <button aria-pressed={graphOpen} className={graphOpen ? 'is-on' : ''} onClick={() => setGraphOpen(value => !value)} data-tip={(graphOpen ? 'Hide' : 'Show') + ' graph · ' + mod + '+Shift+D'}>Graph</button>
+        <button aria-pressed={graphOpen} className={graphOpen ? 'is-on' : ''} onClick={() => setGraphOpen(value => !value)} data-tip={(graphOpen ? 'Hide' : 'Show') + ' canvas · ' + mod + '+Shift+D'}>Canvas</button>
+        <button aria-pressed={showChat} className={showChat ? 'is-on' : ''} onClick={toggleChat} data-tip={(showChat ? 'Hide' : 'Show') + ' chat · ' + mod + '+Shift+A'}>Chat</button>
         <button aria-pressed={drawerOpen} className={drawerOpen ? 'is-on' : ''} onClick={() => drawerOpen && drawer === 'terminal' ? setDrawerOpen(false) : showDrawer('terminal', true)} data-tip={(drawerOpen && drawer === 'terminal' ? 'Hide' : 'Show') + ' terminal · ' + mod + '+J'}>Terminal</button>
         <span className="nav-rule" />
         <button onClick={toggleFocus} data-tip={'Only the code · ' + mod + '+.'}>Focus</button>
@@ -1194,7 +1241,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       </div>
     </aside>}
 
-    <div className={'bench' + (maximized ? ' max-' + maximized : '') + (focusMode && focusOutput ? ' with-output' : '')} style={{ gridTemplateColumns: focusMode ? undefined : columns, gridTemplateRows: focusMode ? undefined : rows }}>
+    <div className={'bench' + (maximized ? ' max-' + maximized : '') + (focusMode && focusOutput ? ' with-output' : '') + (maximized === 'editor' || (!sidebar && !showGraph && !drawerOpen && !showChat) ? ' solo' : '')} style={{ gridTemplateColumns: focusMode ? undefined : columns, gridTemplateRows: focusMode ? undefined : rows }}>
       {sidebar && <aside className={'island side' + (drawerOpen ? ' tall' : '')} key={'side-' + sidebar} aria-label={sideItems.find(item => item.key === sidebar)?.label + ' island'}>
         {sidebar === 'explorer' && <Explorer workspace={workspace} directories={directories} expanded={expanded} active={active?.path} changes={status} symbols={symbols}
           onOpen={path => { void openFile(path) }} onExpand={toggleFolder} onNew={() => newFile()} onNewFolder={() => newFolder()} onWorkspace={chooseFolder}
@@ -1282,11 +1329,16 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
         </section>
       </main>
 
-      {showGraph && <aside className="island graph-island" aria-label="Graph island">
-        <MiniGraph graph={graph} active={active && !active.diff ? active.path : undefined} onOpen={path => { void openFile(path) }} onExpand={() => setGraphView(true)} />
+      {showGraph && <aside className="island graph-island" aria-label="Canvas island">
+        <MiniCanvas graph={graph} root={workspace.root} active={active && !active.diff ? active.path : undefined} onOpen={path => { void openFile(path) }} onExpand={() => setGraphView(true)} />
       </aside>}
 
-      {(drawerOpen || sessions.length > 0) && <section className="island drawer" style={{ display: drawerOpen ? undefined : 'none', gridColumn: maximized ? '1 / -1' : sidebar ? '2 / -1' : '1 / -1', gridRow: maximized ? '1' : undefined }} aria-label="Terminal island">
+      {showChat && <aside className="island chat-island" style={{ gridColumn: '-2 / -1' }} aria-label="Chat island">
+        <Chat settings={{ provider: settings.aiProvider, model: settings.aiModel, effort: settings.aiEffort, ollamaUrl: settings.ollamaUrl, ollamaModel: settings.ollamaModel, autoApproveEdits: settings.aiAutoApprove }}
+          host={agentHost} projectKey={(workspace.remote ?? '') + workspace.root} focusKey={chatFocus} onSettings={() => onSettings('ai')} onClose={() => setChatOpen(false)} />
+      </aside>}
+
+      {(drawerOpen || sessions.length > 0) && <section className="island drawer" style={{ display: drawerOpen ? undefined : 'none', gridColumn: maximized ? '1 / -1' : (sidebar ? '2' : '1') + (showChat ? ' / -2' : ' / -1'), gridRow: maximized ? '1' : undefined }} aria-label="Terminal island">
         <SplitGrip value={actualDrawerHeight} min={128} max={drawerMax} change={setDrawerHeight} />
         <div className="drawer-nav">
           <div className="drawer-tabs" role="tablist" aria-label="Console views" ref={drawerSlider.ref}>
@@ -1376,7 +1428,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       onNewSpace={() => { setOverview(false); chooseFolder() }}
       onLayout={id => applyLayout(id)}
       onSaveLayout={() => { try { localStorage.setItem('still.layout.custom', JSON.stringify(islands)) } catch { /* ignore */ } notify('Saved this layout. Pick it under Layouts as Saved.') }} />}
-    {graphView && <GraphView graph={graph} error={graphError} project={workspace.name} active={active && !active.diff ? active.path : undefined} changed={changedPaths}
+    {graphView && <CanvasView graph={graph} error={graphError} root={workspace.root} project={workspace.name} active={active && !active.diff ? active.path : undefined} changed={changedPaths}
       onOpen={path => { setGraphView(false); void openFile(path) }} onClose={() => { setGraphView(false); requestAnimationFrame(() => editor.current?.focus()) }} />}
     {idle && <Idle sources={tabs.filter(tab => !tab.diff).map(tab => ({ path: tab.path, project: workspace.name, text: tab.contents, edited: edits[tab.path]?.at(-1)?.time }))} onWake={wake} />}
     {palette !== null && <Palette commands={commands} files={fileItems} start={palette} onClose={closePalette} />}

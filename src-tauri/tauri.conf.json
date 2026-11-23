@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Still",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "identifier": "dev.still.editor",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -51,6 +51,18 @@
     },
     "macOS": {
       "minimumSystemVersion": "10.15"
+    },
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDM5MkMzRkNERjUxRkZGNzkKUldSNS94LzF6VDhzT2Vhamw3NHYvbHVsQTZ3WmtEaXJRcldGQmt3Q3VaMnlWMUU1UjlZNzBpL1kK",
+      "endpoints": [
+        "https://github.com/Yuyao24/still-ide/releases/download/latest/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
     }
   }
 }

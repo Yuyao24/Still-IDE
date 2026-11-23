@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod ai;
 mod config;
 mod git;
 mod packages;
@@ -18,9 +19,13 @@ fn main() {
     }
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_http::init())
         .manage(process::Jobs::default())
         .manage(terminal::TerminalState::default())
         .manage(ssh::Passwords::default())
+        .manage(ssh::Workers::default())
         .setup(|app| {
             let store = config::Store::load(app.handle());
             app.manage(store);
@@ -41,6 +46,11 @@ fn main() {
             projects::open_external,
             projects::save_png,
             ssh::ssh_set_password,
+            ssh::ssh_command,
+            ai::ai_key_status,
+            ai::ai_key_get,
+            ai::ai_key_set,
+            ai::ai_run_command,
             workspace::workspace_info,
             workspace::list_directory,
             workspace::list_files,

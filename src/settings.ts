@@ -29,6 +29,14 @@ export interface Settings {
   idleMinutes: number
   smoothCaret: boolean
   journal: boolean
+  autocomplete: boolean
+  autoUpdate: boolean
+  aiProvider: 'anthropic' | 'ollama'
+  aiModel: string
+  aiEffort: 'low' | 'medium' | 'high'
+  ollamaUrl: string
+  ollamaModel: string
+  aiAutoApprove: boolean
 }
 
 export const defaults: Settings = {
@@ -57,6 +65,14 @@ export const defaults: Settings = {
   idleMinutes: 5,
   smoothCaret: true,
   journal: true,
+  autocomplete: false,
+  autoUpdate: true,
+  aiProvider: 'anthropic',
+  aiModel: 'claude-opus-5-5',
+  aiEffort: 'medium',
+  ollamaUrl: 'http://localhost:11434',
+  ollamaModel: '',
+  aiAutoApprove: false,
 }
 
 export const editorFonts = [
@@ -122,6 +138,7 @@ export function applySettings(settings: Settings, systemDark: boolean) {
   root.setProperty('--ligatures', settings.ligatures ? 'contextual common-ligatures' : 'none')
   root.setProperty('--font-features', settings.ligatures ? '"liga" 1, "calt" 1' : '"liga" 0, "calt" 0')
   document.documentElement.classList.toggle('smooth-caret', settings.smoothCaret)
+  watchKeyRepeat()
   return theme
 }
 
@@ -133,3 +150,14 @@ export interface SettingsContextValue {
 
 export const SettingsContext = createContext<SettingsContextValue>({ settings: defaults, theme: findTheme('still-dark', []), update: () => {} })
 export const useSettings = () => useContext(SettingsContext)
+
+let watching = false
+/** Marks the page while a key auto-repeats, so the gliding caret can keep up. */
+function watchKeyRepeat() {
+  if (watching) return
+  watching = true
+  const root = document.documentElement
+  addEventListener('keydown', event => { if (event.repeat) root.classList.add('caret-repeat') }, true)
+  addEventListener('keyup', () => requestAnimationFrame(() => root.classList.remove('caret-repeat')), true)
+  addEventListener('blur', () => root.classList.remove('caret-repeat'))
+}
