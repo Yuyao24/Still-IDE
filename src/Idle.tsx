@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { type DayStats, today } from './journal'
+import { type DayStats, today } from './activity'
 
 export interface IdleSource { path: string; project: string; text: string; edited?: number }
 

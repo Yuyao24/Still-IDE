@@ -8,7 +8,7 @@ import {
 import { blankHost, HostDialog, hostMenu, OpenRemoteDialog } from './Remote'
 import { useSettings } from './settings'
 import { entryText, JournalSheet, useJournal } from './Journal'
-import { type Resume, clock, journal, resumeFor, sameDay } from './journal'
+import { type Resume, clock, journal, resumeFor, sameDay } from './activity'
 import { TitleBar } from './TitleBar'
 import { Icon, IconButton, Menu, Modal, Toggle, relativeTime, type MenuEntry, type MenuState } from './ui'
 

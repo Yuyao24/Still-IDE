@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { type JournalEntry, clock, journal, sameDay } from './journal'
+import { type JournalEntry, clock, journal, sameDay } from './activity'
 import { Modal } from './ui'
 
 export function useJournal() {
