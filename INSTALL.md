@@ -4,6 +4,27 @@ Still is built from source on the computer it will run on. Building takes a few
 minutes the first time and needs about 3 GB of free disk space for the Rust
 build cache (you can delete it afterwards; see [Cleaning up the build](#cleaning-up-the-build)).
 
+## Easiest: download a prebuilt installer
+
+GitHub builds Still automatically every time the code changes, so you don't
+need any developer tools on your computer:
+
+1. Open the repository on GitHub and click **Actions → Build Still**.
+2. Open the newest run with a green tick, scroll to **Artifacts**, and
+   download **Still-Windows** (or Still-macOS / Still-Linux).
+3. Unzip it and run `Still_…_x64-setup.exe`. It installs for your user only,
+   with no administrator rights needed.
+
+Tagged versions (like `v0.2.1`) are also published under **Releases**.
+To update, download the newer installer and run it over the old one; your
+settings and projects are kept.
+
+The installers are not code-signed, so Windows SmartScreen shows "Windows
+protected your PC": click **More info → Run anyway**. If Smart App Control is
+on, Windows may refuse to run unsigned apps altogether.
+
+The rest of this page is for building Still yourself.
+
 ## 1. Install the prerequisites
 
 | | Windows 10/11 | macOS 10.15+ | Linux |
