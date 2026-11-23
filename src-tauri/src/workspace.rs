@@ -5,7 +5,7 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
-use tauri::{AppHandle, Manager};
+use regex::RegexBuilder;
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -58,9 +58,8 @@ pub fn resolve(root: &Path, path: &str) -> Result<PathBuf> {
 
 #[derive(Serialize)]
 pub struct WorkspaceInfo {
-    root: String,
-    name: String,
-    sample: bool,
+    pub root: String,
+    pub name: String,
 }
 
 #[derive(Serialize)]
@@ -106,48 +105,8 @@ pub fn workspace_info(path: String) -> Result<WorkspaceInfo> {
         .map(|name| name.to_string_lossy().into_owned());
     Ok(WorkspaceInfo {
         name: name.unwrap_or_else(|| path.display().to_string()),
-        root: path.to_string_lossy().into_owned(),
-        sample: false,
+        root: crate::projects::canonical(&path),
     })
-}
-
-#[tauri::command]
-pub fn sample_workspace(app: AppHandle) -> Result<WorkspaceInfo> {
-    let folder = app
-        .path()
-        .app_local_data_dir()
-        .map_err(err)?
-        .join("orbit-lab");
-    fs::create_dir_all(&folder).map_err(err)?;
-    let marker = folder.join(".still-initialized");
-    if !marker.exists() {
-        let samples = [
-            ("src/app.py", include_str!("../sample/app.py")),
-            ("src/Main.java", include_str!("../sample/Main.java")),
-            (
-                "tests/test_orbit.py",
-                include_str!("../sample/test_orbit.py"),
-            ),
-            ("README.md", include_str!("../sample/README.md")),
-            (
-                "requirements.txt",
-                include_str!("../sample/requirements.txt"),
-            ),
-            (".gitignore", include_str!("../sample/gitignore.txt")),
-        ];
-        for (path, value) in samples {
-            let path = folder.join(path);
-            fs::create_dir_all(path.parent().unwrap()).map_err(err)?;
-            if !path.exists() {
-                fs::write(path, value).map_err(err)?;
-            }
-        }
-        fs::write(marker, "").map_err(err)?;
-        crate::git::initialize_sample(&folder);
-    }
-    let mut info = workspace_info(folder.to_string_lossy().into_owned())?;
-    info.sample = true;
-    Ok(info)
 }
 
 #[tauri::command]
@@ -262,4 +221,136 @@ pub fn create_file(root_path: String, path: String) -> Result<()> {
         .open(parent.join(name))
         .map_err(err)?;
     Ok(())
+}
+
+fn inside(base: &Path, path: &str) -> Result<PathBuf> {
+    let path = relative(path)?;
+    let parent = path.parent().unwrap_or(Path::new(""));
+    let parent = base.join(parent).canonicalize().map_err(err)?;
+    if !parent.starts_with(base) {
+        return Err("The folder points outside the workspace.".into());
+    }
+    Ok(parent.join(path.file_name().ok_or("Enter a name.")?))
+}
+
+#[tauri::command]
+pub fn create_folder(root_path: String, path: String) -> Result<()> {
+    let base = root(&root_path)?;
+    let target = inside(&base, &path)?;
+    if target.exists() {
+        return Err("Something with this name already exists.".into());
+    }
+    fs::create_dir_all(target).map_err(err)
+}
+
+#[tauri::command]
+pub fn rename_path(root_path: String, from: String, to: String) -> Result<()> {
+    let base = root(&root_path)?;
+    let source = resolve(&base, &from)?;
+    if source == base {
+        return Err("The workspace folder itself cannot be renamed here.".into());
+    }
+    let target = inside(&base, &to)?;
+    if target.exists() {
+        return Err("Something with this name already exists.".into());
+    }
+    fs::rename(source, target).map_err(err)
+}
+
+/// Deleting moves the item to the system trash, so it can be restored.
+#[tauri::command]
+pub async fn delete_path(root_path: String, path: String) -> Result<()> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let base = root(&root_path)?;
+        let target = resolve(&base, &path)?;
+        if target == base {
+            return Err("The workspace folder itself cannot be deleted here.".into());
+        }
+        trash::delete(target).map_err(err)
+    })
+    .await
+    .map_err(err)?
+}
+
+#[derive(Serialize)]
+pub struct Match {
+    path: String,
+    line: usize,
+    column: usize,
+    preview: String,
+}
+
+#[derive(Serialize)]
+pub struct SearchResult {
+    matches: Vec<Match>,
+    files: usize,
+    truncated: bool,
+}
+
+#[tauri::command]
+pub async fn search_workspace(
+    root_path: String,
+    query: String,
+    regex: bool,
+    case_sensitive: bool,
+    whole_word: bool,
+) -> Result<SearchResult> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let base = root(&root_path)?;
+        if query.is_empty() {
+            return Ok(SearchResult { matches: Vec::new(), files: 0, truncated: false });
+        }
+        let mut pattern = if regex { query.clone() } else { regex::escape(&query) };
+        if whole_word {
+            pattern = format!(r"\b(?:{pattern})\b");
+        }
+        let matcher = RegexBuilder::new(&pattern)
+            .case_insensitive(!case_sensitive)
+            .size_limit(1 << 20)
+            .build()
+            .map_err(|_| "This regular expression is not valid.".to_string())?;
+        let mut pending = vec![base.clone()];
+        let mut matches = Vec::new();
+        let mut files = 0;
+        let mut scanned = 0;
+        while let Some(folder) = pending.pop() {
+            let Ok(entries) = list(&base, &folder) else { continue };
+            for entry in entries {
+                if entry.directory {
+                    pending.push(base.join(&entry.path));
+                    continue;
+                }
+                scanned += 1;
+                if scanned > 20000 {
+                    return Ok(SearchResult { matches, files, truncated: true });
+                }
+                let full = base.join(&entry.path);
+                if full.metadata().map(|meta| meta.len() > 1024 * 1024).unwrap_or(true) {
+                    continue;
+                }
+                let Ok(text) = fs::read_to_string(&full) else { continue };
+                if text.contains('\0') {
+                    continue;
+                }
+                let mut found = false;
+                for (index, line) in text.lines().enumerate() {
+                    if let Some(hit) = matcher.find(line) {
+                        found = true;
+                        let start = line[..hit.start()].chars().count();
+                        let preview: String = line.trim_end().chars().take(240).collect();
+                        matches.push(Match { path: entry.path.clone(), line: index + 1, column: start + 1, preview });
+                        if matches.len() >= 2000 {
+                            return Ok(SearchResult { matches, files: files + 1, truncated: true });
+                        }
+                    }
+                }
+                if found {
+                    files += 1;
+                }
+            }
+        }
+        Ok(SearchResult { matches, files, truncated: false })
+    })
+    .await
+    .map_err(err)?
 }

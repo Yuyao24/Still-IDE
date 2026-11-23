@@ -1,47 +1,105 @@
 # Still
 
-Still is a local desktop code editor built with Tauri 2, Rust, React, TypeScript, and Tailwind CSS. It opens with Orbit Lab, a small Python and Java workspace.
+Still is a calm, keyboard-centric desktop code editor built with Tauri 2, Rust,
+React, TypeScript and Tailwind CSS. It runs Python, Java, JavaScript, Go and
+shell files, has a real terminal, Git, a package manager panel, SSH remotes, and
+17 built-in themes you can customize.
 
-## Start the desktop app
+**Install and uninstall instructions are in [INSTALL.md](INSTALL.md).**
 
-Install Node.js 22.12 or newer and the [Tauri desktop prerequisites](https://v2.tauri.app/start/prerequisites/) for your platform. Windows development uses stable Rust targeting MSVC, Microsoft C++ Build Tools, and WebView2. Install Git and the language runtimes you plan to use. A Java run needs a JDK with both javac and java.
+## What's inside
 
-Run these from this project directory.
+**Home.** A clean start page in the style of Notion. Recently opened projects as
+cards, every project in your projects folder plus projects kept elsewhere, and
+your SSH servers. Create a project from a template (Python, Java, JavaScript,
+empty, or the Orbit Lab sample), open any folder, or clone a Git repository.
 
-```sh
-npm ci
-npm run tauri dev
-```
+**Editor.** CodeMirror 6 with syntax highlighting for Python, Java, JavaScript,
+TypeScript, JSX, HTML, CSS, JSON, Markdown, Rust, C/C++, Go, Kotlin, C#, Ruby,
+SQL, YAML, TOML, XML, shell, PowerShell, Dockerfiles and more. Multiple tabs,
+outline, breadcrumbs, find and replace, bracket matching, autocomplete, auto
+save, and inline or side-by-side diffs.
 
-Use `npm run tauri build` to build the desktop bundle on the target platform. Use `npm run build` for the TypeScript check and production frontend bundle.
+**Run.** Ctrl/Cmd + Enter runs the active file. Python uses the project's
+`.venv` (or `venv`, or `VIRTUAL_ENV`) and falls back to Python 3 on PATH. Java
+compiles with `javac -d bin` and shows compiler errors in the gutter and the
+Problems tab. Programs can read input: type into the box under the output.
+Right-click Run to pass program arguments.
 
-The separate **Still Preview.html** file opens directly in a browser. The preview supports editing, file switching, themes, resizing, and the sample Git workflow. Run, shell access, local workspace folders, and package changes use the Tauri desktop app.
+**Terminal.** xterm.js on a native PTY, with as many sessions as you like.
+Your default shell, or pick zsh, bash, fish, PowerShell, Command Prompt, Git
+Bash or WSL in Settings.
 
-## Work in Still
+**Git.** Changed, staged and untracked files, one-click stage and unstage (or
+all at once), discard (untracked files go to the trash), commit, pull, push
+(sets the upstream on first push), fetch, branch switching and creation, and
+recent history.
+
+**Packages.** Detects `requirements.txt`, `pyproject.toml`, `pom.xml` and
+`build.gradle`. Search PyPI, install and remove packages, install requirements,
+create a virtual environment, resolve Maven dependencies, and inspect Gradle
+dependencies, with logs streamed to the Output tab.
+
+**SSH.** Save servers (host, user, port, key, jump host, port forwards) or use
+the hosts already in `~/.ssh/config`. Open a terminal on a server, or open a
+folder on it as a project: browse, search, edit and save files over SSH, and
+run Python, JavaScript, shell, Java, Go or Ruby files remotely. Still uses your
+system's OpenSSH client, so keys, agents and known hosts work exactly as they do
+in a terminal, and Still never stores passwords.
+
+**Themes.** Still Dark and Light, One Dark and One Light (Atom), GitHub Dark and
+Light, Darcula, JetBrains Dark and IntelliJ Light, Solarized Dark and Light,
+Nord, Gruvbox Dark, Monokai, Dracula, Tokyo Night, and Catppuccin Mocha and
+Latte. Edit any color to make your own theme, import and export themes as JSON,
+and optionally follow the system's light or dark mode. Fonts, sizes, line height
+and ligatures are adjustable.
+
+## Keyboard
 
 | Shortcut | Action |
 | --- | --- |
-| Ctrl/Cmd + K or P | Find workspace files and commands |
-| Ctrl/Cmd + Shift + K | Open the palette in command mode |
-| Ctrl/Cmd + O | Open a workspace folder |
-| Ctrl/Cmd + S | Save the active file |
-| Ctrl/Cmd + W | Close the active tab |
-| Ctrl/Cmd + Enter | Save and run the active Python or Java file |
-| Ctrl/Cmd + Shift + Enter | Check Python syntax or compile Java |
+| Ctrl/Cmd + K or P | Find files and commands |
+| Ctrl/Cmd + Shift + K | Commands only |
+| Ctrl/Cmd + , | Settings |
+| Ctrl/Cmd + Shift + H | Home |
+| Ctrl/Cmd + N | New project (on Home) |
+| Ctrl/Cmd + O | Open a folder |
+| Ctrl/Cmd + S / Shift + S | Save / save all |
+| Ctrl/Cmd + W | Close tab |
+| Ctrl/Cmd + Tab / Shift + Tab | Next / previous tab |
+| Ctrl/Cmd + Enter | Run the active file |
+| Ctrl/Cmd + Shift + Enter | Check or compile only |
+| Ctrl/Cmd + F | Find in file |
+| Ctrl/Cmd + Shift + F | Find in all files |
 | Ctrl/Cmd + B | Toggle the sidebar |
 | Ctrl/Cmd + J | Toggle the bottom drawer |
-| Arrow keys on a focused divider | Resize the pane |
+| Ctrl/Cmd + Shift + ` | New terminal |
+| Ctrl/Cmd + Shift + E / G | Explorer / Source control |
+| F2 / Delete in the explorer | Rename / move to trash |
 
-Python prefers the workspace `.venv`, then `VIRTUAL_ENV`, then a Python 3 executable on PATH. Java prefers `JAVA_HOME` and falls back to PATH. The Java file runner compiles into the workspace `bin/` directory and uses its package declaration to locate the main class. Javac diagnostics appear in the gutter, Problems, and the process output.
+## Where Still keeps things
 
-The terminal starts the system PowerShell on Windows and uses `SHELL` on macOS and Linux, with Bash as the fallback. Terminal input, output, and resizing go through a native PTY.
+Settings, themes, saved servers and the list of projects live in one
+`config.json` in the app's config folder (shown in **Settings → About &
+uninstall**). Still writes nothing into your projects except what you ask for
+(for example `bin/` from compiling Java, or a `.venv` you create).
 
-Source Control reads the working tree and index through Git. Click a changed file to view its inline diff. Pull uses fast-forward-only mode. Push and pull use the repository's existing remote and Git credential setup.
+## Development
 
-Packages shows workspace manifests and installed Python packages. Search looks up a package by its exact PyPI name. Install, remove, and requirements-file actions use the active interpreter's pip. The Maven action resolves dependencies and the Gradle action shows the dependency report, using a project wrapper when present.
+```bash
+npm ci
+```
 
-## Project layout
+```bash
+npm run tauri dev
+```
 
-- `src/` holds the React workbench, CodeMirror themes, and xterm.js bridge.
-- `src-tauri/src/` holds the workspace, language runners, PTY, Git, and package commands.
-- `src-tauri/sample/` holds the first-launch Orbit Lab example.
+`npm run build` type-checks and builds the frontend. `npm run dev` serves a
+browser preview with a sample project, which is handy for UI work; running code,
+terminals, Git remotes, packages and SSH need the desktop app.
+
+- `src/` holds the React app: `App.tsx` (shell), `Home.tsx`, `Ide.tsx`
+  (workbench), `SettingsView.tsx`, `themes.ts`, the editor, terminal and panels.
+- `src-tauri/src/` holds the Rust backend: projects and settings, the file
+  system, language runners, PTY terminals, Git, packages, SSH and the uninstaller.
+- `scripts/` holds the install scripts and `uninstall/` the uninstall scripts.

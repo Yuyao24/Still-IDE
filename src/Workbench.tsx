@@ -1,5 +1,5 @@
 import { useLayoutEffect, useRef, useState, type FormEvent, type KeyboardEvent, type PointerEvent } from 'react'
-import { CircleAlert, TerminalSquare, Trash2, X } from 'lucide-react'
+import { CircleAlert, CornerDownLeft, TerminalSquare, Trash2, X } from 'lucide-react'
 import { type Diagnostic, fileName } from './bridge'
 import { Icon, IconButton } from './ui'
 
@@ -34,13 +34,15 @@ export function SplitGrip({ vertical, value, min, max, change }: {
 
 export interface OutputEntry { kind: 'command' | 'stdout' | 'stderr' | 'exit'; text: string; code?: number | null }
 
-export function Output({ entries, sample }: { entries: OutputEntry[]; sample: boolean }) {
+export function Output({ entries, sample, onInput }: { entries: OutputEntry[]; sample: boolean; onInput?: (text: string | null) => void }) {
   const scroller = useRef<HTMLDivElement>(null)
   const atEnd = useRef(true)
+  const [line, setLine] = useState('')
   useLayoutEffect(() => {
     if (scroller.current && atEnd.current) scroller.current.scrollTop = scroller.current.scrollHeight
   }, [entries])
-  return <div className="console-scroll" ref={scroller} role="log" aria-label="Process output" aria-live="off"
+  return <div className={'console-wrap' + (onInput ? ' has-input' : '')}>
+  <div className="console-scroll" ref={scroller} role="log" aria-label="Process output" aria-live="off"
     onScroll={event => { const node = event.currentTarget; atEnd.current = node.scrollHeight - node.scrollTop - node.clientHeight < 16 }}>
     {sample && <div className="console-banner"><Icon glyph={TerminalSquare} size={13} />Sample run</div>}
     {entries.length === 0 && <div className="console-banner">Run or build a file to see output.</div>}
@@ -48,6 +50,12 @@ export function Output({ entries, sample }: { entries: OutputEntry[]; sample: bo
       entry.kind === 'stderr' ? 'console-error' : entry.kind === 'command' ? 'console-command' :
       entry.kind === 'exit' ? entry.code === 0 ? 'console-meta' : 'console-error' : ''
     )}>{entry.text.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '').replace(/\r\n?/g, '\n')}</div>)}
+  </div>
+  {onInput && <form className="console-input" onSubmit={event => { event.preventDefault(); onInput(line + '\n'); setLine('') }}>
+    <Icon glyph={CornerDownLeft} size={13} />
+    <input value={line} onChange={event => setLine(event.target.value)} placeholder="Send input to the running program (Enter sends, Ctrl+D ends input)" spellCheck={false}
+      aria-label="Program input" onKeyDown={event => { if (event.key === 'd' && event.ctrlKey) { event.preventDefault(); if (line) onInput(line); setLine(''); onInput(null) } }} />
+  </form>}
   </div>
 }
 
@@ -65,7 +73,10 @@ export interface DialogState {
   title: string
   description?: string
   input?: string
+  placeholder?: string
+  inputLabel?: string
   label: string
+  danger?: boolean
   action: (value: string) => void
 }
 
@@ -82,11 +93,16 @@ export function Dialog({ dialog, close }: { dialog: DialogState; close: () => vo
       <div className="side-head border-b border-line"><h2 className="font-medium">{dialog.title}</h2><IconButton glyph={X} label="Close dialog" onClick={close} /></div>
       <div className="p-3">
         {dialog.description && <p className="mb-2 text-muted">{dialog.description}</p>}
-        {dialog.input !== undefined && <input className="field" aria-label="Workspace-relative file path" value={value} onChange={event => setValue(event.target.value)} autoFocus placeholder="src/example.py" spellCheck={false} />}
+        {dialog.input !== undefined && <input className="field" aria-label={dialog.inputLabel ?? 'Workspace-relative file path'} value={value} onChange={event => setValue(event.target.value)} autoFocus
+          placeholder={dialog.placeholder ?? 'src/example.py'} spellCheck={false} onFocus={event => {
+            const dot = event.target.value.lastIndexOf('.')
+            const slash = event.target.value.lastIndexOf('/')
+            if (dot > slash + 1) event.target.setSelectionRange(slash + 1, dot)
+          }} />}
         <div className="mt-3 flex justify-end gap-2">
           <button type="button" className="text-btn" onClick={close} autoFocus={dialog.input === undefined}>Cancel</button>
-          <button type="submit" className="text-btn primary" disabled={dialog.input !== undefined && !value.trim()}>
-            {dialog.label === 'Discard changes' && <Icon glyph={Trash2} size={13} />}{dialog.label}
+          <button type="submit" className={'text-btn primary' + (dialog.danger ? ' danger' : '')} disabled={dialog.input !== undefined && !value.trim()}>
+            {dialog.danger && <Icon glyph={Trash2} size={13} />}{dialog.label}
           </button>
         </div>
       </div>

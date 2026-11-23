@@ -3,46 +3,59 @@ import { Terminal as Xterm } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { type Theme, resolve } from './themes'
 
-let lifecycle: Promise<unknown> = Promise.resolve()
-
-function colors() {
-  const tokens = getComputedStyle(document.documentElement)
-  const color = (name: string) => tokens.getPropertyValue('--' + name).trim()
+function colors(theme: Theme) {
+  const { colors: c, terminal: t } = resolve(theme)
   return {
-    background: color('drawer'), foreground: color('ink'), cursor: color('accent'),
-    selectionBackground: color('accent-fill'), black: '#37373d', brightBlack: '#85858e',
-    red: color('red'), green: color('green'), yellow: color('amber'), blue: color('accent'),
-    magenta: '#a99bb1', cyan: '#83a8a9', white: color('ink'),
+    background: c.drawer, foreground: c.ink, cursor: c.accent, cursorAccent: c.drawer,
+    selectionBackground: c.selection, ...t,
   }
 }
 
-export default function Terminal({ root, visible, theme, onReady }: {
-  root: string; visible: boolean; theme: string; onReady: (terminal: Xterm | null) => void
-}) {
+export interface TerminalSession { id: string; label: string; ssh?: string; remotePath?: string; exited?: boolean }
+
+interface Props {
+  session: TerminalSession
+  root: string | null
+  visible: boolean
+  theme: Theme
+  fontSize: number
+  fontFamily: string
+  cursor: 'block' | 'bar' | 'underline'
+  shell: string
+  onReady: (terminal: Xterm | null) => void
+  onExit: (id: string) => void
+}
+
+export default function Terminal({ session, root, visible, theme, fontSize, fontFamily, cursor, shell, onReady, onExit }: Props) {
   const host = useRef<HTMLDivElement>(null)
   const instance = useRef<Xterm | null>(null)
-  const callback = useRef(onReady)
-  callback.current = onReady
+  const fitter = useRef<FitAddon | null>(null)
+  const callbacks = useRef({ onReady, onExit })
+  callbacks.current = { onReady, onExit }
+  const initial = useRef({ theme, fontSize, fontFamily, cursor, shell })
 
   useEffect(() => {
     const container = host.current
     if (!container) return
-    const id = crypto.randomUUID()
+    const id = session.id
+    const settings = initial.current
     const terminal = new Xterm({
-      fontFamily: '"JetBrains Mono Variable", Consolas, monospace', fontSize: 14, lineHeight: 1.2,
-      cursorStyle: 'block', cursorBlink: true, theme: colors(), scrollback: 4000,
-      allowProposedApi: false,
+      fontFamily: settings.fontFamily + ', "JetBrains Mono Variable", Consolas, monospace', fontSize: settings.fontSize, lineHeight: 1.2,
+      cursorStyle: settings.cursor, cursorBlink: true, theme: colors(settings.theme), scrollback: 8000, allowProposedApi: false,
+      macOptionIsMeta: true,
     })
     const fit = new FitAddon()
     terminal.loadAddon(fit)
     terminal.open(container)
     instance.current = terminal
-    callback.current(terminal)
+    fitter.current = fit
+    callbacks.current.onReady(terminal)
     let disposed = false
     let started = false
-    let unlisten: UnlistenFn[] = []
-    const measure = () => { if (container.clientWidth && container.clientHeight) fit.fit() }
+    const unlisten: UnlistenFn[] = []
+    const measure = () => { if (container.clientWidth && container.clientHeight) { try { fit.fit() } catch { /* not attached yet */ } } }
     const observer = new ResizeObserver(measure)
     observer.observe(container)
     void document.fonts.ready.then(() => { if (!disposed) measure() })
@@ -53,45 +66,66 @@ export default function Terminal({ root, visible, theme, onReady }: {
     const input = terminal.onData(data => {
       if (started) writes = writes.then(() => invoke<void>('terminal_write', { id, data })).catch(() => {})
     })
-    lifecycle = lifecycle.catch(() => {}).then(async () => {
-      if (disposed) return
+    const startup = (async () => {
       try {
-        const output = await listen<{ id: string; bytes: number[] }>('terminal-data', ({ payload }) => {
+        unlisten.push(await listen<{ id: string; bytes: number[] }>('terminal-data', ({ payload }) => {
           if (!disposed && payload.id === id) terminal.write(Uint8Array.from(payload.bytes))
-        })
-        unlisten.push(output)
-        if (disposed) { output(); return }
-        const exit = await listen<{ id: string; code: number | null }>('terminal-exit', ({ payload }) => {
+        }))
+        unlisten.push(await listen<{ id: string; code: number | null }>('terminal-exit', ({ payload }) => {
           if (!disposed && payload.id === id) {
             started = false
-            terminal.writeln('\r\nShell exited. Use New terminal to reconnect.')
+            terminal.writeln('\r\n\x1b[2m' + (session.ssh ? 'Connection closed.' : 'Shell exited.') + ' Open a new terminal to continue.\x1b[0m')
+            callbacks.current.onExit(id)
           }
-        })
-        unlisten.push(exit)
-        if (disposed) { exit(); return }
+        }))
+        if (disposed) return
         measure()
         started = true
-        await invoke('terminal_start', { id, rootPath: root, cols: terminal.cols, rows: terminal.rows })
+        await invoke('terminal_start', {
+          id, rootPath: root, cols: terminal.cols, rows: terminal.rows, shell: settings.shell || null,
+          sshHost: session.ssh ?? null, remotePath: session.remotePath ?? null,
+        })
         if (!disposed && container.clientWidth) terminal.focus()
       } catch (error) {
         started = false
-        if (!disposed) terminal.writeln('Could not open the shell.\r\n' + String(error))
+        if (!disposed) terminal.writeln('\x1b[31mCould not open the ' + (session.ssh ? 'SSH session' : 'shell') + '.\x1b[0m\r\n' + String(error))
+        callbacks.current.onExit(id)
       }
-    })
+    })()
     return () => {
       disposed = true
       observer.disconnect()
       resize.dispose()
       input.dispose()
-      unlisten.forEach(stop => stop())
-      unlisten = []
+      void startup.finally(() => {
+        unlisten.forEach(stop => stop())
+        void invoke('terminal_stop', { id }).catch(() => {})
+      })
       terminal.dispose()
-      callback.current(null)
+      callbacks.current.onReady(null)
       instance.current = null
-      lifecycle = lifecycle.then(() => invoke('terminal_stop', { id }).catch(() => {}))
+      fitter.current = null
     }
-  }, [root])
+  }, [session.id])
 
-  useEffect(() => { if (instance.current) instance.current.options.theme = colors() }, [theme])
+  useEffect(() => {
+    const terminal = instance.current
+    if (!terminal) return
+    terminal.options.theme = colors(theme)
+    terminal.options.fontSize = fontSize
+    terminal.options.fontFamily = fontFamily + ', "JetBrains Mono Variable", Consolas, monospace'
+    terminal.options.cursorStyle = cursor
+    try { fitter.current?.fit() } catch { /* hidden */ }
+  }, [theme, fontSize, fontFamily, cursor])
+
+  useEffect(() => {
+    if (!visible) return
+    const frame = requestAnimationFrame(() => {
+      try { fitter.current?.fit() } catch { /* hidden */ }
+      if (instance.current) callbacks.current.onReady(instance.current)
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [visible])
+
   return <div ref={host} className="terminal-host" hidden={!visible} />
 }

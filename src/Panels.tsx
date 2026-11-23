@@ -1,12 +1,16 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
-import { ArrowDownToLine, ArrowUpFromLine, Braces, ChevronDown, ChevronRight, CircleAlert, CodeXml, FilePlus2, Folder, FolderOpen, GitCommitHorizontal, Minus, Package, Plus, RefreshCw, Search, type LucideIcon } from 'lucide-react'
-import { type Change, type Entry, type GitStatus, type PackageMatch, type Packages, type Workspace, desktop, fileName, parentPath } from './bridge'
+import { useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent, type MouseEvent } from 'react'
+import {
+  ArrowDownToLine, ArrowUpFromLine, Box, Braces, ChevronDown, ChevronRight, CircleAlert, CodeXml, FilePlus2, Folder, FolderOpen, FolderPlus,
+  GitBranch, GitCommitHorizontal, GitPullRequestArrow, History, Minus, Package, Plus, RefreshCw, Search, Server, Undo2, type LucideIcon,
+} from 'lucide-react'
+import { type Change, type Commit, type Entry, type GitStatus, type PackageMatch, type Packages, type Workspace, desktop, fileName, parentPath } from './bridge'
 import { FileIcon, Icon, IconButton } from './ui'
 
 export interface SymbolItem { name: string; line: number; kind: 'class' | 'function' | 'heading' }
 
 export function symbolsFor(text: string, path: string): SymbolItem[] {
   const python = /^\s*(?:(?:async\s+)?(def)|class)\s+([\w]+)/
+  const script = /^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:(function)\s*\*?\s*(\w+)|(class|interface|type|enum)\s+(\w+)|(?:const|let)\s+(\w+)\s*=\s*(?:async\s*)?(?:\([^)]*\)|\w+)\s*=>)/
   const java = /^\s*(?:(?:public|private|protected|static|final|abstract)\s+)*(?:(class|interface|record)\s+(\w+)|[\w<>\[\],.?]+\s+(\w+)\s*\()/
   return text.split('\n').flatMap((line, index): SymbolItem[] => {
     const lineNumber = index + 1
@@ -17,6 +21,12 @@ export function symbolsFor(text: string, path: string): SymbolItem[] {
     if (path.endsWith('.java')) {
       const match = java.exec(line)
       return match ? [{ name: match[2] ?? match[3], line: lineNumber, kind: match[1] ? 'class' : 'function' }] : []
+    }
+    if (/\.(m?[jt]sx?|cjs)$/.test(path)) {
+      const match = script.exec(line)
+      if (!match) return []
+      const name = match[2] ?? match[4] ?? match[5]
+      return name ? [{ name, line: lineNumber, kind: match[3] ? 'class' : 'function' }] : []
     }
     const heading = path.endsWith('.md') && /^#{1,6}\s+(.+)/.exec(line)
     return heading ? [{ name: heading[1], line: lineNumber, kind: 'heading' }] : []
@@ -33,9 +43,12 @@ interface ExplorerProps {
   onOpen: (path: string) => void
   onExpand: (path: string) => void
   onNew: () => void
+  onNewFolder: () => void
   onWorkspace: () => void
   onRefresh: () => void
   onJump: (line: number) => void
+  onContext: (event: MouseEvent, entry: Entry | null) => void
+  onKey: (event: KeyboardEvent, entry: Entry) => void
 }
 
 export function Explorer(props: ExplorerProps) {
@@ -53,6 +66,8 @@ export function Explorer(props: ExplorerProps) {
           style={{ paddingLeft: 11 + depth * 15, paddingRight: 9 }} title={item.path}
           aria-expanded={item.directory ? expanded : undefined}
           aria-current={props.active === item.path ? 'true' : undefined}
+          onContextMenu={event => { event.preventDefault(); props.onContext(event, item) }}
+          onKeyDown={event => props.onKey(event, item)}
           onClick={() => item.directory ? props.onExpand(item.path) : props.onOpen(item.path)}>
           <span className="tree-chev">{item.directory && <Icon size={12} glyph={expanded ? ChevronDown : ChevronRight} />}</span>
           {item.directory ? <Icon glyph={expanded ? FolderOpen : Folder} className="file-muted" /> : <FileIcon path={item.path} />}
@@ -69,17 +84,20 @@ export function Explorer(props: ExplorerProps) {
       <h2 className="section-label">Explorer</h2>
       <div className="flex items-center gap-0.5">
         <IconButton glyph={FilePlus2} label="New file" onClick={props.onNew} disabled={!props.workspace} />
+        <IconButton glyph={FolderPlus} label="New folder" onClick={props.onNewFolder} disabled={!props.workspace || (!desktop && !props.workspace.remote)} />
         <IconButton glyph={RefreshCw} label="Refresh files" onClick={props.onRefresh} disabled={!props.workspace} />
-        <IconButton glyph={FolderOpen} label="Open workspace folder" onClick={props.onWorkspace} />
+        <IconButton glyph={FolderOpen} label="Open another folder" onClick={props.onWorkspace} />
       </div>
     </div>
-    <div className="tree-scroll">
+    <div className="tree-scroll" onContextMenu={event => { if (event.target === event.currentTarget) { event.preventDefault(); props.onContext(event, null) } }}>
       {props.workspace && <>
-        <button className="project-row" onClick={() => setRootOpen(open => !open)} aria-expanded={rootOpen} title={props.workspace.root}>
-          <Icon glyph={rootOpen ? ChevronDown : ChevronRight} size={12} /><Icon glyph={Folder} className="project-folder" />
+        <button className="project-row" onClick={() => setRootOpen(open => !open)} aria-expanded={rootOpen} title={props.workspace.remote ? props.workspace.hostName + ':' + props.workspace.root : props.workspace.root}
+          onContextMenu={event => { event.preventDefault(); props.onContext(event, null) }}>
+          <Icon glyph={rootOpen ? ChevronDown : ChevronRight} size={12} /><Icon glyph={props.workspace.remote ? Server : Folder} className="project-folder" />
           <span className="truncate">{props.workspace.name}</span>
         </button>
         {rootOpen && rows('', 0)}
+        {rootOpen && props.directories['']?.length === 0 && <p className="help px-5 py-1">This folder is empty.</p>}
       </>}
     </div>
     <section className="symbols-panel">
@@ -98,37 +116,61 @@ interface GitProps {
   busy: boolean
   error: string
   commit: string
+  log: Commit[]
   onCommitText: (message: string) => void
   onDiff: (change: Change, index: boolean) => void
   onStage: (change: Change, index: boolean) => void
-  onAction: (action: 'commit' | 'pull' | 'push') => void
+  onStageAll: (unstage: boolean) => void
+  onDiscard: (change: Change) => void
+  onAction: (action: 'commit' | 'pull' | 'push' | 'fetch') => void
+  onBranch: (event: MouseEvent) => void
+  onInit: () => void
   onRefresh: () => void
 }
 
+const statusLabel: Record<string, string> = { M: 'Modified', A: 'Added', D: 'Deleted', R: 'Renamed', C: 'Copied', U: 'Conflict', '?': 'Untracked' }
+
 export function SourceControl(props: GitProps) {
+  const [history, setHistory] = useState(false)
   const indexed = props.status.changes.filter(change => change.index.trim() && change.index !== '?')
   const changed = props.status.changes.filter(change => change.worktree.trim())
   function group(label: string, changes: Change[], index: boolean) {
     return <section className="panel-group">
-      <h3>{label}<span>{changes.length}</span></h3>
-      {changes.length ? changes.map(change => <div className="panel-row" key={change.path}>
-        <button className="panel-row-main" onClick={() => props.onDiff(change, index)} title={'View diff for ' + change.path}>
-          <FileIcon path={change.path} size={13} /><span>{fileName(change.path)}</span>
-          <span className="help">{parentPath(change.path)}</span>
-        </button>
-        <IconButton glyph={index ? Minus : Plus} size={14} label={(index ? 'Unstage ' : 'Stage ') + change.path}
-          disabled={props.busy} onClick={() => props.onStage(change, index)} />
-      </div>) : <p className="help">No files</p>}
+      <h3>{label}<span className="flex items-center gap-1">{changes.length > 0 && <IconButton glyph={index ? Minus : Plus} size={13} className="small"
+        label={index ? 'Unstage all' : 'Stage all'} disabled={props.busy} onClick={() => props.onStageAll(index)} />}{changes.length}</span></h3>
+      {changes.length ? changes.map(change => {
+        const code = (index ? change.index : change.worktree).trim()
+        return <div className="panel-row" key={change.path}>
+          <button className="panel-row-main" onClick={() => props.onDiff(change, index)} title={'View diff for ' + change.path}>
+            <FileIcon path={change.path} size={13} /><span>{fileName(change.path)}</span>
+            <span className="help">{parentPath(change.path)}</span>
+          </button>
+          {!index && <IconButton glyph={Undo2} size={13} className="row-action" label={(change.worktree === '?' ? 'Move to trash: ' : 'Discard changes: ') + change.path}
+            disabled={props.busy} onClick={() => props.onDiscard(change)} />}
+          <IconButton glyph={index ? Minus : Plus} size={14} className="row-action" label={(index ? 'Unstage ' : 'Stage ') + change.path}
+            disabled={props.busy} onClick={() => props.onStage(change, index)} />
+          <span className={'status-code code-' + (code === '?' ? 'U' : code)} title={statusLabel[code] ?? code}>{code === '?' ? 'U' : code}</span>
+        </div>
+      }) : <p className="help">No files</p>}
     </section>
   }
   return <>
-    <div className="side-head"><h2 className="section-label">Source Control</h2><IconButton glyph={RefreshCw} label="Refresh Git status" onClick={props.onRefresh} /></div>
+    <div className="side-head"><h2 className="section-label">Source Control</h2>
+      <div className="flex items-center gap-0.5">
+        {props.status.branch && <IconButton glyph={GitPullRequestArrow} label="Fetch from remotes" disabled={props.busy} onClick={() => props.onAction('fetch')} />}
+        <IconButton glyph={RefreshCw} label="Refresh Git status" onClick={props.onRefresh} />
+      </div>
+    </div>
     <div className="sidebar-content">
       {props.error ? <p className="help">{props.error}</p> : props.status.branch ? <>
+        <button className="branch-button" onClick={props.onBranch} disabled={props.busy} title="Switch or create a branch">
+          <Icon glyph={GitBranch} size={13} /><span className="truncate">{props.status.branch}</span><Icon glyph={ChevronDown} size={12} />
+        </button>
         <form onSubmit={event => { event.preventDefault(); props.onAction('commit') }}>
           <label className="field-label" htmlFor="commit-message">Commit message</label>
-          <textarea id="commit-message" className="field resize-y" placeholder="Describe the changes" rows={2} value={props.commit} onChange={event => props.onCommitText(event.target.value)} />
-          <button className="text-btn primary mt-1 w-full" type="submit" disabled={!props.commit.trim() || !indexed.length || props.busy}><Icon glyph={GitCommitHorizontal} size={14} /> Commit</button>
+          <textarea id="commit-message" className="field resize-y" placeholder="Describe the changes" rows={2} value={props.commit} onChange={event => props.onCommitText(event.target.value)}
+            onKeyDown={event => { if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); event.stopPropagation(); props.onAction('commit') } }} />
+          <button className="text-btn primary mt-1 w-full" type="submit" disabled={!props.commit.trim() || !indexed.length || props.busy}><Icon glyph={GitCommitHorizontal} size={14} /> Commit {indexed.length > 0 && indexed.length + (indexed.length === 1 ? ' file' : ' files')}</button>
         </form>
         <div className="mt-2 grid grid-cols-2 gap-2">
           <button className="text-btn" disabled={props.busy} onClick={() => props.onAction('pull')}><Icon glyph={ArrowDownToLine} size={13} /> Pull</button>
@@ -136,7 +178,19 @@ export function SourceControl(props: GitProps) {
         </div>
         {group('Staged changes', indexed, true)}
         {group('Changes', changed, false)}
-      </> : <p className="help">This folder has no Git repository.</p>}
+        <section className="panel-group">
+          <button className="outline-head px-0" onClick={() => setHistory(value => !value)} aria-expanded={history}>
+            <Icon glyph={history ? ChevronDown : ChevronRight} size={12} /><Icon glyph={History} size={13} /><span className="section-label">History</span>
+          </button>
+          {history && (props.log.length ? props.log.map(commit => <div key={commit.hash} className="commit-row" title={commit.subject + '\n' + commit.author + ' · ' + commit.when}>
+            <span className="truncate">{commit.subject}</span>
+            <span className="help">{commit.hash} · {commit.author} · {commit.when}</span>
+          </div>) : <p className="help">No commits yet.</p>)}
+        </section>
+      </> : <div className="empty-panel">
+        <p className="help">This folder is not a Git repository.</p>
+        {desktop && <button className="text-btn primary mt-2" onClick={props.onInit}><Icon glyph={GitBranch} size={13} /> Initialize repository</button>}
+      </div>}
     </div>
   </>
 }
@@ -149,6 +203,8 @@ interface PackageProps {
   onSearch: (name: string) => Promise<PackageMatch[]>
   onAction: (action: string, name?: string) => void
 }
+
+export const isVirtual = (state: Packages | null) => Boolean(state?.environment?.includes('virtual environment'))
 
 export function PackagesPanel(props: PackageProps) {
   const [query, setQuery] = useState('')
@@ -208,6 +264,8 @@ export function PackagesPanel(props: PackageProps) {
       <section className="panel-group">
         <h3>Installed Python packages</h3>
         {props.state?.environment && <p className="help mb-2">{props.state.environment}</p>}
+        {props.state?.environment && !isVirtual(props.state) && <button className="text-btn mb-2 w-full" disabled={props.busy} onClick={() => props.onAction('venv')}
+          title="Runs python -m venv .venv in this project"><Icon glyph={Box} size={13} /> Create virtual environment</button>}
         {props.state?.warning && <p className="help mb-2 flex gap-1"><Icon glyph={CircleAlert} />{props.state.warning}</p>}
         {installed.map(item => <div className="panel-row" key={item.name}>
           <div className="panel-row-main" title={item.name}><Icon glyph={Package} size={13} /><span>{item.name}</span><span className="help">{item.version}</span></div>

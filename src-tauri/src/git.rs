@@ -243,8 +243,9 @@ pub fn git_action(
     message: Option<String>,
 ) -> Result<()> {
     let cwd = root(&root_path)?;
-    jobs.start(app, id, move |job| {
+    jobs.start(app, id, false, move |job| {
         let mut cmd = git(&cwd);
+        let mut label = action.clone();
         match action.as_str() {
             "commit" => {
                 let message = message
@@ -255,15 +256,184 @@ pub fn git_action(
                 cmd.args(["commit", "-m", message]);
             }
             "push" => {
-                cmd.args(["push", "--progress"]);
+                let upstream = git(&cwd).args(["rev-parse", "--abbrev-ref", "@{u}"]).output().is_ok_and(|out| out.status.success());
+                if upstream {
+                    cmd.args(["push", "--progress"]);
+                } else {
+                    let remote = text(git(&cwd).args(["remote"]))?;
+                    let remote = remote.lines().find(|name| *name == "origin").or_else(|| remote.lines().next())
+                        .ok_or("This repository has no remote. Add one with `git remote add origin <url>` in the terminal.")?
+                        .to_owned();
+                    label = format!("push -u {remote} HEAD");
+                    cmd.args(["push", "--progress", "-u", &remote, "HEAD"]);
+                }
             }
             "pull" => {
                 cmd.args(["pull", "--ff-only", "--progress"]);
             }
+            "fetch" => {
+                cmd.args(["fetch", "--all", "--prune", "--progress"]);
+            }
             _ => return Err("Unknown Git action.".into()),
         }
-        job.emit("command", format!("$ git {action}\n"));
+        job.emit("command", format!("$ git {label}\n"));
         let (code, _) = job.run(&mut cmd, false)?;
         Ok((code, Vec::new()))
     })
+}
+
+#[derive(Serialize)]
+pub struct Branches {
+    current: Option<String>,
+    local: Vec<String>,
+    remote: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn git_branches(root_path: String) -> Result<Branches> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let cwd = root(&root_path)?;
+        let list = |kind: &str| -> Result<Vec<String>> {
+            Ok(text(git(&cwd).args(["for-each-ref", "--format=%(refname:short)", "--sort=-committerdate", kind]))?
+                .lines()
+                .filter(|name| !name.ends_with("/HEAD") && !name.is_empty())
+                .map(String::from)
+                .collect())
+        };
+        Ok(Branches {
+            current: text(git(&cwd).args(["symbolic-ref", "--short", "HEAD"])).ok().map(|name| name.trim().to_owned()),
+            local: list("refs/heads")?,
+            remote: list("refs/remotes")?,
+        })
+    })
+    .await
+    .map_err(err)?
+}
+
+fn valid_branch(name: &str) -> Result<&str> {
+    let name = name.trim();
+    if name.is_empty()
+        || name.starts_with('-')
+        || name.contains("..")
+        || name.ends_with('/')
+        || name.ends_with(".lock")
+        || name.chars().any(|c| c.is_whitespace() || c.is_control() || "~^:?*[\\".contains(c))
+    {
+        return Err("Enter a valid branch name.".into());
+    }
+    Ok(name)
+}
+
+#[tauri::command]
+pub async fn git_checkout(root_path: String, branch: String, create: bool) -> Result<()> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let cwd = root(&root_path)?;
+        let branch = valid_branch(&branch)?.to_owned();
+        let mut cmd = git(&cwd);
+        if create {
+            cmd.args(["checkout", "-b", &branch]);
+        } else if let Some((_, local)) = branch.split_once('/').filter(|_| {
+            git(&cwd).args(["show-ref", "--verify", "--quiet", &format!("refs/remotes/{branch}")]).status().is_ok_and(|status| status.success())
+        }) {
+            // A remote branch: create or switch to the tracking branch.
+            let exists = git(&cwd).args(["show-ref", "--verify", "--quiet", &format!("refs/heads/{local}")]).status().is_ok_and(|status| status.success());
+            if exists {
+                cmd.args(["checkout", local]);
+            } else {
+                cmd.args(["checkout", "--track", &branch]);
+            }
+        } else {
+            cmd.args(["checkout", &branch]);
+        }
+        check(cmd.output().map_err(err)?)?;
+        Ok(())
+    })
+    .await
+    .map_err(err)?
+}
+
+#[tauri::command]
+pub async fn git_stage_all(root_path: String, unstage: bool) -> Result<()> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let cwd = root(&root_path)?;
+        let mut cmd = git(&cwd);
+        if unstage {
+            let has_head = git(&cwd).args(["rev-parse", "--verify", "HEAD"]).output().map_err(err)?.status.success();
+            if has_head {
+                cmd.args(["reset", "-q", "HEAD", "--", "."]);
+            } else {
+                cmd.args(["rm", "--cached", "-r", "-q", "-f", "--", "."]);
+            }
+        } else {
+            cmd.args(["add", "-A", "--", "."]);
+        }
+        check(cmd.output().map_err(err)?)?;
+        Ok(())
+    })
+    .await
+    .map_err(err)?
+}
+
+#[tauri::command]
+pub async fn git_discard(root_path: String, path: String, untracked: bool) -> Result<()> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let cwd = root(&root_path)?;
+        relative(&path)?;
+        if untracked {
+            // Untracked files go to the system trash so they can be recovered.
+            let full = resolve(&cwd, &path)?;
+            return trash::delete(full).map_err(err);
+        }
+        check(git(&cwd).args(["checkout", "--", &path]).output().map_err(err)?)?;
+        Ok(())
+    })
+    .await
+    .map_err(err)?
+}
+
+#[derive(Serialize)]
+pub struct Commit {
+    hash: String,
+    subject: String,
+    author: String,
+    when: String,
+}
+
+#[tauri::command]
+pub async fn git_log(root_path: String) -> Result<Vec<Commit>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let cwd = root(&root_path)?;
+        let output = git(&cwd).args(["log", "-n", "40", "--pretty=format:%h%x1f%s%x1f%an%x1f%ar"]).output().map_err(err)?;
+        if !output.status.success() {
+            return Ok(Vec::new());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split('\x1f');
+                Some(Commit {
+                    hash: parts.next()?.into(),
+                    subject: parts.next()?.into(),
+                    author: parts.next()?.into(),
+                    when: parts.next()?.into(),
+                })
+            })
+            .collect())
+    })
+    .await
+    .map_err(err)?
+}
+
+#[tauri::command]
+pub async fn git_init(root_path: String) -> Result<()> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let cwd = root(&root_path)?;
+        let ok = git(&cwd).args(["init", "-q", "-b", "main"]).output().is_ok_and(|out| out.status.success());
+        if !ok {
+            check(git(&cwd).args(["init", "-q"]).output().map_err(err)?)?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(err)?
 }

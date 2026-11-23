@@ -3,9 +3,9 @@ use regex::Regex;
 use serde::Serialize;
 use std::{
     ffi::OsString,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{ChildStdin, Command, Output, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -85,7 +85,7 @@ fn venv_python(path: &Path) -> PathBuf {
 }
 
 pub fn python(cwd: &Path) -> Option<(PathBuf, String, bool)> {
-    let mut envs = vec![cwd.join(".venv")];
+    let mut envs = vec![cwd.join(".venv"), cwd.join("venv")];
     if let Some(path) = std::env::var_os("VIRTUAL_ENV") {
         envs.push(PathBuf::from(path));
     }
@@ -136,12 +136,20 @@ fn java(cwd: &Path) -> Option<(PathBuf, PathBuf, String)> {
     None
 }
 
+pub fn node(cwd: &Path) -> Option<(PathBuf, String)> {
+    let path = PathBuf::from(format!("node{}", std::env::consts::EXE_SUFFIX));
+    probe(&path, &["--version"], cwd).map(|version| (path, format!("Node {}", version.trim_start_matches('v'))))
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeInfo {
     python: Option<String>,
     python_venv: bool,
     java: Option<String>,
+    node: Option<String>,
+    git: Option<String>,
+    ssh: Option<String>,
     shell: String,
 }
 
@@ -168,6 +176,9 @@ pub async fn detect_runtimes(root_path: String) -> Result<RuntimeInfo> {
             python_venv: interpreter.as_ref().is_some_and(|(_, _, venv)| *venv),
             python: interpreter.map(|(_, version, _)| version),
             java: java(&cwd).map(|(_, _, version)| version),
+            node: node(&cwd).map(|(_, version)| version),
+            git: probe(Path::new("git"), &["--version"], &cwd),
+            ssh: probe(Path::new("ssh"), &["-V"], &cwd),
             shell: Path::new(&shell())
                 .file_stem()
                 .unwrap_or_default()
@@ -217,14 +228,15 @@ fn emit(
     );
 }
 
-type ActiveJob = Option<(String, Arc<AtomicBool>)>;
+type Input = Arc<Mutex<Option<ChildStdin>>>;
+type ActiveJob = Option<(String, Arc<AtomicBool>, Input)>;
 
 #[derive(Default, Clone)]
 pub struct Jobs(Arc<Mutex<ActiveJob>>);
 
 impl Jobs {
     pub fn stop(&self, id: Option<&str>) -> Result<()> {
-        if let Some((active_id, cancelled)) = self.0.lock().map_err(err)?.as_ref() {
+        if let Some((active_id, cancelled, _)) = self.0.lock().map_err(err)?.as_ref() {
             if id.is_none() || id == Some(active_id.as_str()) {
                 cancelled.store(true, Ordering::Relaxed);
             }
@@ -232,7 +244,25 @@ impl Jobs {
         Ok(())
     }
 
-    pub fn start<F>(&self, app: AppHandle, id: String, operation: F) -> Result<()>
+    pub fn input(&self, id: &str, text: Option<&str>) -> Result<()> {
+        let input = match self.0.lock().map_err(err)?.as_ref() {
+            Some((active_id, _, input)) if active_id == id => input.clone(),
+            _ => return Err("The process is no longer running.".into()),
+        };
+        let mut slot = input.lock().map_err(err)?;
+        match text {
+            Some(text) => {
+                let stdin = slot.as_mut().ok_or("This process does not accept input.")?;
+                stdin.write_all(text.as_bytes()).and_then(|_| stdin.flush()).map_err(err)
+            }
+            None => {
+                slot.take();
+                Ok(())
+            }
+        }
+    }
+
+    pub fn start<F>(&self, app: AppHandle, id: String, interactive: bool, operation: F) -> Result<()>
     where
         F: FnOnce(&Job) -> Result<(i32, Vec<Diagnostic>)> + Send + 'static,
     {
@@ -241,10 +271,11 @@ impl Jobs {
             return Err("A process is already running.".into());
         }
         let cancelled = Arc::new(AtomicBool::new(false));
-        *active = Some((id.clone(), cancelled.clone()));
+        let input: Input = Arc::default();
+        *active = Some((id.clone(), cancelled.clone(), input.clone()));
         let state = self.clone();
         thread::spawn(move || {
-            let job = Job { app, id, cancelled };
+            let job = Job { app, id, cancelled, interactive, input };
             let (code, diagnostics) = match operation(&job) {
                 Ok(result) => result,
                 Err(error) => {
@@ -270,6 +301,8 @@ pub struct Job {
     app: AppHandle,
     id: String,
     cancelled: Arc<AtomicBool>,
+    interactive: bool,
+    input: Input,
 }
 
 fn stream(mut reader: impl Read, job: &Job, kind: &'static str, capture: bool) -> String {
@@ -310,11 +343,20 @@ impl Job {
         if self.cancelled.load(Ordering::Relaxed) {
             return Ok((130, String::new()));
         }
+        if self.interactive {
+            cmd.stdin(Stdio::piped());
+        }
         let mut child = cmd
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(err)?;
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::NotFound => format!("{} was not found. Install it or add it to PATH.", cmd.get_program().to_string_lossy()),
+                _ => err(error),
+            })?;
+        if let (Some(stdin), Ok(mut slot)) = (child.stdin.take(), self.input.lock()) {
+            *slot = Some(stdin);
+        }
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
         thread::scope(|scope| {
@@ -331,6 +373,9 @@ impl Job {
                 }
                 thread::sleep(Duration::from_millis(22));
             };
+            if let Ok(mut slot) = self.input.lock() {
+                slot.take();
+            }
             Ok((code, captured.join().unwrap_or_default()))
         })
     }
@@ -376,6 +421,7 @@ fn run_java(
     file: &Path,
     path: &str,
     build_only: bool,
+    args: &[String],
 ) -> Result<(i32, Vec<Diagnostic>)> {
     let (compiler, runtime, _) =
         java(cwd).ok_or("Install a JDK with both javac and java on PATH or set JAVA_HOME.")?;
@@ -439,12 +485,27 @@ fn run_java(
     if code != 0 || build_only {
         return Ok((code, diagnostics));
     }
-    job.emit("command", format!("$ java -cp bin {class}\n"));
+    job.emit("command", format!("$ java -cp bin {class}{}\n", display_args(args)));
     let (code, _) = job.run(
-        command(runtime, cwd).args(["-Dfile.encoding=UTF-8", "-cp", "bin", &class]),
+        command(runtime, cwd).args(["-Dfile.encoding=UTF-8", "-cp", "bin", &class]).args(args),
         false,
     )?;
     Ok((code, diagnostics))
+}
+
+fn display_args(args: &[String]) -> String {
+    if args.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", shell_words::join(args))
+    }
+}
+
+pub fn parse_args(args: Option<String>) -> Result<Vec<String>> {
+    match args.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => shell_words::split(value).map_err(|_| "Check the quotes in the program arguments.".into()),
+        None => Ok(Vec::new()),
+    }
 }
 
 #[tauri::command]
@@ -455,15 +516,19 @@ pub fn run_file(
     path: String,
     id: String,
     build_only: bool,
+    args: Option<String>,
 ) -> Result<()> {
     let cwd = root(&root_path)?;
     let file = resolve(&cwd, &path)?;
     if !file.is_file() {
         return Err("Select a source file to run.".into());
     }
-    jobs.start(app, id, move |job| {
-        match file.extension().and_then(|part| part.to_str()) {
-            Some("py") => {
+    let args = parse_args(args)?;
+    jobs.start(app, id, true, move |job| {
+        let input = Path::new(".").join(relative(&path)?);
+        let extension = file.extension().and_then(|part| part.to_str()).unwrap_or_default().to_lowercase();
+        match extension.as_str() {
+            "py" => {
                 let (program, _, _) =
                     python(&cwd).ok_or("Python 3 was not found on PATH or in .venv.")?;
                 let mut cmd = command(program, &cwd);
@@ -472,17 +537,62 @@ pub fn run_file(
                     job.emit("command", format!("$ python -m py_compile {path}\n"));
                     cmd.args(["-m", "py_compile"]);
                 } else {
-                    job.emit("command", format!("$ python -u {path}\n"));
+                    job.emit("command", format!("$ python -u {path}{}\n", display_args(&args)));
                     cmd.arg("-u");
                 }
-                let input = Path::new(".").join(relative(&path)?);
-                let (code, _) = job.run(cmd.arg(input), false)?;
+                cmd.arg(input);
+                if !build_only {
+                    cmd.args(&args);
+                }
+                let (code, _) = job.run(&mut cmd, false)?;
                 Ok((code, Vec::new()))
             }
-            Some("java") => run_java(job, &cwd, &file, &path, build_only),
-            _ => Err("Run supports Python and Java files.".into()),
+            "java" => run_java(job, &cwd, &file, &path, build_only, &args),
+            "js" | "mjs" | "cjs" => {
+                let (program, _) = node(&cwd).ok_or("Node.js was not found on PATH.")?;
+                let mut cmd = command(program, &cwd);
+                if build_only {
+                    job.emit("command", format!("$ node --check {path}\n"));
+                    cmd.arg("--check").arg(input);
+                } else {
+                    job.emit("command", format!("$ node {path}{}\n", display_args(&args)));
+                    cmd.arg(input).args(&args);
+                }
+                let (code, _) = job.run(&mut cmd, false)?;
+                Ok((code, Vec::new()))
+            }
+            "sh" | "bash" if !cfg!(windows) => {
+                let mut cmd = command("bash", &cwd);
+                if build_only {
+                    job.emit("command", format!("$ bash -n {path}\n"));
+                    cmd.arg("-n").arg(input);
+                } else {
+                    job.emit("command", format!("$ bash {path}{}\n", display_args(&args)));
+                    cmd.arg(input).args(&args);
+                }
+                let (code, _) = job.run(&mut cmd, false)?;
+                Ok((code, Vec::new()))
+            }
+            "go" => {
+                let mut cmd = command("go", &cwd);
+                if build_only {
+                    job.emit("command", format!("$ go vet {path}\n"));
+                    cmd.arg("vet").arg(input);
+                } else {
+                    job.emit("command", format!("$ go run {path}{}\n", display_args(&args)));
+                    cmd.arg("run").arg(input).args(&args);
+                }
+                let (code, _) = job.run(&mut cmd, false)?;
+                Ok((code, Vec::new()))
+            }
+            _ => Err("Run supports Python, Java, JavaScript, Go, and shell files.".into()),
         }
     })
+}
+
+#[tauri::command]
+pub fn job_input(jobs: State<Jobs>, id: String, text: Option<String>) -> Result<()> {
+    jobs.input(&id, text.as_deref())
 }
 
 #[tauri::command]

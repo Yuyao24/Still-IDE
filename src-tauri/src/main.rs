@@ -1,9 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod config;
 mod git;
 mod packages;
 mod process;
+mod projects;
+mod ssh;
 mod terminal;
+mod uninstall;
 mod workspace;
 
 use tauri::Manager;
@@ -13,17 +17,38 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .manage(process::Jobs::default())
         .manage(terminal::TerminalState::default())
+        .setup(|app| {
+            let store = config::Store::load(app.handle());
+            app.manage(store);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
+            config::settings_get,
+            config::settings_set,
+            projects::home_state,
+            projects::set_projects_root,
+            projects::open_project,
+            projects::forget_project,
+            projects::pin_project,
+            projects::create_project,
+            projects::clone_project,
+            projects::reveal_path,
+            projects::app_paths,
             workspace::workspace_info,
-            workspace::sample_workspace,
             workspace::list_directory,
             workspace::list_files,
             workspace::read_file,
             workspace::save_file,
             workspace::create_file,
+            workspace::create_folder,
+            workspace::rename_path,
+            workspace::delete_path,
+            workspace::search_workspace,
             process::detect_runtimes,
             process::run_file,
             process::stop_job,
+            process::job_input,
+            terminal::detect_shells,
             terminal::terminal_start,
             terminal::terminal_write,
             terminal::terminal_resize,
@@ -31,10 +56,30 @@ fn main() {
             git::git_status,
             git::git_diff,
             git::git_stage,
+            git::git_stage_all,
+            git::git_discard,
             git::git_action,
+            git::git_branches,
+            git::git_checkout,
+            git::git_log,
+            git::git_init,
             packages::package_state,
             packages::package_search,
             packages::package_action,
+            ssh::ssh_hosts,
+            ssh::ssh_save_host,
+            ssh::ssh_delete_host,
+            ssh::ssh_test,
+            ssh::ssh_resolve,
+            ssh::ssh_list,
+            ssh::ssh_files,
+            ssh::ssh_read,
+            ssh::ssh_write,
+            ssh::ssh_fs,
+            ssh::ssh_search,
+            ssh::ssh_run,
+            uninstall::uninstall_plan,
+            uninstall::uninstall_start,
         ])
         .build(tauri::generate_context!())
         .expect("could not initialize Still")

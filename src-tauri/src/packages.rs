@@ -147,7 +147,7 @@ pub fn package_action(
     name: Option<String>,
 ) -> Result<()> {
     let cwd = root(&root_path)?;
-    jobs.start(app, id, move |job| {
+    jobs.start(app, id, false, move |job| {
         let (mut cmd, label) = match action.as_str() {
             "install" | "remove" | "requirements" => {
                 let (program, _, _) =
@@ -177,6 +177,18 @@ pub fn package_action(
                         (cmd, format!("python -m pip uninstall {name}"))
                     }
                 }
+            }
+            "venv" => {
+                if resolve(&cwd, ".venv").is_ok() {
+                    return Err("This project already has a .venv folder.".into());
+                }
+                let (program, _, venv) = python(&cwd).ok_or("Python 3 was not found on PATH.")?;
+                if venv {
+                    return Err("A virtual environment is already active.".into());
+                }
+                let mut cmd = command(program, &cwd);
+                cmd.args(["-m", "venv", ".venv"]);
+                (cmd, "python -m venv .venv".into())
             }
             "maven" => {
                 resolve(&cwd, "pom.xml")?;
