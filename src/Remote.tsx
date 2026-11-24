@@ -1,7 +1,7 @@
-import { useEffect, useState, type FormEvent, type MouseEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent, type MouseEvent } from 'react'
 import { open } from '@tauri-apps/plugin-dialog'
-import { Ellipsis, FileKey, FolderOpen, Pencil, Plug, Plus, RefreshCw, Server, SquareTerminal, Trash2 } from 'lucide-react'
-import { type SshHost, type SshOverview, desktop, hostLabel, nameHost, ssh } from './bridge'
+import { ArrowUp, Ellipsis, File, FileKey, Folder, FolderOpen, Pencil, Plug, Plus, RefreshCw, Server, SquareTerminal, Trash2 } from 'lucide-react'
+import { type RemoteListing, type SshHost, type SshOverview, desktop, hostLabel, nameHost, ssh } from './bridge'
 import { Icon, IconButton, Modal, type MenuEntry } from './ui'
 
 export const blankHost: SshHost = { id: '', name: '', host: '', user: '', port: null, identityFile: '', jump: '', forwards: [], remotePath: '', source: 'saved' }
@@ -60,23 +60,164 @@ export function HostDialog({ host, onClose, onSaved }: { host: SshHost; onClose:
   </Modal>
 }
 
-export function OpenRemoteDialog({ host, onClose, onOpen }: { host: SshHost; onClose: () => void; onOpen: (path: string) => Promise<void> }) {
-  const [path, setPath] = useState(host.remotePath || '~')
+const recentKey = (id: string) => 'still.remote.recent.' + id
+export function recentRemote(id: string): string[] {
+  try { return JSON.parse(localStorage.getItem(recentKey(id)) ?? '[]') } catch { return [] }
+}
+function rememberRemote(id: string, path: string) {
+  try { localStorage.setItem(recentKey(id), JSON.stringify([path, ...recentRemote(id).filter(item => item !== path)].slice(0, 5))) } catch { /* optional */ }
+}
+const baseName = (path: string) => path === '/' ? '/' : path.split('/').filter(Boolean).at(-1) ?? path
+const parentOf = (path: string) => path === '/' ? '/' : path.replace(/\/[^/]+\/?$/, '') || '/'
+
+/**
+ * Connects to the server first, then lets the user walk its folders and pick one,
+ * the way VS Code's remote "Open Folder" works. Nothing has to be typed in advance.
+ */
+export function OpenRemoteDialog({ host, onClose, onOpen, onBack }: { host: SshHost; onClose: () => void; onOpen: (path: string) => Promise<void>; onBack?: () => void }) {
+  const [listing, setListing] = useState<RemoteListing | null>(null)
+  const [typed, setTyped] = useState('')
+  const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [busy, setBusy] = useState(false)
+  const [hidden, setHidden] = useState(false)
+  const [active, setActive] = useState(0)
+  const [opening, setOpening] = useState(false)
+  const request = useRef(0)
+  const listRef = useRef<HTMLDivElement>(null)
+  const crumbRef = useRef<HTMLElement>(null)
   useEffect(() => { nameHost(host.id, host.name) }, [host])
-  return <Modal title={'Open folder on ' + host.name} onClose={onClose}>
-    <form className="sheet-body form-grid" onSubmit={event => {
+  useEffect(() => { const nav = crumbRef.current; if (nav) nav.scrollLeft = nav.scrollWidth }, [listing?.path])
+
+  async function go(path: string) {
+    const ticket = ++request.current
+    setLoading(true); setError('')
+    try {
+      const next = await ssh.browse(host.id, path)
+      if (ticket !== request.current) return
+      setListing(next); setTyped(next.path); setActive(0)
+      listRef.current?.scrollTo({ top: 0 })
+      const focused = document.activeElement
+      if (!focused || focused === document.body || listRef.current?.contains(focused) || focused.closest('.rb-crumbs, .rb-places, .rb-up')) requestAnimationFrame(() => listRef.current?.focus({ preventScroll: true }))
+    } catch (failure) {
+      if (ticket !== request.current) return
+      setError(String(failure))
+      if (listing) setTyped(listing.path)
+    } finally { if (ticket === request.current) setLoading(false) }
+  }
+  useEffect(() => { void go(host.remotePath || '~') }, [host.id])
+
+  async function openPath(path: string) {
+    setOpening(true); setError('')
+    try { await onOpen(path); rememberRemote(host.id, path); onClose() } catch (failure) { setError(String(failure)) } finally { setOpening(false) }
+  }
+
+  const folders = (listing?.entries ?? []).filter(entry => hidden || !entry.name.startsWith('.'))
+  const pretty = (path: string) => listing?.home && (path === listing.home || path.startsWith(listing.home + '/')) ? '~' + path.slice(listing.home.length) : path
+  const crumbs = listing ? listing.path.split('/').filter(Boolean).map((part, index, parts) => ({ label: part, path: '/' + parts.slice(0, index + 1).join('/') })) : []
+  const recents = recentRemote(host.id)
+  const connected = !!listing
+
+  function keys(event: KeyboardEvent<HTMLElement>) {
+    const dirs = folders.filter(entry => entry.directory)
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
       event.preventDefault()
-      setBusy(true); setError('')
-      onOpen(path).then(onClose).catch(failure => setError(String(failure))).finally(() => setBusy(false))
-    }}>
-      <label>Folder on the server<input className="field" value={path} onChange={event => setPath(event.target.value)} autoFocus spellCheck={false} placeholder="~/projects/app" /></label>
-      <p className="help">{hostLabel(host)} · Files are read and saved over SSH. If the server needs a password, Still asks for it once and keeps it in memory until you quit.</p>
+      const next = Math.max(0, Math.min(dirs.length - 1, active + (event.key === 'ArrowDown' ? 1 : -1)))
+      setActive(next)
+      listRef.current?.querySelectorAll('.rb-dir')[next]?.scrollIntoView({ block: 'nearest' })
+    } else if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && listing) { event.preventDefault(); void openPath(listing.path) }
+    else if ((event.key === 'ArrowRight' || (event.key === 'Enter' && event.target === listRef.current)) && dirs[active] && !(event.target instanceof HTMLInputElement)) { event.preventDefault(); void go(dirs[active].path) }
+    else if ((event.key === 'ArrowLeft' || event.key === 'Backspace') && listing && !(event.target instanceof HTMLInputElement)) { event.preventDefault(); void go(parentOf(listing.path)) }
+  }
+
+  return <Modal title={'Open folder on ' + host.name} onClose={onClose} wide className="remote-browser">
+    <div className="sheet-body rb" onKeyDown={keys}>
+      <div className="rb-status">
+        <span className={'rb-dot' + (connected ? ' on' : loading ? ' busy' : '')} />
+        <span>{connected ? 'Connected to ' + hostLabel(host) : loading ? 'Connecting to ' + hostLabel(host) + '…' : 'Not connected'}</span>
+        {onBack && <button type="button" className="quiet-link ml-auto" onClick={onBack}>Other server</button>}
+      </div>
+
+      {connected && <>
+        <form className="rb-path" onSubmit={event => { event.preventDefault(); void go(typed) }}>
+          <button type="button" className="rb-up" onClick={() => void go(parentOf(listing.path))} disabled={listing.path === '/'} title="Up one folder (Backspace)" aria-label="Up one folder"><Icon glyph={ArrowUp} size={13} /></button>
+          <nav className="rb-crumbs" aria-label="Current folder" ref={crumbRef}>
+            <button type="button" onClick={() => void go('/')}>/</button>
+            {crumbs.map(crumb => <button type="button" key={crumb.path} onClick={() => void go(crumb.path)}>{crumb.label}</button>)}
+          </nav>
+          <input className="field rb-type" value={typed === listing.path ? '' : typed} onChange={event => setTyped(event.target.value || listing.path)} placeholder="Go to path…" spellCheck={false} aria-label="Go to a path" />
+        </form>
+        <div className="rb-places">
+          <button type="button" onClick={() => void go('~')} className={listing.path === listing.home ? 'is-active' : ''}>Home</button>
+          {recents.filter(path => path !== listing.home).slice(0, 4).map(path => <button type="button" key={path} onClick={() => void go(path)} title={path}>{pretty(path)}</button>)}
+          <label className="rb-hidden"><input type="checkbox" checked={hidden} onChange={event => setHidden(event.target.checked)} /> Hidden</label>
+        </div>
+      </>}
+
+      <div className={'rb-list' + (loading ? ' is-loading' : '')} ref={listRef} tabIndex={-1} role="listbox" aria-label="Folders">
+        {!connected && loading && <p className="rb-note">Connecting… If the server needs a password, Still will ask for it once.</p>}
+        {connected && !folders.length && !loading && <p className="rb-note">This folder is empty.</p>}
+        {(() => { let dir = -1; return folders.map(entry => {
+          if (!entry.directory) return <div key={entry.path} className="rb-row rb-file"><Icon glyph={File} size={13} /><span>{entry.name}</span></div>
+          dir++
+          const index = dir
+          return <div key={entry.path} className={'rb-row rb-dir' + (index === active ? ' is-active' : '')} role="option" aria-selected={index === active} onMouseEnter={() => setActive(index)}>
+            <button type="button" className="rb-enter" onClick={() => void go(entry.path)} onDoubleClick={() => void openPath(entry.path)} title={'Show what is in ' + entry.name}>
+              <Icon glyph={Folder} size={13} /><span>{entry.name}</span>
+            </button>
+            <button type="button" className="rb-open" onClick={() => void openPath(entry.path)}>Open</button>
+          </div>
+        }) })()}
+      </div>
+
       {error && <p className="form-error" role="alert">{error}</p>}
       <div className="sheet-actions">
+        <span className="help mr-auto truncate">{connected ? 'Click a folder to look inside · Ctrl+Enter opens this one' : 'Files are read and saved over SSH'}</span>
         <button type="button" className="text-btn" onClick={onClose}>Cancel</button>
-        <button type="submit" className="text-btn primary" disabled={busy || !path.trim()}>{busy ? 'Connecting…' : 'Open folder'}</button>
+        {!connected && !loading && <button type="button" className="text-btn primary" onClick={() => void go(host.remotePath || '~')}>Try again</button>}
+        {connected && <button type="button" className="text-btn primary" disabled={opening || loading} onClick={() => void openPath(listing.path)}>{opening ? 'Opening…' : listing.path === listing.home ? 'Open home folder' : 'Open ' + baseName(listing.path)}</button>}
+      </div>
+    </div>
+  </Modal>
+}
+
+/** "Connect to server": pick a known server or type user@host, then browse its folders. */
+export function ConnectDialog({ hosts, onClose, onOpen, onAdvanced }: { hosts: SshHost[]; onClose: () => void; onOpen: (host: SshHost, path: string) => Promise<void>; onAdvanced: (host: SshHost) => void }) {
+  const [target, setTarget] = useState('')
+  const [host, setHost] = useState<SshHost | null>(null)
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+  if (host) return <OpenRemoteDialog host={host} onClose={onClose} onOpen={path => onOpen(host, path)} onBack={() => setHost(null)} />
+
+  const term = target.trim().toLowerCase()
+  const matches = hosts.filter(item => !term || item.name.toLowerCase().includes(term) || hostLabel(item).toLowerCase().includes(term))
+  const parsed = /^(?:([^@\s]+)@)?([^:\s@]+)(?::(\d+))?$/.exec(target.trim())
+
+  async function connectNew() {
+    if (!parsed) { setError('Type a server as user@host, for example mike@10.0.0.12'); return }
+    const existing = hosts.find(item => item.host === parsed[2] && (item.user || '') === (parsed[1] || item.user || '') && (!parsed[3] || item.port === Number(parsed[3])))
+    if (existing) { setHost(existing); return }
+    setBusy(true); setError('')
+    try { setHost(await ssh.save({ ...blankHost, name: parsed[2], host: parsed[2], user: parsed[1] ?? '', port: parsed[3] ? Number(parsed[3]) : null })) }
+    catch (failure) { setError(String(failure)) } finally { setBusy(false) }
+  }
+
+  return <Modal title="Connect to server" onClose={onClose} className="remote-browser">
+    <form className="sheet-body rb" onSubmit={event => { event.preventDefault(); if (matches.length === 1 && term && !parsed?.[1]) setHost(matches[0]); else void connectNew() }}>
+      <input className="field field-lg" value={target} onChange={event => { setTarget(event.target.value); setError('') }} placeholder="user@host" autoFocus spellCheck={false} aria-label="Server" />
+      <div className="rb-list rb-hosts">
+        {matches.map(item => <button type="button" key={item.id} className="rb-row rb-host" onClick={() => setHost(item)}>
+          <Icon glyph={Server} size={13} /><span>{item.name}</span><code>{item.source === 'config' && !item.user ? 'ssh config' : hostLabel(item)}</code>
+        </button>)}
+        {parsed && !matches.some(item => hostLabel(item) === target.trim()) && <button type="submit" className="rb-row rb-host" disabled={busy}>
+          <Icon glyph={Plus} size={13} /><span>Connect to {target.trim()}</span>
+        </button>}
+        {!matches.length && !parsed && <p className="rb-note">Type a server as user@host. Servers from ~/.ssh/config show up here too.</p>}
+      </div>
+      {error && <p className="form-error" role="alert">{error}</p>}
+      <div className="sheet-actions">
+        <button type="button" className="quiet-link mr-auto" onClick={() => onAdvanced(parsed ? { ...blankHost, host: parsed[2], user: parsed[1] ?? '', port: parsed[3] ? Number(parsed[3]) : null } : blankHost)}>Keys, jump host, ports…</button>
+        <button type="button" className="text-btn" onClick={onClose}>Cancel</button>
+        <button type="submit" className="text-btn primary" disabled={busy || !term}>Connect</button>
       </div>
     </form>
   </Modal>

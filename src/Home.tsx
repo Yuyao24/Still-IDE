@@ -5,7 +5,7 @@ import {
   type HomeState, type JobEvent, type ProjectSummary, type SshHost, type SshOverview, type Workspace,
   api, demo, desktop, home, hostLabel, mod, pickFolder, ssh,
 } from './bridge'
-import { blankHost, HostDialog, hostMenu, OpenRemoteDialog } from './Remote'
+import { blankHost, ConnectDialog, HostDialog, hostMenu, OpenRemoteDialog } from './Remote'
 import { useSettings } from './settings'
 import mark from './still.svg?inline'
 import { entryText, JournalSheet, useJournal } from './Journal'
@@ -43,6 +43,7 @@ export default function Home(props: Props) {
   const [cloning, setCloning] = useState(false)
   const [editingHost, setEditingHost] = useState<SshHost | null>(null)
   const [remoteHost, setRemoteHost] = useState<SshHost | null>(null)
+  const [connecting, setConnecting] = useState(false)
   const [menu, setMenu] = useState<MenuState | null>(null)
   const filterInput = useRef<HTMLInputElement>(null)
   const list = useRef<HTMLDivElement>(null)
@@ -83,7 +84,7 @@ export default function Home(props: Props) {
 
   useEffect(() => {
     const handle = (event: KeyboardEvent) => {
-      if (creating || cloning || editingHost || remoteHost || journalOpen || document.querySelector('.modal-backdrop')) return
+      if (creating || cloning || editingHost || remoteHost || connecting || journalOpen || document.querySelector('.modal-backdrop')) return
       const meta = event.ctrlKey || event.metaKey
       const key = event.key.toLowerCase()
       if (meta && key === 'n') { event.preventDefault(); setCreating(true) }
@@ -195,7 +196,7 @@ export default function Home(props: Props) {
             <button className="paper-btn primary" onClick={() => setCreating(true)}>New project</button>
             <button className="paper-btn" onClick={() => { void openFolder() }}>Open folder</button>
             <button className="paper-btn" onClick={() => desktop ? setCloning(true) : props.notify('Cloning is available in the Still desktop app.')}>Clone</button>
-            <button className="paper-btn" onClick={() => desktop ? setEditingHost(blankHost) : props.notify('SSH is available in the Still desktop app.')}>Connect to server</button>
+            <button className="paper-btn" onClick={() => desktop ? setConnecting(true) : props.notify('SSH is available in the Still desktop app.')}>Connect to server</button>
           </div>
         </header>
 
@@ -240,7 +241,7 @@ export default function Home(props: Props) {
             </div>
           </div>
           <div>
-            <div className="paper-head"><h2>Today</h2></div>
+            <div className="paper-head"><h2>Journal</h2><span className="paper-sort"><span className="muted">Today</span></span></div>
             <div className="paper-list">
               {todays.map(entry => <button key={entry.id} className="paper-row journal-line" onClick={() => { void open(entry.root, entry.path ? { path: entry.path, line: 1, time: entry.time } : undefined) }} title={entry.project}>
                 <time>{clock(entry.time)}</time><span>{entryText(entry)}</span>
@@ -257,7 +258,7 @@ export default function Home(props: Props) {
             <span>{host.name}</span> <code>{host.source === 'config' && !host.user ? 'ssh config' : hostLabel(host)}</code>
           </button>)}
           {!hosts.length && <span className="muted">None saved yet.</span>}
-          <button className="paper-add" onClick={() => setEditingHost(blankHost)}>Add server</button>
+          <button className="paper-add" onClick={() => setConnecting(true)}>Connect…</button>
         </section>}
 
         <footer className="paper-foot">
@@ -281,6 +282,7 @@ export default function Home(props: Props) {
     {journalOpen && <JournalSheet onClose={() => setJournal(false)} onOpen={entry => { setJournal(false); void open(entry.root, entry.path ? { path: entry.path, line: 1, time: entry.time } : undefined) }} />}
     {editingHost && <HostDialog host={editingHost} onClose={() => setEditingHost(null)} onSaved={host => { void refresh(); setRemoteHost(host) }} />}
     {remoteHost && <OpenRemoteDialog host={remoteHost} onClose={() => setRemoteHost(null)} onOpen={path => props.onOpenRemote(remoteHost, path)} />}
+    {connecting && <ConnectDialog hosts={hosts} onClose={() => { setConnecting(false); void refresh() }} onOpen={props.onOpenRemote} onAdvanced={host => { setConnecting(false); setEditingHost(host) }} />}
     {menu && <Menu {...menu} onClose={() => setMenu(null)} />}
   </div>
 }

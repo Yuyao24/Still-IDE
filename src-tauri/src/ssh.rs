@@ -600,6 +600,49 @@ pub async fn ssh_resolve(app: AppHandle, store: State<'_, Store>, id: String, pa
 }
 
 #[derive(Serialize)]
+pub struct RemoteListing {
+    path: String,
+    home: String,
+    entries: Vec<RemoteEntry>,
+}
+
+/// Connects (if needed) and lists one folder on the server, for picking a folder to open.
+/// `~` and `~/…` are expanded on the server; `..` is allowed so the user can walk up.
+#[tauri::command]
+pub async fn ssh_browse(app: AppHandle, store: State<'_, Store>, id: String, path: String) -> Result<RemoteListing> {
+    let host = find_host(&store, &id)?;
+    touch(&store, &id);
+    blocking(move || {
+        let script = format!(
+            "cd {} 2>/dev/null || {{ echo 'STILL-NO-DIR' >&2; exit 3; }}; printf '%s\\n%s\\n' \"$(pwd)\" \"$HOME\"; LC_ALL=C ls -1Ap 2>/dev/null",
+            cd_target(&path)
+        );
+        let out = exec(&app, &host, &script, None, 25).map_err(|error| {
+            if error.contains("STILL-NO-DIR") { format!("{path} is not a folder you can open.") } else { error }
+        })?;
+        let text = String::from_utf8_lossy(&out);
+        let mut lines = text.lines();
+        let path = lines.next().unwrap_or("").trim().to_owned();
+        let home = lines.next().unwrap_or("").trim().to_owned();
+        if !path.starts_with('/') {
+            return Err("Remote folders need a POSIX shell (Linux, macOS, or BSD) on the server.".into());
+        }
+        let mut entries: Vec<RemoteEntry> = lines
+            .filter(|line| !line.is_empty() && *line != "./" && *line != "../")
+            .map(|line| {
+                let directory = line.ends_with('/');
+                let name = line.trim_end_matches('/').to_owned();
+                let full = if path == "/" { format!("/{name}") } else { format!("{path}/{name}") };
+                RemoteEntry { name, path: full, directory }
+            })
+            .collect();
+        entries.sort_by_cached_key(|entry| (!entry.directory, entry.name.starts_with('.'), entry.name.to_lowercase()));
+        Ok(RemoteListing { path, home, entries })
+    })
+    .await
+}
+
+#[derive(Serialize)]
 pub struct RemoteEntry {
     name: String,
     path: String,

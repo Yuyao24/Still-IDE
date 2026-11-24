@@ -88,6 +88,7 @@ fn main() {
             ssh::ssh_delete_host,
             ssh::ssh_test,
             ssh::ssh_resolve,
+            ssh::ssh_browse,
             ssh::ssh_list,
             ssh::ssh_files,
             ssh::ssh_read,

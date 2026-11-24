@@ -158,12 +158,15 @@ export async function withPassword<T>(id: string, call: () => Promise<T>): Promi
   }
 }
 
+export interface RemoteListing { path: string; home: string; entries: Entry[] }
+
 export const ssh = {
   hosts: async (): Promise<SshOverview> => desktop ? invoke('ssh_hosts') : { saved: [], imported: [], client: null },
   save: (host: SshHost) => invoke<SshHost>('ssh_save_host', { host }),
   remove: (id: string) => invoke<void>('ssh_delete_host', { id }),
   test: (id: string) => withPassword(id, () => invoke<string>('ssh_test', { id })),
   resolve: (id: string, path: string) => withPassword(id, () => invoke<string>('ssh_resolve', { id, path })),
+  browse: (id: string, path: string) => withPassword(id, () => invoke<RemoteListing>('ssh_browse', { id, path })),
 }
 
 export const hostLabel = (host: SshHost) => (host.user ? host.user + '@' : '') + (host.address || host.host) + (host.port && host.port !== 22 ? ':' + host.port : '')
