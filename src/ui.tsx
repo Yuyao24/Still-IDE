@@ -188,3 +188,26 @@ export function useSlider(key: unknown) {
   const bar = box ? <span className={'slider' + (first.current ? ' no-motion' : '')} aria-hidden="true" style={{ width: box.width, transform: `translateX(${box.left}px)` }} /> : null
   return { ref, bar }
 }
+
+/** VS Code-style layout icons: a window outline with the part it toggles filled in when shown. */
+export function LayoutIcon({ part, on }: { part: 'left' | 'bottom' | 'right' | 'canvas' | 'focus' | 'overview'; on: boolean }) {
+  const fill = on ? 'currentColor' : 'none'
+  return <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.2" aria-hidden="true">
+    {part === 'overview' ? <>
+      <rect x="1.6" y="2.6" width="5.6" height="4.6" /><rect x="8.8" y="2.6" width="5.6" height="4.6" />
+      <rect x="1.6" y="8.8" width="5.6" height="4.6" /><rect x="8.8" y="8.8" width="5.6" height="4.6" />
+    </> : part === 'focus' ? <>
+      <rect x="1.6" y="2.6" width="12.8" height="10.8" />
+      <path d="M4.5 6h7M4.5 8h5M4.5 10h6" strokeWidth="1" />
+    </> : <>
+      <rect x="1.6" y="2.6" width="12.8" height="10.8" />
+      {part === 'left' && <rect x="1.6" y="2.6" width="4.4" height="10.8" fill={fill} />}
+      {part === 'bottom' && <rect x="1.6" y="9.4" width="12.8" height="4" fill={fill} />}
+      {part === 'right' && <rect x="10" y="2.6" width="4.4" height="10.8" fill={fill} />}
+      {part === 'canvas' && <>
+        <rect x="10" y="2.6" width="4.4" height="10.8" fill={on ? 'currentColor' : 'none'} />
+        {!on && <path d="M11.4 5.5h.01M13 5.5h.01M11.4 8h.01M13 8h.01M11.4 10.5h.01M13 10.5h.01" strokeWidth="1.4" strokeLinecap="round" />}
+      </>}
+    </>}
+  </svg>
+}

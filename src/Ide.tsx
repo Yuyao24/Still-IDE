@@ -7,14 +7,14 @@ import {
   Check, Circle, CircleAlert, CodeXml, Columns2, Copy, FilePlus2, Files, FolderOpen, FolderPlus,
   FolderSearch, GitBranch, GitCompareArrows, GitPullRequestArrow, Hammer, House, Moon, Package,  Pencil, Play, Plus,
   RefreshCw, Rows2, Search, Server, Settings2, Square, SquareTerminal, Sun, TerminalSquare, Trash2, WrapText, X,
-  Camera, Eye, PenLine, LayoutGrid, Maximize2, Minimize2, Network, BookOpen, Sparkles,
+  Camera, Eye, PenLine, LayoutGrid, Maximize2, Minimize2, Network, BookOpen, Sparkles, Bug,
 } from 'lucide-react'
 import {
   api, clipboard, desktop, editorSupport, fileName, fileSystem, home, mod, parentPath, pickFolder, ssh,
   type Branches, type Change, type Commit, type Diagnostic, type Diff, type Entry, type GitStatus, type JobEvent, type Packages, type Runtimes,
   type SshHost, type SshOverview, type Workspace,
 } from './bridge'
-import Editor, { defaultIndent, language, type CodeCapture, type Cursor, type EditorHandle, type EditorMemory, type EditorOptions, type LiveIssue } from './Editor'
+import Editor, { defaultIndent, highlightToHtml, language, type CodeCapture, type Cursor, type EditorHandle, type EditorMemory, type EditorOptions, type LiveIssue } from './Editor'
 import CodeShot from './CodeShot'
 import { Preview, docKind } from './Preview'
 import type { OpenOptions } from './Home'
@@ -27,7 +27,8 @@ import mark from './still.svg?inline'
 import { type Graph, buildGraph } from './graph'
 import { CanvasView, MiniCanvas } from './Canvas'
 import { Chat } from './Chat'
-import type { AgentHost } from './ai'
+import { DebugPanel, type DebugOp, type DebugSession, type DebugStop } from './Debug'
+import { type AgentHost, explain, keys, suggestCode } from './ai'
 import { Idle, useIdle } from './Idle'
 import { JournalSheet, useJournal } from './Journal'
 import { bump, clock, journal, lineChanges, remember } from './activity'
@@ -36,10 +37,10 @@ import Terminal, { type TerminalSession } from './Terminal'
 import { presets } from './themes'
 import { TitleBar } from './TitleBar'
 import { Dialog, Output, Problems, SplitGrip, type DialogState, type OutputEntry } from './Workbench'
-import { Icon, IconButton, Menu, useSlider, type MenuEntry, type MenuItem, type MenuState } from './ui'
+import { Icon, IconButton, LayoutIcon, Menu, useSlider, type MenuEntry, type MenuItem, type MenuState } from './ui'
 
 type Side = 'explorer' | 'search' | 'git' | 'packages' | 'remote'
-type Drawer = 'terminal' | 'output' | 'problems'
+type Drawer = 'terminal' | 'output' | 'problems' | 'debug'
 type DocView = 'edit' | 'split' | 'preview'
 type Tab = { id: string; path: string; contents: string; saved: string; memory?: EditorMemory; diff?: Diff; staged?: boolean; line?: number; view?: DocView }
 type Job = { id: string; kind: 'run' | 'git' | 'packages'; action: string; path?: string; detail?: string }
@@ -139,6 +140,18 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const [resizing, setResizing] = useState(false)
   const [overview, setOverview] = useState(false)
   const [graphView, setGraphView] = useState(false)
+  // Fullscreen Files and Git (opened from the overview, like the journal and the canvas).
+  const [fullView, setFullView] = useState<'files' | 'git' | null>(null)
+  // Debugger: breakpoints per file (kept per project), watch expressions, and the running session.
+  const [breakpoints, setBreakpoints] = useState<Record<string, number[]>>(() => { try { return JSON.parse(localStorage.getItem('still.breakpoints.' + workspace.root) ?? '{}') } catch { return {} } })
+  const [watches, setWatches] = useState<string[]>(() => { try { return JSON.parse(localStorage.getItem('still.watches.' + workspace.root) ?? '[]') } catch { return [] } })
+  const [debug, setDebug] = useState<DebugSession | null>(null)
+  const debugRef = useRef<DebugSession | null>(null)
+  debugRef.current = debug
+  // Events can arrive before React re-renders, so the ref is updated together with the state.
+  const putDebug = (next: DebugSession | null) => { debugRef.current = next; setDebug(next) }
+  const [filePreview, setFilePreview] = useState<{ path: string; text: string } | null>(null)
+  const [gitPreview, setGitPreview] = useState<{ path: string; diff: Diff; staged: boolean } | null>(null)
   const [graph, setGraph] = useState<Graph | null>(null)
   const [graphError, setGraphError] = useState('')
   const [journalOpen, setJournalOpen] = useState(false)
@@ -687,6 +700,29 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     })
   }
 
+  // AI inline suggestions: keys are read once from the keychain, and a missing key is said once.
+  const suggestKey = useRef<{ provider: string; key: string | null } | null>(null)
+  const suggestWarned = useRef(false)
+  async function suggestInline(prefix: string, suffix: string, signal: AbortSignal) {
+    if (!active) return ''
+    const provider = settings.aiCompleteProvider
+    if (provider !== 'ollama' && suggestKey.current?.provider !== provider) suggestKey.current = { provider, key: await keys.get(provider).catch(() => null) }
+    const key = provider === 'ollama' ? null : suggestKey.current?.key ?? null
+    if (provider !== 'ollama' && !key) {
+      if (!suggestWarned.current) { suggestWarned.current = true; notify('Inline suggestions need ' + (provider === 'github' ? 'a GitHub token' : 'an Anthropic API key') + ' in Settings → AI.') }
+      return ''
+    }
+    try {
+      return await suggestCode({
+        settings: { provider, model: settings.aiCompleteModel, ollamaUrl: settings.ollamaUrl, githubModel: provider === 'github' ? settings.aiCompleteModel : settings.githubModel },
+        key, path: active.path, language: mode ?? 'text', prefix, suffix, signal,
+      })
+    } catch (error) {
+      if (!signal.aborted && !suggestWarned.current) { suggestWarned.current = true; notify('Inline suggestions: ' + explain(error)) }
+      return ''
+    }
+  }
+
   function searchFor(query: string) {
     setSearchSeed(previous => ({ query, key: (previous?.key ?? 0) + 1 }))
     showSide('search')
@@ -782,6 +818,8 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       { label: 'Run', items: [
         item(active ? 'Run ' + fileName(active.path) : 'Run', () => { void run() }, mod + '+Enter', { disabled: !runnable || Boolean(job) }),
         item('Run with arguments…', askArguments, undefined, { disabled: !runnable || Boolean(job) }),
+        item('Debug', () => { void startDebug() }, 'F5', { disabled: Boolean(debugWhy) || !active || Boolean(job) }),
+        item('Toggle breakpoint', () => { if (active) { const list = breakpoints[active.path] ?? []; changeBreakpoints(active.path, list.includes(cursor.line) ? list.filter(line => line !== cursor.line) : [...list, cursor.line]) } }, 'F9', { disabled: !active || Boolean(active.diff) }),
         ...(!remote ? [item(mode === 'Java' ? 'Compile' : 'Check', () => { void run(true) }, mod + '+Shift+Enter', { disabled: !runnable || Boolean(job) })] : []),
         item('Stop', () => { if (job) void invoke('stop_job', { id: job.id }).catch(notify) }, undefined, { disabled: !job }),
         'separator',
@@ -901,6 +939,87 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     if (!next.length) terminal.current = null
   }
 
+  useEffect(() => { try { localStorage.setItem('still.breakpoints.' + workspace.root, JSON.stringify(breakpoints)) } catch { /* ignore */ } }, [breakpoints])
+  useEffect(() => { try { localStorage.setItem('still.watches.' + workspace.root, JSON.stringify(watches)) } catch { /* ignore */ } }, [watches])
+  useEffect(() => {
+    if (!desktop) return
+    let stop: UnlistenFn | null = null, cancelled = false
+    void listen<{ id: string; event: string } & Partial<DebugStop> & { expression?: string; value?: string; ok?: boolean }>('debug-event', ({ payload }) => {
+      const current = debugRef.current
+      if (!current || payload.id !== current.id) return
+      if (payload.event === 'started') putDebug({ ...current, state: 'running' })
+      else if (payload.event === 'stopped') {
+        const stopped = payload as unknown as DebugStop
+        putDebug({ ...current, state: 'paused', stop: stopped })
+        if (!stopped.frameFile.startsWith('/') && !/^[a-z]:/i.test(stopped.frameFile)) jumpTo({ path: stopped.frameFile, line: stopped.frameLine })
+        setDrawer('debug'); setDrawerOpen(true)
+        void getCurrentWindow().setFocus().catch(() => {})
+      } else if (payload.event === 'eval') putDebug({ ...current, evals: [...current.evals, { expression: payload.expression ?? '', value: payload.value ?? '', ok: payload.ok !== false }] })
+      else if (payload.event === 'ended') putDebug(null)
+    }).then(unlisten => { if (cancelled) unlisten(); else stop = unlisten })
+    return () => { cancelled = true; stop?.() }
+  }, [])
+
+  const debugWhy = !desktop ? 'Debugging runs in the Still desktop app.' : remote ? 'Debugging works for local projects for now.' : mode !== 'Python' ? 'The debugger works with Python files for now.' : undefined
+  async function startDebug() {
+    if (!active || debugWhy || activeJob.current) { if (debugWhy) notify(debugWhy); return }
+    await store(active)
+    const items = Object.entries(breakpoints).flatMap(([file, lines]) => lines.map(line => ({ file, line })))
+    putDebug({ id: '', state: 'starting', stop: null, evals: [] })
+    const started = launch('run', 'debug', 'debug_start', { rootPath: workspace.root, path: active.path, breakpoints: items, watches, stopOnEntry: false, args: runArgs[active.path] || null }, { path: active.path })
+    const id = (activeJob.current as Job | null)?.id ?? ''
+    putDebug({ id, state: 'starting', stop: null, evals: [] })
+    setDrawer('debug'); setDrawerOpen(true)
+    await started
+    if (!activeJob.current) putDebug(null)
+  }
+  function debugSend(command: Record<string, unknown>) {
+    const current = debugRef.current
+    if (!current?.id) return
+    void invoke('debug_send', { id: current.id, command }).catch(notify)
+  }
+  function debugCommand(op: DebugOp) {
+    const current = debugRef.current
+    if (!current) return
+    if (op === 'stop') {
+      if (current.state === 'paused') debugSend({ op: 'stop' })
+      if (activeJob.current) void invoke('stop_job', { id: activeJob.current.id }).catch(() => {})
+      putDebug(null)
+      return
+    }
+    if (current.state !== 'paused') return
+    putDebug({ ...current, state: 'running' })
+    debugSend({ op })
+  }
+  function changeBreakpoints(path: string, lines: number[]) {
+    setBreakpoints(previous => {
+      const next = { ...previous, [path]: [...new Set(lines)].sort((a, b) => a - b) }
+      if (!next[path].length) delete next[path]
+      // A running program learns about new breakpoints at once.
+      if (debugRef.current?.state === 'paused') debugSend({ op: 'breakpoints', items: Object.entries(next).flatMap(([file, items]) => items.map(line => ({ file, line }))) })
+      return next
+    })
+  }
+  function changeWatches(next: string[]) {
+    setWatches(next)
+    if (debugRef.current?.state === 'paused') debugSend({ op: 'watches', items: next })
+  }
+
+  // F5 debug / continue, Shift+F5 stop, F9 breakpoint, F10 step over, F11 step into, Shift+F11 step out.
+  useEffect(() => {
+    const keys = (event: KeyboardEvent) => {
+      if (!/^F(5|9|10|11)$/.test(event.key) || event.ctrlKey || event.metaKey || event.altKey || document.querySelector('.modal-backdrop, .settings-backdrop')) return
+      event.preventDefault()
+      const current = debugRef.current
+      if (event.key === 'F5') { if (event.shiftKey) debugCommand('stop'); else if (current) debugCommand('continue'); else void startDebug() }
+      else if (event.key === 'F9' && active && !active.diff) { const list = breakpoints[active.path] ?? []; changeBreakpoints(active.path, list.includes(cursor.line) ? list.filter(line => line !== cursor.line) : [...list, cursor.line]) }
+      else if (event.key === 'F10') debugCommand('next')
+      else if (event.key === 'F11') debugCommand(event.shiftKey ? 'out' : 'step')
+    }
+    addEventListener('keydown', keys, true)
+    return () => removeEventListener('keydown', keys, true)
+  })
+
   async function launch(kind: Job['kind'], action: string, command: string, args: object, extra: Pick<Job, 'path' | 'detail'> = {}) {
     if (activeJob.current || !jobReady) { notify('The process runner is busy or still starting.'); return }
     const current: Job = { id: crypto.randomUUID(), kind, action, ...extra }
@@ -909,7 +1028,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     setOutput([])
     setSampleRun(false)
     if (focusMode) { setFocusOutput(true); setDrawer('output') }
-    else showDrawer('output')
+    else showDrawer(action === 'debug' ? 'debug' : 'output')
     try { await invoke(command, { ...args, id: current.id }) }
     catch (error) {
       if (activeJob.current?.id === current.id) {
@@ -1252,7 +1371,10 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     if (key === 'editor') { requestAnimationFrame(() => editor.current?.focus()); return }
     if (key.startsWith('tab:')) { activate(key.slice(4)); return }
     if (key === 'journal') { setJournalOpen(true); return }
-    if (key === 'graph') { setGraphOpen(true); return }
+    // Files, Git and the canvas open fullscreen from the overview.
+    if (key === 'graph') { setGraphView(true); return }
+    if (key === 'explorer') { setFilePreview(null); setFullView('files'); return }
+    if (key === 'git') { setGitPreview(null); void refreshLog(); setFullView('git'); return }
     if (key === 'terminal') { showDrawer('terminal', true); return }
     showSide(key as Side)
   }
@@ -1308,6 +1430,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     { key: 'terminal', label: 'Terminal', glyph: TerminalSquare },
     { key: 'output', label: 'Output', glyph: CodeXml },
     { key: 'problems', label: 'Problems', glyph: CircleAlert },
+    { key: 'debug', label: 'Debug', glyph: Bug },
   ] as const
   const remoteActions = {
     onTerminal: (target: SshHost) => { setDrawer('terminal'); setDrawerOpen(true); newSession(target) },
@@ -1333,6 +1456,10 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     onIssues: (issues: LiveIssue[]) => { const path = active.path; setLive(previous => previous && previous.path === path && JSON.stringify(previous.issues) === JSON.stringify(issues) ? previous : { path, issues }) },
     onContextMenu: editorMenu,
     onDefinition: () => { void goToDefinition() },
+    suggest: settings.aiComplete && !active.diff ? suggestInline : undefined,
+    breakpoints: breakpoints[active.path] ?? [],
+    onBreakpoints: (lines: number[]) => changeBreakpoints(active.path, lines),
+    debugLine: debug?.state === 'paused' && debug.stop && debug.stop.frameFile === active.path ? debug.stop.frameLine : null,
   } : null
   // On narrow windows the graph island steps aside on its own; the setting is kept for when there is room again.
   const showChat = chatOpen && frame.width >= 760
@@ -1350,22 +1477,27 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const chatMounted = usePresence(showChat)
   const shownSide: Side = sidebar ?? lastSide
   const drawerMounted = usePresence(drawerOpen)
+  const idleShown = usePresence(idle, 520)
   const marks = active ? edits[active.path] ?? [] : []
   const tabSlider = useSlider(selected + tabs.length + sidebar + graphOpen + focusMode)
   const drawerSlider = useSlider(drawer + drawerOpen + sidebar)
-  const projectEntries = journalEntries.filter(entry => entry.root === workspace.root).slice(-3).reverse()
-  const otherTabs = tabs.filter(tab => tab.id !== selected && !tab.diff).slice(0, 3)
+  const projectEntries = journalEntries.filter(entry => entry.root === workspace.root).slice(-5).reverse()
+  const codeOf = (path: string, text: string) => highlightToHtml(text.split('\n').slice(0, 34).join('\n'), path.split('.').at(-1) ?? '')
   const excerpt = (text: string, count: number) => <pre>{text.split('\n').slice(0, count).join('\n')}</pre>
   const cards: OverviewCard[] = [
-    { key: 'editor', title: active ? 'Editor · ' + fileName(active.path) : 'Editor', note: 'active', wide: true, current: true, body: active ? excerpt(active.diff ? active.diff.after : active.contents, 7) : <span>No file open</span> },
-    ...otherTabs.map(tab => ({ key: 'tab:' + tab.id, title: fileName(tab.path), note: dirty(tab) ? 'unsaved' : undefined, body: excerpt(tab.contents, 6) })),
-    { key: 'explorer', title: 'Files', hidden: sidebar !== 'explorer', body: <span className="ov-list">{(directories[''] ?? []).slice(0, 5).map(entry => <span key={entry.path}>{entry.name}{entry.directory ? '/' : ''}</span>)}</span> },
-    { key: 'terminal', title: 'Terminal', hidden: !drawerOpen, body: excerpt(output.map(entry => entry.text).join('\n').split('\n').filter(Boolean).slice(-4).join('\n') || (sessions.length ? sessions.length + (sessions.length === 1 ? ' session open' : ' sessions open') : 'No output yet'), 4) },
-    { key: 'graph', title: 'Canvas', hidden: !graphOpen, fullLabel: 'Open canvas', body: <span className="ov-dots" aria-hidden="true"><i /><i /><i /><i /><i /></span> },
-    { key: 'journal', title: 'Journal', fullLabel: 'Open journal', body: <span className="ov-list">{projectEntries.length ? projectEntries.map(entry => <span key={entry.id}>{clock(entry.time)} {entry.text}</span>) : <span>Nothing noted yet</span>}</span> },
+    // Every open file is a window, the one you're in first and larger.
+    ...[...tabs].sort((a, b) => Number(b.id === selected) - Number(a.id === selected)).slice(0, 9).map(tab => ({
+      key: 'tab:' + tab.id, kind: 'file' as const, title: fileName(tab.path) + (tab.diff ? ' · diff' : ''), note: tab.id === selected ? 'editing' : dirty(tab) ? 'unsaved' : parentPath(tab.path),
+      wide: tab.id === selected, current: tab.id === selected, code: codeOf(tab.path, tab.diff ? tab.diff.after : tab.contents), body: null,
+    })),
+    ...(!tabs.length ? [{ key: 'editor', title: 'Editor', note: 'no file open', wide: true, current: true, body: <span className="ov-list"><span>Open a file with {mod}+P</span></span> }] : []),
+    { key: 'explorer', kind: 'tool', title: 'Files', note: 'fullscreen', fullLabel: 'Open files', full: false, body: <span className="ov-list">{(directories[''] ?? []).slice(0, 7).map(entry => <span key={entry.path}>{entry.name}{entry.directory ? '/' : ''}</span>)}</span> },
     remote
-      ? { key: 'remote', title: 'Servers', hidden: sidebar !== 'remote', body: <span className="ov-list"><span>{workspace.hostName}</span><span>{workspace.root}</span></span> }
-      : { key: 'git', title: 'Git', hidden: sidebar !== 'git', body: <span className="ov-list"><span>{status.changes.length} {status.changes.length === 1 ? 'change' : 'changes'} on {status.branch ?? 'no branch'}</span>{sidebar !== 'git' && <span>Click to show</span>}</span> },
+      ? { key: 'remote', kind: 'tool', title: 'Servers', full: false, body: <span className="ov-list"><span>{workspace.hostName}</span><span>{workspace.root}</span></span> }
+      : { key: 'git', kind: 'tool', title: 'Git', note: status.branch ?? undefined, full: false, body: <span className="ov-list"><span>{status.changes.length} {status.changes.length === 1 ? 'change' : 'changes'}</span>{status.changes.slice(0, 5).map(change => <span key={change.path}>{change.worktree === '?' ? 'new' : 'changed'} · {fileName(change.path)}</span>)}</span> },
+    { key: 'graph', kind: 'tool', title: 'Canvas', full: false, body: <span className="ov-dots" aria-hidden="true"><i /><i /><i /><i /><i /></span> },
+    { key: 'terminal', kind: 'tool', title: 'Terminal', hidden: !drawerOpen, body: excerpt(output.map(entry => entry.text).join('\n').split('\n').filter(Boolean).slice(-5).join('\n') || (sessions.length ? sessions.length + (sessions.length === 1 ? ' session open' : ' sessions open') : 'No output yet'), 5) },
+    { key: 'journal', kind: 'tool', title: 'Journal', full: false, body: <span className="ov-list">{projectEntries.length ? projectEntries.map(entry => <span key={entry.id}>{clock(entry.time)} {entry.text}</span>) : <span>Nothing noted yet</span>}</span> },
   ]
   const agentHost: Omit<AgentHost, 'approve'> = {
     root: workspace.root,
@@ -1398,11 +1530,12 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     open: (path, line) => jumpTo({ path, line: line ?? 1 }),
   }
 
+  const debugButton = runnable && active && mode === 'Python' && !remote && desktop && <IconButton glyph={Bug} className={'debug-btn' + (debug ? ' is-on' : '')} label={debug ? 'Debugging · Shift+F5 stops' : 'Debug (F5)'} disabled={Boolean(job) && !debug} onClick={() => { if (debug) debugCommand('stop'); else void startDebug() }} />
   const runButton = runnable && active && <button type="button" className="run" title={'Run ' + (remote ? 'on ' + workspace.hostName + ' ' : '') + '(' + mod + '+Enter). Right-click for arguments.'} disabled={Boolean(job) || runningRequest || !jobReady}
     onClick={() => { void run() }} onContextMenu={event => { event.preventDefault(); askArguments() }}>{job?.kind === 'run' ? 'Running…' : 'Run'}</button>
 
-  return <div className={'app bench-app' + (focusMode ? ' is-focus' : '')}>
-    <TitleBar onError={notify} onClose={desktop ? () => { void getCurrentWindow().close().catch(notify) } : undefined}
+  return <div className={'app bench-app' + (focusMode ? ' is-focus' : '') + (settings.autoHideTopBar ? ' top-autohide' : '') + (idleShown && !idle ? ' is-waking' : '')}>
+    <TitleBar onError={notify} autoHide={settings.autoHideTopBar} onClose={desktop ? () => { void getCurrentWindow().close().catch(notify) } : undefined}
       left={focusMode
         ? <span className="focus-path">{workspace.name}{active && active.path.split('/').map((part, index, all) => <span key={index}><i>/</i>{index === all.length - 1 ? <b>{part}</b> : part}</span>)}</span>
         : <>
@@ -1422,26 +1555,26 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
             {remote && <Icon glyph={Server} size={12} />}{workspace.name}
           </button>
         </>}
-      center={focusMode ? undefined : <nav className="islands-nav" aria-label="Show or hide islands">
-        <button aria-pressed={Boolean(sidebar)} className={sidebar ? 'is-on' : ''} onClick={() => { if (focusMode) setFocusMode(false); setSidebar(value => value ? null : lastSide) }}
-          data-tip={(sidebar ? 'Hide' : 'Show') + ' sidebar · ' + mod + '+B'}>
-          Sidebar{status.changes.length > 0 && !remote && <span className="nav-count">{Math.min(status.changes.length, 99)}</span>}
-        </button>
-        <button aria-pressed={graphOpen} className={graphOpen ? 'is-on' : ''} onClick={() => setGraphOpen(value => !value)} data-tip={(graphOpen ? 'Hide' : 'Show') + ' canvas · ' + mod + '+Shift+D'}>Canvas</button>
-        <button aria-pressed={showChat} className={showChat ? 'is-on' : ''} onClick={toggleChat} data-tip={(showChat ? 'Hide' : 'Show') + ' chat · ' + mod + '+Shift+A'}>Chat</button>
-        <button aria-pressed={drawerOpen} className={drawerOpen ? 'is-on' : ''} onClick={() => drawerOpen && drawer === 'terminal' ? setDrawerOpen(false) : showDrawer('terminal', true)} data-tip={(drawerOpen && drawer === 'terminal' ? 'Hide' : 'Show') + ' terminal · ' + mod + '+J'}>Terminal</button>
-        <span className="nav-rule" />
-        <button onClick={toggleFocus} data-tip={'Only the code · ' + mod + '+.'}>Focus</button>
-        <button onClick={openOverview} data-tip={'See everything · ' + mod + '+↑'}>Overview</button>
-      </nav>}
       right={focusMode
         ? <button className="quiet-link" onClick={() => setFocusMode(false)}>Esc to show everything</button>
         : <>
-          <button className="chrome-jump" onClick={() => openPalette('')} title="Find a file or run a command"><span>Go to</span><kbd>{mod}+K</kbd></button>
-          <IconButton glyph={theme.kind === 'dark' ? Sun : Moon} label="Toggle light and dark" onClick={onToggleTheme} />
+          <nav className="layout-toggles" aria-label="Show or hide parts of the window">
+            <button aria-pressed={Boolean(sidebar)} className={sidebar ? 'is-on' : ''} onClick={() => { if (focusMode) setFocusMode(false); setSidebar(value => value ? null : lastSide) }}
+              data-tip={(sidebar ? 'Hide' : 'Show') + ' sidebar · ' + mod + '+B'} aria-label="Sidebar"><LayoutIcon part="left" on={Boolean(sidebar)} />{status.changes.length > 0 && !remote && !sidebar && <i className="toggle-dot" />}</button>
+            <button aria-pressed={drawerOpen} className={drawerOpen ? 'is-on' : ''} onClick={() => drawerOpen ? setDrawerOpen(false) : showDrawer('terminal', true)}
+              data-tip={(drawerOpen ? 'Hide' : 'Show') + ' terminal and output · ' + mod + '+J'} aria-label="Terminal"><LayoutIcon part="bottom" on={drawerOpen} /></button>
+            <button aria-pressed={graphOpen} className={graphOpen ? 'is-on' : ''} onClick={() => setGraphOpen(value => !value)}
+              data-tip={(graphOpen ? 'Hide' : 'Show') + ' canvas · ' + mod + '+Shift+D'} aria-label="Canvas"><LayoutIcon part="canvas" on={showGraph} /></button>
+            <button aria-pressed={showChat} className={showChat ? 'is-on' : ''} onClick={toggleChat}
+              data-tip={(showChat ? 'Hide' : 'Show') + ' chat · ' + mod + '+Shift+A'} aria-label="Chat"><LayoutIcon part="right" on={showChat} /></button>
+            <span className="nav-rule" />
+            <button onClick={toggleFocus} data-tip={'Focus: only the code · ' + mod + '+.'} aria-label="Focus"><LayoutIcon part="focus" on={false} /></button>
+            <button onClick={openOverview} data-tip={'Overview · ' + mod + '+↑'} aria-label="Overview"><LayoutIcon part="overview" on={false} /></button>
+          </nav>
           <IconButton glyph={Settings2} label={'Settings (' + mod + '+,)'} onClick={() => onSettings()} />
           {remote ? <span className="chrome-branch"><Icon glyph={Server} size={12} />{workspace.hostName}</span>
             : <button className="chrome-branch" onClick={event => { void branchMenu(event) }} title="Switch branch">{status.branch ?? 'No branch'}</button>}
+          {debugButton}
           {runButton}
         </>} />
 
@@ -1563,7 +1696,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
 
       <div className={'slot slot-chat' + (showChat && !maximized ? ' is-open' : '')} aria-hidden={!showChat || undefined}>
       {chatMounted && <aside className="island chat-island" style={{ width: chatWidth }} aria-label="Chat island" inert={!showChat || undefined}>
-        <Chat settings={{ provider: settings.aiProvider, model: settings.aiModel, effort: settings.aiEffort, ollamaUrl: settings.ollamaUrl, ollamaModel: settings.ollamaModel, autoApproveEdits: settings.aiAutoApprove }}
+        <Chat settings={{ provider: settings.aiProvider, model: settings.aiModel, effort: settings.aiEffort, ollamaUrl: settings.ollamaUrl, ollamaModel: settings.ollamaModel, githubModel: settings.githubModel, autoApproveEdits: settings.aiAutoApprove }}
           host={agentHost} projectKey={(workspace.remote ?? '') + workspace.root} focusKey={chatFocus} onSettings={() => onSettings('ai')} onClose={() => setChatOpen(false)} />
       </aside>}
       </div>
@@ -1608,6 +1741,10 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
           {drawer === 'output' && <Output entries={output} sample={sampleRun}
             onInput={job?.kind === 'run' ? text => { void invoke('job_input', { id: job.id, text }).catch(notify) } : undefined} />}
           {drawer === 'problems' && <Problems items={problems} jump={jumpTo} />}
+          {drawer === 'debug' && <DebugPanel session={debug} canDebug={!debugWhy && Boolean(active) && !job} why={debugWhy} breakpointCount={Object.values(breakpoints).reduce((sum, lines) => sum + lines.length, 0)}
+            watches={watches} onStart={() => { void startDebug() }} onCommand={debugCommand} onFrame={index => debugSend({ op: 'frame', index })}
+            onEval={expression => debugSend({ op: 'eval', expression })} onWatches={changeWatches} onJump={(file, line) => jumpTo({ path: file, line })}
+            output={<Output entries={output} sample={false} onInput={job?.kind === 'run' ? text => { void invoke('job_input', { id: job.id, text }).catch(notify) } : undefined} />} />}
         </div>
       </section>}
       </div>
@@ -1660,9 +1797,38 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       onNewSpace={() => { setOverview(false); chooseFolder() }}
       onLayout={id => applyLayout(id)}
       onSaveLayout={() => { try { localStorage.setItem('still.layout.custom', JSON.stringify(islands)) } catch { /* ignore */ } notify('Saved this layout. Pick it under Layouts as Saved.') }} />}
+    {fullView === 'files' && <FullView title="Files" project={workspace.name} onClose={() => { setFullView(null); requestAnimationFrame(() => editor.current?.focus()) }}>
+      <div className="full-side island side">
+        <Explorer workspace={workspace} directories={directories} expanded={expanded} active={filePreview?.path ?? active?.path} changes={status} symbols={[]}
+          onOpen={path => { void fs.read(path).then(text => setFilePreview({ path, text })).catch(notify) }} onExpand={toggleFolder} onNew={() => newFile()} onNewFolder={() => newFolder()} onWorkspace={chooseFolder}
+          onRefresh={() => { void refreshFiles() }} onJump={() => {}} onContext={explorerMenu} onKey={explorerKey} />
+      </div>
+      <div className="full-main">
+        {filePreview ? <>
+          <header className="full-main-head"><b>{filePreview.path}</b><button className="text-btn primary" onClick={() => { setFullView(null); void openFile(filePreview.path) }}>Open in editor</button></header>
+          <div className="full-editor"><Editor key={filePreview.path} path={filePreview.path} text={filePreview.text} readOnly options={{ ...editorOptions, changes: false, errors: false }} diagnostics={[]} onEdit={() => {}} onCursor={() => {}} handle={() => {}} /></div>
+        </> : <p className="full-empty">Choose a file to preview it here. Open it in the editor when you want to change it.</p>}
+      </div>
+    </FullView>}
+    {fullView === 'git' && <FullView title="Git" project={workspace.name} onClose={() => { setFullView(null); requestAnimationFrame(() => editor.current?.focus()) }}>
+      <div className="full-side island side">
+        <SourceControl status={status} busy={Boolean(job) || gitBusy} error={gitError} commit={commit} log={log} onCommitText={setCommit}
+          onDiff={(change, index) => { void api.diff(workspace.root, change, index).then(diff => setGitPreview({ path: change.path, diff, staged: index })).catch(notify) }}
+          onStage={(change, index) => { void updateStage(change, index) }} onAction={gitAction}
+          onStageAll={unstage => { void stageAll(unstage) }} onDiscard={discard} onBranch={event => { void branchMenu(event) }}
+          onInit={() => { void api.gitInit(workspace.root).then(() => refreshGit()).catch(notify) }} onRefresh={() => { void refreshGit(); void refreshLog() }} />
+      </div>
+      <div className="full-main">
+        {gitPreview ? <>
+          <header className="full-main-head"><b>{gitPreview.path}</b><span className="muted">{gitPreview.staged ? 'Staged changes' : 'Working tree'}</span>
+            <button className="text-btn" onClick={() => { setFullView(null); void openFile(gitPreview.path) }}>Open file</button></header>
+          <div className="full-editor"><Editor key={gitPreview.path + gitPreview.staged} path={gitPreview.path} text={gitPreview.diff.after} diff={gitPreview.diff} options={{ ...editorOptions, layout: 'split' }} diagnostics={[]} onEdit={() => {}} onCursor={() => {}} handle={() => {}} /></div>
+        </> : <p className="full-empty">{status.changes.length ? 'Choose a change to see what is different.' : 'Nothing has changed since the last commit.'}</p>}
+      </div>
+    </FullView>}
     {graphView && <CanvasView graph={graph} error={graphError} root={workspace.root} project={workspace.name} active={active && !active.diff ? active.path : undefined} changed={changedPaths}
       onOpen={path => { setGraphView(false); void openFile(path) }} onClose={() => { setGraphView(false); requestAnimationFrame(() => editor.current?.focus()) }} />}
-    {idle && <Idle sources={tabs.filter(tab => !tab.diff).map(tab => ({ path: tab.path, project: workspace.name, text: tab.contents, edited: edits[tab.path]?.at(-1)?.time }))} onWake={wake} />}
+    {idleShown && <Idle leaving={!idle} sources={tabs.filter(tab => !tab.diff).map(tab => ({ path: tab.path, project: workspace.name, text: tab.contents, edited: edits[tab.path]?.at(-1)?.time }))} onWake={wake} />}
     {palette !== null && <Palette commands={commands} files={fileItems} start={palette} onClose={closePalette} />}
     {dialog && <Dialog dialog={dialog} close={() => setDialog(null)} />}
     {menu && <Menu {...menu} onClose={() => setMenu(null)} />}
@@ -1686,4 +1852,23 @@ function usePresence(open: boolean, ms = 260) {
     return () => clearTimeout(timer)
   }, [open, ms])
   return open || present
+}
+
+/** A fullscreen view over the workspace (Files, Git), like the canvas and the journal. */
+function FullView({ title, project, onClose, children }: { title: string; project: string; onClose: () => void; children: React.ReactNode }) {
+  useEffect(() => {
+    const key = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || event.defaultPrevented || document.querySelector('.modal-backdrop, .menu, .cm-panels')) return
+      event.preventDefault(); onClose()
+    }
+    addEventListener('keydown', key)
+    return () => removeEventListener('keydown', key)
+  }, [onClose])
+  return <div className="graph-view full-view" role="dialog" aria-label={title}>
+    <header className="graph-head">
+      <span className="graph-crumbs"><b>Still</b><i>/</i>{project}<i>/</i>{title}</span>
+      <button className="quiet-link" onClick={onClose}>Esc to return</button>
+    </header>
+    <div className="full-body">{children}</div>
+  </div>
 }

@@ -1,6 +1,6 @@
-import { useEffect, useRef, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 
-export interface OverviewCard { key: string; title: string; note?: string; wide?: boolean; hidden?: boolean; current?: boolean; full?: boolean; fullLabel?: string; body: ReactNode }
+export interface OverviewCard { key: string; title: string; note?: string; wide?: boolean; hidden?: boolean; current?: boolean; full?: boolean; fullLabel?: string; body: ReactNode; code?: string; kind?: 'file' | 'tool' }
 export interface OverviewSpace { id: string; label: string; kind: 'home' | 'project' | 'server'; current?: boolean; preview?: string[] }
 export interface OverviewLayout { id: string; label: string }
 
@@ -23,6 +23,13 @@ interface Props {
 /** Everything in the workspace at once, like a desk seen from above. */
 export function Overview(props: Props) {
   const grid = useRef<HTMLDivElement>(null)
+  // Choosing a window: it grows toward the screen while the rest fades, then the view switches.
+  const [chosen, setChosen] = useState<string | null>(null)
+  const choose = (key: string, action: (key: string) => void) => {
+    if (chosen) return
+    setChosen(key)
+    setTimeout(() => action(key), 190)
+  }
   useEffect(() => {
     const current = grid.current?.querySelector<HTMLButtonElement>('.ov-card.is-current') ?? grid.current?.querySelector<HTMLButtonElement>('.ov-card')
     current?.focus({ preventScroll: true })
@@ -58,7 +65,7 @@ export function Overview(props: Props) {
     best?.focus()
   }
 
-  return <div className="overview" role="dialog" aria-label="Overview">
+  return <div className={'overview' + (chosen ? ' is-leaving' : '')} role="dialog" aria-label="Overview">
     <nav className="ov-spaces" aria-label="Workspaces">
       {props.spaces.map((space, index) => <button key={space.id} className={'ov-space' + (space.current ? ' is-current' : '')} style={{ animationDelay: index * 20 + 'ms' }}
         aria-current={space.current ? 'page' : undefined} onClick={() => space.current ? props.onClose() : props.onSpace(space.id)}>
@@ -74,18 +81,19 @@ export function Overview(props: Props) {
 
     <div className="ov-title">
       <h1>{props.title}</h1>
-      <span>Enter jumps · F fills the window · Delete hides or shows · Esc returns</span>
+      <span>Click a window to open it · F fills the screen · Delete hides or shows · Esc returns</span>
     </div>
 
-    <div className="ov-grid" ref={grid}>
-      {props.cards.map((card, index) => <div key={card.key} className={'ov-slot' + (card.wide ? ' wide' : '')} style={{ animationDelay: 40 + index * 22 + 'ms' }}>
-        <button className={'ov-card' + (card.hidden ? ' is-hidden' : '') + (card.current ? ' is-current' : '')}
-          onClick={() => props.onJump(card.key)} onKeyDown={event => move(event, card.key)}
-          aria-label={card.title + (card.hidden ? ', hidden' : '') + '. Enter to jump, F to fill the window.'}>
+    <div className="ov-grid ov-windows" ref={grid}>
+      {props.cards.map((card, index) => <div key={card.key} className={'ov-slot' + (card.wide ? ' wide' : '') + (chosen === card.key ? ' is-chosen' : chosen ? ' is-fading' : '')} style={{ animationDelay: 30 + index * 26 + 'ms' }}>
+        <button className={'ov-card ov-window' + (card.kind === 'file' ? ' is-file' : ' is-tool') + (card.hidden ? ' is-hidden' : '') + (card.current ? ' is-current' : '')}
+          onClick={() => choose(card.key, props.onJump)} onKeyDown={event => move(event, card.key)}
+          aria-label={card.title + (card.hidden ? ', hidden' : '') + '. Enter to open, F to fill the window.'}>
           <span className="ov-card-head"><b>{card.title}</b><span>{card.hidden ? 'hidden' : card.note}</span></span>
-          <span className="ov-card-body">{card.body}</span>
+          <span className="ov-card-body">{card.code !== undefined ? <pre dangerouslySetInnerHTML={{ __html: card.code }} /> : card.body}</span>
         </button>
-        {card.full !== false && <button className="ov-full" tabIndex={-1} onClick={() => props.onFullscreen(card.key)}>{card.fullLabel ?? 'Fullscreen'}</button>}
+        <span className="ov-label">{card.title}</span>
+        {card.full !== false && <button className="ov-full" tabIndex={-1} onClick={() => choose(card.key, props.onFullscreen)}>{card.fullLabel ?? 'Fullscreen'}</button>}
       </div>)}
     </div>
 

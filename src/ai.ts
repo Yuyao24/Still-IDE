@@ -1,6 +1,8 @@
-// The assistant behind the Chat island. Two providers share one set of tools:
-// Claude through the official Anthropic SDK (tool runner, streamed), and a local model
-// through Ollama's chat API. Tools that change anything wait for the person's approval.
+// The assistant behind the Chat island. Three providers share one set of tools:
+// Claude through the official Anthropic SDK (tool runner, streamed), GitHub Models
+// (OpenAI, Llama, Mistral, DeepSeek… with a GitHub token) and a local model through
+// Ollama. Tools that change anything wait for the person's approval. The same providers
+// also power inline code suggestions (ghost text, like Copilot).
 
 import Anthropic from '@anthropic-ai/sdk'
 import { betaTool } from '@anthropic-ai/sdk/helpers/beta/json-schema'
@@ -8,7 +10,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { fetch as appFetch } from '@tauri-apps/plugin-http'
 import { desktop } from './bridge'
 
-export type Provider = 'anthropic' | 'ollama'
+export type Provider = 'anthropic' | 'ollama' | 'github'
 export type Mode = 'ask' | 'agent'
 export const claudeModels = [
   { id: 'claude-opus-5-5', label: 'Claude Opus 5.5' },
@@ -16,7 +18,7 @@ export const claudeModels = [
   { id: 'claude-haiku-5-5', label: 'Claude Haiku 5.5' },
 ]
 
-export interface AiSettings { provider: Provider; model: string; effort: 'low' | 'medium' | 'high'; ollamaUrl: string; ollamaModel: string; autoApproveEdits: boolean }
+export interface AiSettings { provider: Provider; model: string; effort: 'low' | 'medium' | 'high'; ollamaUrl: string; ollamaModel: string; githubModel: string; autoApproveEdits: boolean }
 
 /** What the assistant can do in the open project. The Chat island supplies it. */
 export interface AgentHost {
@@ -310,13 +312,182 @@ export async function askOllama(options: { settings: AiSettings; mode: Mode; his
   return messages
 }
 
+// ---- GitHub Models -------------------------------------------------------------------
+// GitHub's model catalog (the models GitHub Copilot users reach) through its OpenAI-style
+// inference API. A GitHub token with the "Models: read" permission is all it needs.
+
+const githubApi = 'https://models.github.ai'
+const githubHeaders = (token: string) => ({ authorization: 'Bearer ' + token, accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28', 'content-type': 'application/json' })
+
+export interface GithubModel { id: string; name: string; publisher: string; tools: boolean }
+export const githubFallbackModels: GithubModel[] = [
+  { id: 'openai/gpt-4.1', name: 'GPT-4.1', publisher: 'OpenAI', tools: true },
+  { id: 'openai/gpt-4.1-mini', name: 'GPT-4.1 mini', publisher: 'OpenAI', tools: true },
+  { id: 'openai/gpt-4o', name: 'GPT-4o', publisher: 'OpenAI', tools: true },
+  { id: 'openai/o4-mini', name: 'o4-mini', publisher: 'OpenAI', tools: true },
+  { id: 'deepseek/DeepSeek-V3-0324', name: 'DeepSeek V3', publisher: 'DeepSeek', tools: false },
+  { id: 'meta/Llama-4-Maverick-17B-128E-Instruct-FP8', name: 'Llama 4 Maverick', publisher: 'Meta', tools: false },
+  { id: 'mistral-ai/Codestral-2501', name: 'Codestral', publisher: 'Mistral AI', tools: false },
+]
+
+export async function githubModels(token: string): Promise<GithubModel[]> {
+  const response = await fetchForAi(githubApi + '/catalog/models', { headers: githubHeaders(token) })
+  if (response.status === 401 || response.status === 403) throw new Error('GitHub rejected the token. It needs the “Models: read” permission.')
+  if (!response.ok) throw new Error('GitHub answered ' + response.status)
+  const body = await response.json() as { id: string; name?: string; publisher?: string; capabilities?: string[]; supported_output_modalities?: string[] }[]
+  return body.filter(model => !model.supported_output_modalities || model.supported_output_modalities.includes('text'))
+    .map(model => ({ id: model.id, name: model.name ?? model.id, publisher: model.publisher ?? '', tools: (model.capabilities ?? []).includes('tool-calling') }))
+}
+
+export interface ChatMessage { role: 'system' | 'user' | 'assistant' | 'tool'; content: string | null; tool_calls?: { id: string; type: 'function'; function: { name: string; arguments: string } }[]; tool_call_id?: string }
+
+async function githubError(response: Response) {
+  let detail = ''
+  try { const body = await response.json() as { error?: { message?: string; code?: string } }; detail = body.error?.message ?? '' } catch { /* not JSON */ }
+  if (response.status === 401) return new Error('GitHub rejected the token. Check it in Settings → AI.')
+  if (response.status === 403) return new Error('This GitHub token can’t use GitHub Models. Give it the “Models: read” permission.' + (detail ? ' (' + detail + ')' : ''))
+  if (response.status === 429) return new Error('GitHub Models rate limit reached. Wait a moment, or pick a lighter model.' + (detail ? ' (' + detail + ')' : ''))
+  return new Error('GitHub Models answered ' + response.status + (detail ? ': ' + detail : ''))
+}
+
+/** One reply from a GitHub model, with tools when the model supports them. Returns the updated conversation. */
+export async function askGithub(options: { token: string; settings: AiSettings; mode: Mode; history: ChatMessage[]; prompt: string; host: AgentHost; events: Events; signal: AbortSignal; tools: boolean }): Promise<ChatMessage[]> {
+  const { settings, host, events } = options
+  if (!settings.githubModel) throw new Error('Choose a GitHub model in Settings → AI.')
+  const specs = options.tools ? toolSpecs.filter(spec => options.mode === 'agent' || !spec.changes) : []
+  const tools = specs.map(spec => ({ type: 'function', function: { name: spec.name, description: spec.description, parameters: spec.schema } }))
+  const messages: ChatMessage[] = options.history.length ? [...options.history] : [{ role: 'system', content: systemPrompt(host, options.mode) }]
+  messages.push({ role: 'user', content: options.prompt + contextNote(host) })
+  for (let round = 0; round < 16; round++) {
+    const response = await fetchForAi(githubApi + '/inference/chat/completions', {
+      method: 'POST', headers: githubHeaders(options.token), signal: options.signal,
+      body: JSON.stringify({ model: settings.githubModel, messages, stream: true, ...(tools.length ? { tools } : {}) }),
+    })
+    if (!response.ok || !response.body) throw await githubError(response)
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = '', content = ''
+    const calls: { id: string; name: string; arguments: string }[] = []
+    for (let finished = false; !finished;) {
+      const { value, done } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      let newline
+      while ((newline = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, newline).trim()
+        buffer = buffer.slice(newline + 1)
+        if (!line.startsWith('data:')) continue
+        const data = line.slice(5).trim()
+        if (data === '[DONE]') { finished = true; break }
+        let chunk: { choices?: { delta?: { content?: string | null; reasoning_content?: string; tool_calls?: { index: number; id?: string; function?: { name?: string; arguments?: string } }[] } }[]; error?: { message?: string } }
+        try { chunk = JSON.parse(data) } catch { continue }
+        if (chunk.error) throw new Error(chunk.error.message ?? 'GitHub Models returned an error.')
+        const delta = chunk.choices?.[0]?.delta
+        if (!delta) continue
+        if (delta.reasoning_content) events.thinking(delta.reasoning_content)
+        if (delta.content) { events.text((!content && round > 0 ? '\n\n' : '') + delta.content); content += delta.content }
+        for (const call of delta.tool_calls ?? []) {
+          const slot = calls[call.index] ?? (calls[call.index] = { id: call.id ?? crypto.randomUUID(), name: '', arguments: '' })
+          if (call.id) slot.id = call.id
+          if (call.function?.name) slot.name += call.function.name
+          if (call.function?.arguments) slot.arguments += call.function.arguments
+        }
+      }
+    }
+    const made = calls.filter(Boolean)
+    messages.push({ role: 'assistant', content: content || null, tool_calls: made.length ? made.map(call => ({ id: call.id, type: 'function', function: { name: call.name, arguments: call.arguments } })) : undefined })
+    if (!made.length) return messages
+    for (const call of made) {
+      const spec = specs.find(item => item.name === call.name)
+      let input: Record<string, unknown> = {}
+      try { input = JSON.parse(call.arguments || '{}') } catch { messages.push({ role: 'tool', tool_call_id: call.id, content: 'Error: the arguments were not valid JSON.' }); continue }
+      if (!spec) { messages.push({ role: 'tool', tool_call_id: call.id, content: 'Error: no such tool.' }); continue }
+      const id = call.id
+      events.tool({ id, name: spec.name, summary: summary(spec.name, input), state: 'running' })
+      try {
+        const result = await spec.run(input, host, events, id)
+        events.tool({ id, name: spec.name, summary: summary(spec.name, input), state: result.startsWith('DECLINED') ? 'declined' : 'done' })
+        messages.push({ role: 'tool', tool_call_id: call.id, content: result })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        events.tool({ id, name: spec.name, summary: summary(spec.name, input), state: 'failed', detail: message })
+        messages.push({ role: 'tool', tool_call_id: call.id, content: 'Error: ' + message })
+      }
+    }
+  }
+  return messages
+}
+
+// ---- Inline suggestions (ghost text) -----------------------------------------------------
+
+export interface CompleteSettings { provider: Provider; model: string; ollamaUrl: string; githubModel: string }
+
+const completeSystem = 'You are the code completion engine inside a code editor. You are given a file with a <CURSOR> marker. Reply with ONLY the exact text to insert at the cursor: no explanation, no Markdown fences, and never repeat code that is already before or after the cursor. Continue naturally from where the person is typing; when they have just written a function or class signature, write the complete body. Match the file\'s indentation and style. If nothing useful fits, reply with an empty message.'
+
+/** Cleans a model's suggestion: no fences, no echo of the text around the cursor. */
+function tidySuggestion(raw: string, prefix: string, suffix: string) {
+  let text = raw.replace(/^```[\w+-]*\n?/, '').replace(/\n?```\s*$/, '')
+  text = text.replace(/<\/?CURSOR>/g, '')
+  // Drop a repeated copy of the current line's start, which models sometimes include.
+  const lineStart = prefix.slice(prefix.lastIndexOf('\n') + 1)
+  if (lineStart.trim() && text.startsWith(lineStart)) text = text.slice(lineStart.length)
+  // The editor has already indented the new line; don't indent the first line twice.
+  else if (!lineStart.trim() && lineStart) { const lead = /^[ \t]*/.exec(text)![0]; text = text.slice(Math.min(lead.length, lineStart.length)) }
+  // Stop where the suggestion runs into the code that already follows the cursor.
+  const next = suffix.split('\n').find(line => line.trim())?.trim()
+  if (next && next.length > 3) { const at = text.indexOf(next); if (at > 0) text = text.slice(0, at) }
+  return text.replace(/\s+$/, '')
+}
+
+/** Asks the chosen provider what to insert at the cursor. Returns '' when there's nothing to suggest. */
+export async function suggestCode(options: { settings: CompleteSettings; key: string | null; path: string; language: string; prefix: string; suffix: string; signal: AbortSignal }): Promise<string> {
+  const { settings, prefix, suffix } = options
+  const prompt = `File: ${options.path} (${options.language})\n<file>\n${prefix}<CURSOR>${suffix}\n</file>`
+  if (settings.provider === 'ollama') {
+    if (!settings.model) return ''
+    // Fill-in-the-middle: coding models (qwen2.5-coder, codellama, starcoder2…) take the code after the cursor as `suffix`.
+    const response = await fetchForAi(settings.ollamaUrl.replace(/\/$/, '') + '/api/generate', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, signal: options.signal,
+      body: JSON.stringify({ model: settings.model, prompt: prefix, suffix, stream: false, options: { num_predict: 256, temperature: 0.2 } }),
+    })
+    if (!response.ok) return ''
+    const body = await response.json() as { response?: string }
+    return tidySuggestion(body.response ?? '', prefix, suffix)
+  }
+  if (!options.key) return ''
+  if (settings.provider === 'github') {
+    const response = await fetchForAi(githubApi + '/inference/chat/completions', {
+      method: 'POST', headers: githubHeaders(options.key), signal: options.signal,
+      body: JSON.stringify({ model: settings.githubModel || settings.model, max_tokens: 400, messages: [{ role: 'system', content: completeSystem }, { role: 'user', content: prompt }] }),
+    })
+    if (!response.ok) throw await githubError(response)
+    const body = await response.json() as { choices?: { message?: { content?: string } }[] }
+    return tidySuggestion(body.choices?.[0]?.message?.content ?? '', prefix, suffix)
+  }
+  const client = new Anthropic({ apiKey: options.key, dangerouslyAllowBrowser: true, fetch: fetchForAi, maxRetries: 0 })
+  const haiku = settings.model.startsWith('claude-haiku')
+  const message = await client.beta.messages.create({
+    model: settings.model,
+    max_tokens: 1024,
+    system: [{ type: 'text', text: completeSystem, cache_control: { type: 'ephemeral' } }],
+    messages: [{ role: 'user', content: prompt }],
+    output_config: { effort: 'low' },
+    // Haiku can skip thinking entirely at low effort, which keeps suggestions quick.
+    ...(haiku ? { thinking: { type: 'disabled' as const } } : { betas: ['server-side-fallback-2026-07-01'], fallbacks: 'default' as const }),
+  }, { signal: options.signal })
+  if (message.stop_reason === 'refusal') return ''
+  const text = message.content.map(block => block.type === 'text' ? block.text : '').join('')
+  return tidySuggestion(text, prefix, suffix)
+}
+
 // ---- Keys ----------------------------------------------------------------------------
 
+/** Saved keys: the Anthropic API key and the GitHub token, in the system keychain. */
 export const keys = {
-  status: async () => desktop ? invoke<boolean>('ai_key_status', { provider: 'anthropic' }) : Boolean(sessionStorage.getItem('still.anthropic-key')),
-  get: async () => desktop ? invoke<string | null>('ai_key_get', { provider: 'anthropic' }) : sessionStorage.getItem('still.anthropic-key'),
-  set: async (key: string | null) => {
-    if (desktop) await invoke('ai_key_set', { provider: 'anthropic', key })
-    else if (key) sessionStorage.setItem('still.anthropic-key', key); else sessionStorage.removeItem('still.anthropic-key')
+  status: async (provider: 'anthropic' | 'github' = 'anthropic') => desktop ? invoke<boolean>('ai_key_status', { provider }) : Boolean(sessionStorage.getItem('still.' + provider + '-key')),
+  get: async (provider: 'anthropic' | 'github' = 'anthropic') => desktop ? invoke<string | null>('ai_key_get', { provider }) : sessionStorage.getItem('still.' + provider + '-key'),
+  set: async (key: string | null, provider: 'anthropic' | 'github' = 'anthropic') => {
+    if (desktop) await invoke('ai_key_set', { provider, key })
+    else if (key) sessionStorage.setItem('still.' + provider + '-key', key); else sessionStorage.removeItem('still.' + provider + '-key')
   },
 }

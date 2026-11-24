@@ -18,7 +18,7 @@ use std::{
 const SERVICE: &str = "dev.still.editor";
 
 fn entry(provider: &str) -> Result<keyring::Entry> {
-    if !matches!(provider, "anthropic") {
+    if !matches!(provider, "anthropic" | "github") {
         return Err("Unknown AI provider.".into());
     }
     keyring::Entry::new(SERVICE, &format!("{provider}-api-key")).map_err(err)

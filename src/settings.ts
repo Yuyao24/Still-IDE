@@ -31,12 +31,16 @@ export interface Settings {
   journal: boolean
   autocomplete: boolean
   autoUpdate: boolean
-  aiProvider: 'anthropic' | 'ollama'
+  aiProvider: 'anthropic' | 'ollama' | 'github'
   aiModel: string
   aiEffort: 'low' | 'medium' | 'high'
   ollamaUrl: string
   ollamaModel: string
   aiAutoApprove: boolean
+  githubModel: string
+  aiComplete: boolean
+  aiCompleteProvider: 'anthropic' | 'ollama' | 'github'
+  aiCompleteModel: string
   syntaxTheme: string
   cursorStyle: 'line' | 'block' | 'underline'
   cursorBlink: boolean
@@ -51,7 +55,8 @@ export interface Settings {
   trimOnSave: boolean
   finalNewline: boolean
   reduceMotion: boolean
-  bounce: boolean
+  autoHideTopBar: boolean
+  settingsVersion: number
   openLastProject: boolean
   terminalScrollback: number
   terminalCopyOnSelect: boolean
@@ -83,7 +88,7 @@ export const defaults: Settings = {
   idleMinutes: 5,
   smoothCaret: true,
   journal: true,
-  autocomplete: false,
+  autocomplete: true,
   autoUpdate: true,
   aiProvider: 'anthropic',
   aiModel: 'claude-opus-5-5',
@@ -91,6 +96,10 @@ export const defaults: Settings = {
   ollamaUrl: 'http://localhost:11434',
   ollamaModel: '',
   aiAutoApprove: false,
+  githubModel: 'openai/gpt-4.1',
+  aiComplete: false,
+  aiCompleteProvider: 'anthropic',
+  aiCompleteModel: 'claude-opus-5-5',
   syntaxTheme: '',
   cursorStyle: 'line',
   cursorBlink: true,
@@ -105,7 +114,8 @@ export const defaults: Settings = {
   trimOnSave: false,
   finalNewline: false,
   reduceMotion: false,
-  bounce: true,
+  autoHideTopBar: false,
+  settingsVersion: 2,
   openLastProject: false,
   terminalScrollback: 5000,
   terminalCopyOnSelect: false,
@@ -126,6 +136,8 @@ const cacheKey = 'still.settings'
 function merge(value: unknown): Settings {
   const stored = value && typeof value === 'object' ? value as Partial<Settings> : {}
   const merged = { ...defaults, ...stored }
+  // Version 2: word suggestions became smart and on by default; AI completion is its own setting.
+  if (!stored.settingsVersion || stored.settingsVersion < 2) { merged.autocomplete = true; merged.settingsVersion = 2 }
   if (!Array.isArray(merged.customThemes)) merged.customThemes = []
   return merged
 }
@@ -187,7 +199,6 @@ export function applySettings(settings: Settings, systemDark: boolean) {
   classes.toggle('cursor-block', settings.cursorStyle === 'block')
   classes.toggle('cursor-underline', settings.cursorStyle === 'underline')
   classes.toggle('reduce-motion', settings.reduceMotion)
-  classes.toggle('no-bounce', !settings.bounce)
   watchKeyRepeat()
   return theme
 }

@@ -5,7 +5,7 @@ import {
   type HomeState, type JobEvent, type ProjectSummary, type SshHost, type SshOverview, type Workspace,
   api, demo, desktop, home, hostLabel, mod, pickFolder, ssh,
 } from './bridge'
-import { blankHost, ConnectDialog, HostDialog, hostMenu, OpenRemoteDialog } from './Remote'
+import { ConnectDialog, HostDialog, OpenRemoteDialog } from './Remote'
 import { useSettings } from './settings'
 import mark from './still.svg?inline'
 import { entryText, JournalSheet, useJournal } from './Journal'
@@ -45,6 +45,7 @@ export default function Home(props: Props) {
   const [remoteHost, setRemoteHost] = useState<SshHost | null>(null)
   const [connecting, setConnecting] = useState(false)
   const [menu, setMenu] = useState<MenuState | null>(null)
+  const [showAll, setShowAll] = useState(false)
   const filterInput = useRef<HTMLInputElement>(null)
   const list = useRef<HTMLDivElement>(null)
 
@@ -141,21 +142,13 @@ export default function Home(props: Props) {
 
   function row(project: ProjectSummary) {
     const when = project.lastOpened ? relativeTime(project.lastOpened) : project.modified ? 'edited ' + relativeTime(project.modified).toLowerCase() : ''
-    return <div key={project.path} className={'paper-row' + (project.missing ? ' missing' : '')} onContextMenu={event => showMenu(event, projectMenu(project))}>
+    return <div key={project.path} className={'calm-row' + (project.missing ? ' missing' : '')} onContextMenu={event => showMenu(event, projectMenu(project))}>
       <button className="project-open" onClick={() => { if (!project.missing) void open(project.path) }} disabled={project.missing} title={project.path} onKeyDown={rowKey}>
-        <span className="paper-name">{project.name}{project.location === 'external' && <span className="muted"> · elsewhere</span>}{project.pinned && <Icon glyph={Pin} size={11} className="project-pin" />}</span>
-        <span className="paper-meta">{project.missing ? 'Missing' : [project.languages.slice(0, 2).join(', '), when].filter(Boolean).join(' · ')}</span>
+        <span className="calm-name">{project.name}{project.pinned && <Icon glyph={Pin} size={11} className="project-pin" />}</span>
+        <span className="calm-meta">{project.missing ? 'Missing' : [project.location === 'external' ? 'elsewhere' : '', project.languages.slice(0, 2).join(', '), when].filter(Boolean).join(' · ')}</span>
       </button>
       <IconButton glyph={Ellipsis} label={'Actions for ' + project.name} className="row-action" onClick={event => showMenu(event, projectMenu(project), true)} />
     </div>
-  }
-
-  const serverActions = {
-    onTerminal: (host: SshHost) => setRemoteHost(host),
-    onOpenFolder: (host: SshHost) => setRemoteHost(host),
-    onEdit: (host: SshHost) => setEditingHost(host),
-    onDelete: (host: SshHost) => { void ssh.remove(host.id).then(refresh).catch(props.notify) },
-    onTest: (host: SshHost) => { props.notify('Connecting to ' + host.name + '…'); void ssh.test(host.id).then(result => props.notify('Connected: ' + result)).catch(props.notify) },
   }
 
   const latest = recent.find(project => !project.missing && project.lastOpened)
@@ -183,7 +176,6 @@ export default function Home(props: Props) {
             }} />
           {!filter && <kbd>{mod}+K</kbd>}
         </label>
-        <IconButton glyph={theme.kind === 'dark' ? Sun : Moon} label="Toggle light and dark" onClick={props.onToggleTheme} />
         <button className="quiet-link" onClick={() => props.onSettings()}>Settings</button>
       </>} />
 
@@ -194,9 +186,9 @@ export default function Home(props: Props) {
           <p>Pick up where you left off, or start something new.</p>
           <div className="paper-actions">
             <button className="paper-btn primary" onClick={() => setCreating(true)}>New project</button>
-            <button className="paper-btn" onClick={() => { void openFolder() }}>Open folder</button>
-            <button className="paper-btn" onClick={() => desktop ? setCloning(true) : props.notify('Cloning is available in the Still desktop app.')}>Clone</button>
-            <button className="paper-btn" onClick={() => desktop ? setConnecting(true) : props.notify('SSH is available in the Still desktop app.')}>Connect to server</button>
+            <button className="calm-action" onClick={() => { void openFolder() }}>Open folder</button>
+            <button className="calm-action" onClick={() => desktop ? setCloning(true) : props.notify('Cloning is available in the Still desktop app.')}>Clone</button>
+            <button className="calm-action" onClick={() => desktop ? setConnecting(true) : props.notify('SSH is available in the Still desktop app.')}>Connect to server</button>
           </div>
         </header>
 
@@ -211,59 +203,44 @@ export default function Home(props: Props) {
           </div>
         </section>}
 
-        {latest && !term && <section className="paper-section">
-          <h2>Continue</h2>
-          <button className="paper-continue" onClick={() => { void open(latest.path, resume ?? undefined) }} onContextMenu={event => showMenu(event, projectMenu(latest))}>
+        {latest && !term && <section className="calm-continue">
+          <button onClick={() => { void open(latest.path, resume ?? undefined) }} onContextMenu={event => showMenu(event, projectMenu(latest))}>
+            <span className="calm-label">Continue</span>
             <b>{latest.name}</b>
-            {resume && <span className="muted">{resume.path}, line {resume.line}</span>}
-            {changed ? <span className="paper-amber">{changed} changed</span> : null}
-            <span className="muted paper-when">{relativeTime(latest.lastOpened)}</span>
+            <span className="calm-where">{[resume ? resume.path.split('/').at(-1) + ', line ' + resume.line : '', relativeTime(latest.lastOpened).toLowerCase()].filter(Boolean).join(' · ')}{changed ? <em> · {changed} changed</em> : null}</span>
           </button>
         </section>}
 
-        <section className="paper-columns">
-          <div ref={list}>
-            <div className="paper-head">
-              <h2>{term ? 'Matching projects' : 'Projects'}{state?.projectsRoot && !term && <> · <button className="paper-root" onClick={event => showMenu(event, [
-                { label: 'Change projects folder…', icon: FolderOpen, action: () => { void chooseRoot() } },
-                { label: 'Reveal in file manager', icon: FolderSearch, action: () => { void home.reveal(state.projectsRoot!).catch(props.notify) } },
-              ], true)} title={state.projectsRoot}>{shortPath(state.projectsRoot, homeDir)}</button></>}</h2>
-              <span className="paper-sort">
+        <section className="calm-grid">
+          <div ref={list} className="calm-projects">
+            <div className="calm-head">
+              <h2>{term ? 'Matching projects' : 'Projects'}</h2>
+              {!term && <span className="calm-sort">
                 <button className={sort === 'recent' ? 'is-active' : ''} onClick={() => setSort('recent')}>Recent</button>
                 <button className={sort === 'name' ? 'is-active' : ''} onClick={() => setSort('name')}>Name</button>
-              </span>
+              </span>}
             </div>
-            <div className="paper-list">
-              {filtered.map(row)}
-              {state && !filtered.length && <div className="paper-empty">
-                {term ? <p>No projects match “{filter}”.</p> : <p>No projects yet. <button className="link" onClick={() => setCreating(true)}>Create one</button>, or try the Orbit Lab sample from New project.</p>}
-              </div>}
+            <div className="calm-list">
+              {(showAll || term ? filtered : filtered.slice(0, 7)).map(row)}
+              {state && !filtered.length && <p className="calm-quiet">
+                {term ? <>No projects match “{filter}”.</> : <>No projects yet. <button className="link" onClick={() => setCreating(true)}>Create one</button>, or try the Orbit Lab sample from New project.</>}
+              </p>}
             </div>
+            {!term && filtered.length > 7 && <button className="calm-more" onClick={() => setShowAll(value => !value)}>{showAll ? 'Fewer' : 'All ' + filtered.length + ' projects'}</button>}
+            {state?.projectsRoot && !term && <button className="calm-root" onClick={event => showMenu(event, [
+              { label: 'Change projects folder…', icon: FolderOpen, action: () => { void chooseRoot() } },
+              { label: 'Reveal in file manager', icon: FolderSearch, action: () => { void home.reveal(state.projectsRoot!).catch(props.notify) } },
+            ], true)} title={state.projectsRoot}>{shortPath(state.projectsRoot, homeDir)}</button>}
           </div>
-          <div>
-            <div className="paper-head"><h2>Journal</h2><span className="paper-sort"><span className="muted">Today</span></span></div>
-            <div className="paper-list">
-              {todays.map(entry => <button key={entry.id} className="paper-row journal-line" onClick={() => { void open(entry.root, entry.path ? { path: entry.path, line: 1, time: entry.time } : undefined) }} title={entry.project}>
-                <time>{clock(entry.time)}</time><span>{entryText(entry)}</span>
-              </button>)}
-              {!todays.length && <p className="paper-row paper-quiet">Nothing yet today.</p>}
-              <button className="paper-row journal-line paper-quiet journal-open" onClick={() => setJournal(true)}><span>Open journal</span></button>
-            </div>
-          </div>
+          {!term && <div className="calm-journal">
+            <div className="calm-head"><h2>Today</h2></div>
+            {todays.map(entry => <button key={entry.id} className="calm-entry" onClick={() => { void open(entry.root, entry.path ? { path: entry.path, line: 1, time: entry.time } : undefined) }} title={entry.project}>
+              <time>{clock(entry.time)}</time><span>{entryText(entry)}</span>
+            </button>)}
+            {!todays.length && <p className="calm-quiet">Nothing yet today.</p>}
+            <button className="calm-more" onClick={() => setJournal(true)}>Open journal</button>
+          </div>}
         </section>
-
-        {desktop && <section className="paper-servers">
-          <h2>Servers</h2>
-          {hosts.map(host => <button key={host.id} onClick={() => setRemoteHost(host)} onContextMenu={event => showMenu(event, hostMenu(host, serverActions))} title={'Open a folder on ' + host.name}>
-            <span>{host.name}</span> <code>{host.source === 'config' && !host.user ? 'ssh config' : hostLabel(host)}</code>
-          </button>)}
-          {!hosts.length && <span className="muted">None saved yet.</span>}
-          <button className="paper-add" onClick={() => setConnecting(true)}>Connect…</button>
-        </section>}
-
-        <footer className="paper-foot">
-          <span><kbd>{mod}+N</kbd> new project</span><span><kbd>{mod}+O</kbd> open folder</span><span><kbd>/</kbd> search</span><span><kbd>{mod}+,</kbd> settings</span>
-        </footer>
       </div>
     </main>
 

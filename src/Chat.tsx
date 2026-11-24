@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { type AgentHost, type AiSettings, type Approval, type ClaudeHistory, type Mode, type OllamaMessage, askClaude, askOllama, explain, keys } from './ai'
+import { type AgentHost, type AiSettings, type Approval, type ChatMessage, type ClaudeHistory, type Mode, type OllamaMessage, askClaude, askGithub, askOllama, explain, githubFallbackModels, keys } from './ai'
 import { renderMarkdown } from './Preview'
 import { mod } from './bridge'
 
@@ -74,14 +74,16 @@ export function Chat({ settings, host, projectKey, onSettings, onClose, focusKey
   const [attach, setAttach] = useState(true)
   const claude = useRef<ClaudeHistory>([])
   const ollama = useRef<OllamaMessage[]>([])
+  const github = useRef<ChatMessage[]>([])
   const abort = useRef<AbortController | null>(null)
   const list = useRef<HTMLDivElement>(null)
   const box = useRef<HTMLTextAreaElement>(null)
 
-  useEffect(() => { void keys.status().then(setHasKey).catch(() => setHasKey(false)) }, [settings.provider, focusKey])
+  const keyed = settings.provider === 'anthropic' || settings.provider === 'github'
+  useEffect(() => { if (settings.provider === 'ollama') { setHasKey(true); return } void keys.status(settings.provider).then(setHasKey).catch(() => setHasKey(false)) }, [settings.provider, focusKey])
   useEffect(() => { try { localStorage.setItem('still.chat.mode', mode) } catch { /* ignore */ } }, [mode])
   useEffect(() => { box.current?.focus() }, [focusKey])
-  useEffect(() => { setTurns([]); claude.current = []; ollama.current = [] }, [projectKey])
+  useEffect(() => { setTurns([]); claude.current = []; ollama.current = []; github.current = [] }, [projectKey])
   useEffect(() => { const node = list.current; if (node && node.scrollHeight - node.scrollTop - node.clientHeight < 160) node.scrollTop = node.scrollHeight }, [turns])
 
   const update = (id: string, change: (turn: Turn) => Turn) => setTurns(previous => previous.map(turn => turn.id === id ? change(turn) : turn))
@@ -89,7 +91,7 @@ export function Chat({ settings, host, projectKey, onSettings, onClose, focusKey
   async function send(text = input) {
     const prompt = text.trim()
     if (!prompt || busy) return
-    if (settings.provider === 'anthropic' && !hasKey) { onSettings(); return }
+    if (keyed && !hasKey) { onSettings(); return }
     setInput('')
     const replyId = crypto.randomUUID()
     setTurns(previous => [...previous, { id: crypto.randomUUID(), role: 'user', text: prompt, tools: [] }, { id: replyId, role: 'assistant', text: '', tools: [] }])
@@ -118,6 +120,11 @@ export function Chat({ settings, host, projectKey, onSettings, onClose, focusKey
         const apiKey = await keys.get()
         if (!apiKey) throw new Error('Add your Anthropic API key in Settings → AI.')
         claude.current = await askClaude({ apiKey, settings, mode, history: claude.current, prompt, host: agentHost, events, signal: controller.signal })
+      } else if (settings.provider === 'github') {
+        const token = await keys.get('github')
+        if (!token) throw new Error('Add a GitHub token in Settings → AI.')
+        const tools = !githubFallbackModels.some(model => model.id === settings.githubModel && !model.tools) && !/deepseek|llama|codestral|phi-|mistral-small/i.test(settings.githubModel)
+        github.current = await askGithub({ token, settings, mode, history: github.current, prompt, host: agentHost, events, signal: controller.signal, tools })
       } else {
         ollama.current = await askOllama({ settings, mode, history: ollama.current, prompt, host: agentHost, events, signal: controller.signal })
       }
@@ -135,7 +142,8 @@ export function Chat({ settings, host, projectKey, onSettings, onClose, focusKey
     setTurns(previous => previous.map(turn => turn.approvals?.includes(pending) ? { ...turn, approvals: turn.approvals.filter(item => item !== pending) } : turn))
   }
 
-  const modelName = settings.provider === 'anthropic' ? settings.model.replace('claude-', '').replace(/-(\d)-(\d)$/, ' $1.$2').replace(/^./, c => c.toUpperCase()) : settings.ollamaModel || 'Ollama'
+  const modelName = settings.provider === 'anthropic' ? settings.model.replace('claude-', '').replace(/-(\d)-(\d)$/, ' $1.$2').replace(/^./, c => c.toUpperCase())
+    : settings.provider === 'github' ? (settings.githubModel.split('/').at(-1) || 'GitHub Models') : settings.ollamaModel || 'Ollama'
   const file = host.activeFile
 
   return <div className="chat">
@@ -146,15 +154,15 @@ export function Chat({ settings, host, projectKey, onSettings, onClose, focusKey
       </nav>
       <span className="chat-head-actions">
         <button onClick={onSettings} title="AI settings">{modelName}</button>
-        <button onClick={() => { setTurns([]); claude.current = []; ollama.current = [] }} disabled={busy || !turns.length}>New chat</button>
+        <button onClick={() => { setTurns([]); claude.current = []; ollama.current = []; github.current = [] }} disabled={busy || !turns.length}>New chat</button>
         <button onClick={onClose} aria-label="Hide chat">Hide</button>
       </span>
     </div>
     <div className="chat-list" ref={list} aria-live="polite">
       {!turns.length && <div className="chat-empty">
-        {settings.provider === 'anthropic' && hasKey === false ? <>
-          <p>Connect Claude with your Anthropic API key to chat about this project and let the agent make changes.</p>
-          <button className="text-btn primary" onClick={onSettings}>Add API key</button>
+        {keyed && hasKey === false ? <>
+          <p>{settings.provider === 'github' ? 'Connect GitHub Models with a GitHub token to chat with GPT, Llama, DeepSeek and more about this project.' : 'Connect Claude with your Anthropic API key to chat about this project and let the agent make changes.'}</p>
+          <button className="text-btn primary" onClick={onSettings}>{settings.provider === 'github' ? 'Add GitHub token' : 'Add API key'}</button>
         </> : <>
           <p>{mode === 'agent' ? 'Ask for a change. The agent reads the code, then shows each edit and command for you to approve.' : 'Ask about this project. Answers can read your files but never change them.'}</p>
           <div className="chat-suggestions">

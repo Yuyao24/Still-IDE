@@ -7,7 +7,7 @@ use crate::{
     ssh,
     workspace::{err, root, Result},
 };
-use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::Serialize;
 use std::{
     collections::HashMap,
@@ -20,23 +20,23 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 struct Session {
     writer: Box<dyn Write + Send>,
-    master: Box<dyn MasterPty + Send>,
-    killer: Box<dyn ChildKiller + Send + Sync>,
+    resize: Box<dyn Fn(u16, u16) -> Result<()> + Send>,
+    kill: Box<dyn FnMut() + Send>,
 }
 
 #[derive(Default, Clone)]
 pub struct TerminalState(Arc<Mutex<HashMap<String, Session>>>);
 
 #[derive(Clone, Serialize)]
-struct TerminalData {
-    id: String,
-    bytes: Vec<u8>,
+pub struct TerminalData {
+    pub id: String,
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Clone, Serialize)]
-struct TerminalExit {
-    id: String,
-    code: Option<u32>,
+pub struct TerminalExit {
+    pub id: String,
+    pub code: Option<u32>,
 }
 
 fn dimensions(cols: u16, rows: u16) -> PtySize {
@@ -52,10 +52,17 @@ impl TerminalState {
         };
         for id in ids {
             if let Some(mut session) = sessions.remove(&id) {
-                let _ = session.killer.kill();
+                (session.kill)();
             }
         }
         Ok(())
+    }
+
+    /// Drops a session that has already ended (its relay reported the exit).
+    pub fn forget(&self, id: &str) {
+        if let Ok(mut sessions) = self.0.lock() {
+            sessions.remove(id);
+        }
     }
 }
 
@@ -134,9 +141,24 @@ pub async fn terminal_start(
         }
         let mut cmd = match ssh_host {
             Some(host) => {
+                // Prefer the connection that is already signed in (no second password or code).
+                match ssh::relay_terminal(&app, &store, &host, &id, cols, rows, remote_path.as_deref()) {
+                    Ok(relay) => {
+                        let mut close = relay.close;
+                        state.0.lock().map_err(err)?.insert(id.clone(), Session { writer: Box::new(relay.writer), resize: relay.resize, kill: Box::new(move || close()) });
+                        ssh::touch(&store, &host);
+                        return Ok(());
+                    }
+                    // A refused or cancelled login is final; don't ask again in a second window.
+                    Err(message) if message != "NORELAY" && !message.starts_with("WORKER") && (message.contains("login") || message.contains("Login") || message.contains("accept")) => return Err(message),
+                    Err(_) => {}
+                }
                 let host = ssh::find_host(&store, &host)?;
                 let mut cmd = CommandBuilder::new(ssh::program());
                 cmd.args(ssh::session_args(&app, &host, remote_path.as_deref())?);
+                for (key, value) in ssh::prompt_env(&app, &host) {
+                    cmd.env(key, value);
+                }
                 ssh::touch(&store, &host.id);
                 cmd
             }
@@ -152,8 +174,13 @@ pub async fn terminal_start(
         let writer = pty.master.take_writer().map_err(err)?;
         let mut child = pty.slave.spawn_command(cmd).map_err(err)?;
         drop(pty.slave);
-        let killer = child.clone_killer();
-        state.0.lock().map_err(err)?.insert(id.clone(), Session { writer, master: pty.master, killer });
+        let mut killer = child.clone_killer();
+        let master = pty.master;
+        state.0.lock().map_err(err)?.insert(id.clone(), Session {
+            writer,
+            resize: Box::new(move |cols, rows| master.resize(dimensions(cols, rows)).map_err(err)),
+            kill: Box::new(move || { let _ = killer.kill(); }),
+        });
 
         let data_app = app.clone();
         let data_id = id.clone();
@@ -196,7 +223,7 @@ pub async fn terminal_write(state: State<'_, TerminalState>, id: String, data: S
 #[tauri::command]
 pub fn terminal_resize(state: State<TerminalState>, id: String, cols: u16, rows: u16) -> Result<()> {
     if let Some(session) = state.0.lock().map_err(err)?.get(&id) {
-        session.master.resize(dimensions(cols, rows)).map_err(err)?;
+        (session.resize)(cols, rows)?;
     }
     Ok(())
 }

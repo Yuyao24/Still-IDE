@@ -513,9 +513,107 @@ while IFS= read -r id && IFS= read -r body && IFS= read -r input; do
 ' "$id" "$c" "$(b64e < "$d/o")" "$(b64e < "$d/e")"
 done"#;
 
+// When the server has python3 (most do), the connection runs this relay instead of the
+// shell loop: it answers the same requests and also carries terminals (a pty per
+// session), so a terminal reuses the connection you already signed in on — no second
+// password or verification code. Standard library only; works with Python 3.5+.
+const RELAY_PY: &str = r#"
+import os, sys, pty, select, struct, fcntl, termios, signal, base64, threading, subprocess, tempfile
+out_lock = threading.Lock()
+def send(line):
+    with out_lock:
+        sys.stdout.buffer.write((line + '\n').encode()); sys.stdout.buffer.flush()
+b64 = lambda data: base64.b64encode(data).decode()
+work = tempfile.mkdtemp(prefix='still.')
+def run(rid, body, data):
+    path = os.path.join(work, 's' + rid)
+    with open(path, 'wb') as handle: handle.write(body)
+    try:
+        done = subprocess.run(['sh', path], input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        send('STILL %s %d %s %s' % (rid, done.returncode, b64(done.stdout), b64(done.stderr)))
+    except Exception as error:
+        send('STILL %s 127 %s %s' % (rid, '', b64(str(error).encode())))
+    finally:
+        try: os.unlink(path)
+        except OSError: pass
+terms = {}
+def size(fd, cols, rows):
+    try: fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
+    except OSError: pass
+def opened(sid, cols, rows, cwd):
+    pid, fd = pty.fork()
+    if pid == 0:
+        try: os.chdir(os.path.expanduser(cwd) if cwd else os.path.expanduser('~'))
+        except OSError: os.chdir(os.path.expanduser('~'))
+        env = dict(os.environ, TERM='xterm-256color', COLORTERM='truecolor', TERM_PROGRAM='Still')
+        shell = env.get('SHELL') or '/bin/sh'
+        try: os.execvpe(shell, [shell, '-l'], env)
+        except OSError: os.execvpe('/bin/sh', ['/bin/sh', '-l'], env)
+    size(fd, cols, rows)
+    terms[sid] = (pid, fd)
+def finish(sid):
+    pid, fd = terms.pop(sid)
+    try: os.close(fd)
+    except OSError: pass
+    code = 0
+    try:
+        _, status = os.waitpid(pid, 0)
+        code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
+    except OSError: pass
+    send('STILLT exit %s %d' % (sid, code))
+buffer = b''
+pending = []
+send('STILL READY relay')
+while True:
+    fds = [0] + [fd for _, fd in terms.values()]
+    try: ready, _, _ = select.select(fds, [], [], 30)
+    except InterruptedError: continue
+    for fd in ready:
+        if fd == 0:
+            chunk = os.read(0, 65536)
+            if not chunk:
+                for sid in list(terms): os.kill(terms[sid][0], signal.SIGHUP)
+                sys.exit(0)
+            buffer += chunk
+            while b'\n' in buffer:
+                line, buffer = buffer.split(b'\n', 1)
+                text = line.decode('utf-8', 'replace')
+                if pending or not text.startswith('T '):
+                    pending.append(text)
+                    if len(pending) == 3:
+                        rid, body, data = pending; pending = []
+                        threading.Thread(target=run, args=(rid, base64.b64decode(body), base64.b64decode(data) if data else b''), daemon=True).start()
+                    continue
+                parts = text.split(' ')
+                kind, sid = parts[1], parts[2] if len(parts) > 2 else ''
+                try:
+                    if kind == 'open': opened(sid, int(parts[3]), int(parts[4]), base64.b64decode(parts[5]).decode() if len(parts) > 5 else '')
+                    elif kind == 'in' and sid in terms: os.write(terms[sid][1], base64.b64decode(parts[3]))
+                    elif kind == 'resize' and sid in terms: size(terms[sid][1], int(parts[3]), int(parts[4]))
+                    elif kind == 'close' and sid in terms: os.kill(terms[sid][0], signal.SIGHUP)
+                except Exception as error:
+                    if kind == 'open': send('STILLT exit %s 127' % sid)
+        else:
+            sid = next((key for key, value in terms.items() if value[1] == fd), None)
+            if sid is None: continue
+            try: data = os.read(fd, 65536)
+            except OSError: data = b''
+            if data: send('STILLT data %s %s' % (sid, b64(data)))
+            else: finish(sid)
+"#;
+
+/// Terminals carried over a server's relay connection, by host id.
+#[derive(Default)]
+pub struct Relays(Mutex<HashMap<String, Relay>>);
+#[derive(Clone)]
+struct Relay {
+    stdin: std::sync::Arc<Mutex<std::process::ChildStdin>>,
+    sessions: std::sync::Arc<Mutex<std::collections::HashSet<String>>>,
+}
+
 struct Worker {
     child: std::process::Child,
-    stdin: std::process::ChildStdin,
+    stdin: std::sync::Arc<Mutex<std::process::ChildStdin>>,
     replies: std::sync::mpsc::Receiver<String>,
     next: u64,
 }
@@ -531,25 +629,51 @@ fn worker_slot(app: &AppHandle, id: &str) -> Option<std::sync::Arc<Mutex<Option<
 
 fn start_worker(app: &AppHandle, host: &SshHost) -> Result<Worker> {
     let mut cmd: Command = command(program(), &std::env::temp_dir());
-    cmd.args(base_args(app, host, true)?).arg("-T").arg("--").arg(destination(host)).arg(format!("sh -c {}", quote(WORKER_LOOP)));
+    let launch = format!("if command -v python3 >/dev/null 2>&1; then exec python3 -u -c {}; else exec sh -c {}; fi", quote(RELAY_PY), quote(WORKER_LOOP));
+    cmd.args(base_args(app, host, true)?).arg("-T").arg("--").arg(destination(host)).arg(format!("sh -c {}", quote(&launch)));
     let attempt = use_prompts(app, &mut cmd, host);
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|error| match error.kind() {
         std::io::ErrorKind::NotFound => "The ssh command was not found. Install OpenSSH and try again.".to_string(),
         _ => err(error),
     })?;
-    let stdin = child.stdin.take().unwrap();
+    let stdin = std::sync::Arc::new(Mutex::new(child.stdin.take().unwrap()));
     let stdout = child.stdout.take().unwrap();
+    let sessions: std::sync::Arc<Mutex<std::collections::HashSet<String>>> = Default::default();
+    let terminal_app = app.clone();
+    let open_sessions = sessions.clone();
     let mut stderr = child.stderr.take().unwrap();
     let (sender, replies) = std::sync::mpsc::channel::<String>();
     thread::spawn(move || {
+        use base64::Engine;
         use std::io::BufRead;
+        use tauri::Emitter;
         for line in std::io::BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
+            // Terminal traffic from the relay goes straight to the terminal in the window.
+            if let Some(rest) = line.strip_prefix("STILLT ") {
+                let mut parts = rest.splitn(3, ' ');
+                let (kind, id, value) = (parts.next().unwrap_or(""), parts.next().unwrap_or("").to_owned(), parts.next().unwrap_or(""));
+                if kind == "data" {
+                    let bytes = base64::engine::general_purpose::STANDARD.decode(value.trim()).unwrap_or_default();
+                    let _ = terminal_app.emit("terminal-data", crate::terminal::TerminalData { id, bytes });
+                } else if kind == "exit" {
+                    if let Ok(mut open) = open_sessions.lock() { open.remove(&id); }
+                    terminal_app.state::<crate::terminal::TerminalState>().forget(&id);
+                    let _ = terminal_app.emit("terminal-exit", crate::terminal::TerminalExit { id, code: value.trim().parse().ok() });
+                }
+                continue;
+            }
             // Anything a login script prints is ignored; only protocol lines count.
             if line.starts_with("STILL ") && sender.send(line).is_err() {
                 break;
             }
+        }
+        // The connection ended: close the terminals that were riding on it.
+        let ids: Vec<String> = open_sessions.lock().map(|open| open.iter().cloned().collect()).unwrap_or_default();
+        for id in ids {
+            terminal_app.state::<crate::terminal::TerminalState>().forget(&id);
+            let _ = terminal_app.emit("terminal-exit", crate::terminal::TerminalExit { id, code: None });
         }
     });
     let errors = std::sync::Arc::new(Mutex::new(String::new()));
@@ -566,9 +690,11 @@ fn start_worker(app: &AppHandle, host: &SshHost) -> Result<Worker> {
     });
     // Wait for the shell loop to start. While someone is typing a password or code, keep waiting.
     let started = Instant::now();
+    let mut relay = false;
     let ready = loop {
         match replies.recv_timeout(Duration::from_millis(400)) {
             Ok(line) if line == "STILL READY" => break true,
+            Ok(line) if line == "STILL READY relay" => { relay = true; break true }
             Ok(_) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break false,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -579,6 +705,11 @@ fn start_worker(app: &AppHandle, host: &SshHost) -> Result<Worker> {
         }
     };
     if ready {
+        if let Some(relays) = app.try_state::<Relays>() {
+            if let Ok(mut map) = relays.0.lock() {
+                if relay { map.insert(host.id.clone(), Relay { stdin: stdin.clone(), sessions }); } else { map.remove(&host.id); }
+            }
+        }
         return Ok(Worker { child, stdin, replies, next: 1 });
     }
     let _ = child.kill();
@@ -599,7 +730,10 @@ fn ask_worker(worker: &mut Worker, script: &str, input: Option<&[u8]>, timeout: 
     let id = worker.next;
     worker.next += 1;
     let request = format!("{id}\n{}\n{}\n", engine.encode(script), input.map(|bytes| engine.encode(bytes)).unwrap_or_default());
-    worker.stdin.write_all(request.as_bytes()).and_then(|_| worker.stdin.flush()).map_err(|error| error.to_string())?;
+    {
+        let mut stdin = worker.stdin.lock().map_err(|error| error.to_string())?;
+        stdin.write_all(request.as_bytes()).and_then(|_| stdin.flush()).map_err(|error| error.to_string())?;
+    }
     let deadline = Instant::now() + Duration::from_secs(timeout);
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -658,6 +792,9 @@ fn exec(app: &AppHandle, host: &SshHost, script: &str, input: Option<Vec<u8>>, t
 
 /// Forget a server's connection (after a password change or when it is removed).
 pub fn drop_worker(app: &AppHandle, id: &str) {
+    if let Some(relays) = app.try_state::<Relays>() {
+        if let Ok(mut map) = relays.0.lock() { map.remove(id); }
+    }
     if let Some(slot) = worker_slot(app, id) {
         if let Ok(mut guard) = slot.lock() {
             if let Some(mut worker) = guard.take() {
@@ -1074,4 +1211,65 @@ pub async fn ssh_command(app: AppHandle, store: State<'_, Store>, id: String, ro
         Ok(String::from_utf8_lossy(&out).into_owned())
     })
     .await
+}
+
+
+// ---- Terminals over the relay -------------------------------------------------------
+
+fn relay_send(relay: &Relay, line: &str) -> Result<()> {
+    let mut stdin = relay.stdin.lock().map_err(err)?;
+    stdin.write_all(line.as_bytes()).and_then(|_| stdin.write_all(b"\n")).and_then(|_| stdin.flush()).map_err(err)
+}
+
+/// Keystrokes for one relay terminal.
+pub struct RelayWriter { relay: Relay, id: String }
+impl Write for RelayWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        use base64::Engine;
+        relay_send(&self.relay, &format!("T in {} {}", self.id, base64::engine::general_purpose::STANDARD.encode(buffer))).map_err(std::io::Error::other)?;
+        Ok(buffer.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
+pub struct RelayTerminal {
+    pub writer: RelayWriter,
+    pub resize: Box<dyn Fn(u16, u16) -> Result<()> + Send>,
+    pub close: Box<dyn FnMut() + Send>,
+}
+
+/// Opens a terminal on the server over the connection that is already signed in (starting it,
+/// and signing in, if needed). Errors with "NORELAY" when the server has no python3.
+pub fn relay_terminal(app: &AppHandle, store: &Store, host_id: &str, id: &str, cols: u16, rows: u16, path: Option<&str>) -> Result<RelayTerminal> {
+    use base64::Engine;
+    let host = find_host(store, host_id)?;
+    let existing = || app.try_state::<Relays>().and_then(|relays| relays.0.lock().ok().and_then(|map| map.get(host_id).cloned()));
+    let relay = match existing() {
+        Some(relay) => relay,
+        None => {
+            // Start (and sign in to) the connection with a harmless request.
+            exec(app, &host, "true", None, 30)?;
+            existing().ok_or("NORELAY")?
+        }
+    };
+    relay.sessions.lock().map_err(err)?.insert(id.to_owned());
+    let start = path.or(host.remote_path.as_deref()).unwrap_or("");
+    relay_send(&relay, &format!("T open {id} {} {} {}", cols.max(2), rows.max(2), base64::engine::general_purpose::STANDARD.encode(start)))?;
+    let (resize_relay, close_relay) = (relay.clone(), relay.clone());
+    let (resize_id, close_id) = (id.to_owned(), id.to_owned());
+    Ok(RelayTerminal {
+        writer: RelayWriter { relay, id: id.to_owned() },
+        resize: Box::new(move |cols, rows| relay_send(&resize_relay, &format!("T resize {resize_id} {} {}", cols.max(2), rows.max(2)))),
+        close: Box::new(move || { let _ = relay_send(&close_relay, &format!("T close {close_id}")); }),
+    })
+}
+
+/// Login prompts for an interactive ssh in a terminal go through the app too, so a saved
+/// password is filled in for you.
+pub fn prompt_env(app: &AppHandle, host: &SshHost) -> Vec<(String, String)> {
+    let mut probe = Command::new("ssh");
+    if use_prompts(app, &mut probe, host).is_none() {
+        return Vec::new();
+    }
+    probe.get_envs().filter_map(|(key, value)| Some((key.to_string_lossy().into_owned(), value?.to_string_lossy().into_owned()))).collect()
 }

@@ -5,10 +5,10 @@ import { desktop } from './bridge'
 import { IconButton } from './ui'
 
 /** The slim 36px window chrome. Empty areas drag the window; double-click maximizes. */
-export function TitleBar({ left, center, right, onError, onClose }: {
-  left: ReactNode; center?: ReactNode; right?: ReactNode; onError: (error: unknown) => void; onClose?: () => void
+export function TitleBar({ left, center, right, onError, onClose, autoHide }: {
+  left: ReactNode; center?: ReactNode; right?: ReactNode; onError: (error: unknown) => void; onClose?: () => void; autoHide?: boolean
 }) {
-  return <header className="chrome" onMouseDown={event => {
+  const bar = <header className="chrome" onMouseDown={event => {
     if (desktop && event.button === 0 && !(event.target as Element).closest('button, input, a, [role="menu"]')) {
       const current = getCurrentWindow()
       void (event.detail === 2 ? current.toggleMaximize() : current.startDragging()).catch(onError)
@@ -25,4 +25,6 @@ export function TitleBar({ left, center, right, onError, onClose }: {
       </div>}
     </div>
   </header>
+  // Hidden until the pointer reaches the top edge of the window (Settings → Appearance).
+  return autoHide ? <div className="chrome-zone">{bar}</div> : bar
 }

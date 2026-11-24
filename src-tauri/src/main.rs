@@ -2,6 +2,7 @@
 
 mod ai;
 mod check;
+mod debug;
 mod config;
 mod git;
 mod packages;
@@ -28,6 +29,8 @@ fn main() {
         .manage(terminal::TerminalState::default())
         .manage(ssh::Passwords::default())
         .manage(ssh::Prompts::default())
+        .manage(ssh::Relays::default())
+        .manage(debug::Debuggers::default())
         .manage(ssh::Workers::default())
         .setup(|app| {
             let store = config::Store::load(app.handle());
@@ -38,6 +41,8 @@ fn main() {
             config::settings_get,
             check::git_head_text,
             check::check_python,
+            debug::debug_start,
+            debug::debug_send,
             config::settings_set,
             projects::home_state,
             projects::set_projects_root,

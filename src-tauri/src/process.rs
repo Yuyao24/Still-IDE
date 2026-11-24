@@ -276,6 +276,7 @@ impl Jobs {
         let state = self.clone();
         thread::spawn(move || {
             let job = Job { app, id, cancelled, interactive, input };
+            let started = std::time::Instant::now();
             let (code, diagnostics) = match operation(&job) {
                 Ok(result) => result,
                 Err(error) => {
@@ -286,10 +287,13 @@ impl Jobs {
             if let Ok(mut active) = state.0.lock() {
                 *active = None;
             }
+            // How long it took, as people read it: 0.42 s, 12.3 s, 2 min 5 s.
+            let elapsed = started.elapsed().as_secs_f64();
+            let took = if elapsed < 10.0 { format!("{elapsed:.2} s") } else if elapsed < 60.0 { format!("{elapsed:.1} s") } else { format!("{} min {} s", (elapsed / 60.0).floor(), (elapsed % 60.0).round()) };
             let ended = if job.cancelled.load(Ordering::Relaxed) {
-                "Process stopped.".into()
+                format!("Process stopped after {took}.")
             } else {
-                format!("Process exited with code {code}.")
+                format!("Process exited with code {code} in {took}.")
             };
             emit(&job.app, &job.id, "exit", ended, Some(code), diagnostics);
         });

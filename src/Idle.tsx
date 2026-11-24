@@ -48,7 +48,7 @@ function duration(ms: number) {
 }
 
 /** A calm screen for when you step away: drifting code, one excerpt at a time, the time and today's numbers. */
-export function Idle({ sources, onWake, sessionStats }: { sources: IdleSource[]; onWake: () => void; sessionStats?: Partial<DayStats> }) {
+export function Idle({ sources, onWake, sessionStats, leaving }: { sources: IdleSource[]; onWake: () => void; sessionStats?: Partial<DayStats>; leaving?: boolean }) {
   const [now, setNow] = useState(new Date())
   const [turn, setTurn] = useState(0)
   const [stats] = useState(today)
@@ -57,6 +57,7 @@ export function Idle({ sources, onWake, sessionStats }: { sources: IdleSource[];
   useEffect(() => {
     const clockTimer = setInterval(() => setNow(new Date()), 15000)
     const turnTimer = setInterval(() => setTurn(value => value + 1), 12000)
+    if (leaving) return () => { clearInterval(clockTimer); clearInterval(turnTimer) }
     const wake = (event: Event) => { event.preventDefault(); event.stopPropagation(); onWake() }
     // A short grace period so the move that hid the cursor doesn't wake it at once.
     const arm = setTimeout(() => {
@@ -66,7 +67,7 @@ export function Idle({ sources, onWake, sessionStats }: { sources: IdleSource[];
       clearInterval(clockTimer); clearInterval(turnTimer); clearTimeout(arm)
       removeEventListener('keydown', wake, true); removeEventListener('pointerdown', wake, true); removeEventListener('pointermove', wake, true)
     }
-  }, [onWake])
+  }, [onWake, leaving])
 
   const columns = useMemo(() => {
     const texts = usable.length ? usable.map(source => source.text) : ['']
@@ -79,7 +80,7 @@ export function Idle({ sources, onWake, sessionStats }: { sources: IdleSource[];
   const shown = source ? excerpt(source, turn + source.path.length) : null
   const active = stats.activeMs + (sessionStats?.activeMs ?? 0)
 
-  return <div className="idle" role="dialog" aria-label="Idle screen. Press any key to return.">
+  return <div className={'idle' + (leaving ? ' is-leaving' : '')} role="dialog" aria-label="Idle screen. Press any key to return." aria-hidden={leaving || undefined}>
     <div className="idle-drift" aria-hidden="true">
       {columns.map((text, index) => <div key={index}><pre style={{ animationDuration: [100, 150, 120][index] + 's' }}>{text}</pre></div>)}
     </div>

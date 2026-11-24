@@ -32,6 +32,9 @@ import { groovy } from '@codemirror/legacy-modes/mode/groovy'
 import { dockerFile } from '@codemirror/legacy-modes/mode/dockerfile'
 import { properties } from '@codemirror/legacy-modes/mode/properties'
 import { useEffect, useLayoutEffect, useRef } from 'react'
+import { scopedOccurrences } from './occurrences'
+import { smartCompletions, sourceColumn } from './completion'
+import { inlineSuggestions, type Suggest } from './ghost'
 import { type Diagnostic, type Diff, clipboard, normalize } from './bridge'
 
 const look = EditorView.theme({
@@ -52,6 +55,17 @@ const look = EditorView.theme({
   '&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground': { opacity: '1' },
   '.cm-selectionMatch': { background: 'var(--occurrence)', borderRadius: '0' },
   '.cm-selectionMatch-main': { background: 'var(--occurrence)', outline: '1px solid var(--occurrence-border)' },
+  '.cm-occurrence': { background: 'var(--occurrence)' },
+  '.cm-breakpoints': { width: '14px', cursor: 'pointer' },
+  '.cm-breakpoints .cm-gutterElement': { display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '0' },
+  '.cm-breakpoints .cm-gutterElement:hover::after': { content: '""', width: '8px', height: '8px', borderRadius: '50%', background: 'color-mix(in srgb, var(--red) 35%, transparent)' },
+  '.cm-breakpoint': { width: '8px', height: '8px', borderRadius: '50%', background: 'var(--red)' },
+  '.cm-breakpoints .cm-gutterElement:has(.cm-breakpoint):hover::after': { content: 'none' },
+  '.cm-debug-line': { background: 'color-mix(in srgb, var(--amber) 18%, transparent) !important', boxShadow: 'inset 2px 0 0 var(--amber)' },
+  '.cm-ghost': { color: 'var(--muted)', opacity: '.75', whiteSpace: 'pre', pointerEvents: 'none' },
+  '.cm-content[data-suggesting] .cm-cursor-primary, &.cm-focused .cm-content[data-suggesting] ~ .cm-cursorLayer .cm-cursor': { borderLeftColor: 'var(--muted)' },
+  '.cm-occurrence-write': { background: 'color-mix(in srgb, var(--occurrence) 55%, var(--occurrence-border))' },
+  '.cm-occurrence-keyword': { background: 'var(--occurrence)' },
   '.cm-lintRange-error': { backgroundImage: 'none', textDecoration: 'underline wavy var(--red)', textDecorationSkipInk: 'none', textUnderlineOffset: '3px', textDecorationThickness: '1px' },
   '.cm-lintRange-warning': { backgroundImage: 'none', textDecoration: 'underline wavy var(--amber)', textDecorationSkipInk: 'none', textUnderlineOffset: '3px', textDecorationThickness: '1px' },
   '.cm-lintRange-info': { backgroundImage: 'none', textDecoration: 'underline dotted var(--muted)', textUnderlineOffset: '3px' },
@@ -77,7 +91,27 @@ const look = EditorView.theme({
   '.cm-panels, .cm-tooltip': { background: 'var(--panel)', color: 'var(--ink)', borderColor: 'var(--line)' },
   '.cm-panels.cm-panels-top': { borderBottom: '1px solid var(--line)' },
   '.cm-tooltip-autocomplete > ul > li[aria-selected]': { background: 'var(--selection)', color: 'var(--ink)' },
-  '.cm-tooltip-autocomplete > ul': { fontFamily: 'var(--font-mono)' },
+  '.cm-tooltip-autocomplete': { border: '1px solid var(--line)', boxShadow: '0 10px 28px var(--shadow)', background: 'var(--editor)', padding: '4px 0 0' },
+  '.cm-tooltip-autocomplete > ul': { fontFamily: 'var(--font-mono)', fontSize: 'calc(var(--editor-font-size) - 1px)', minWidth: '320px', maxWidth: 'min(640px, 80vw)', maxHeight: '15em' },
+  '.cm-tooltip-autocomplete > ul > li': { display: 'flex', alignItems: 'center', gap: '8px', padding: '3px 12px 3px 10px', lineHeight: '1.5' },
+  '.cm-tooltip-autocomplete::after': { content: '"Tab to accept · Enter for a new line"', display: 'block', padding: '6px 12px', borderTop: '1px solid var(--line)', marginTop: '4px', color: 'var(--muted)', fontFamily: 'var(--font-sans)', fontSize: '11px' },
+  '.cm-completionLabel': { color: 'var(--ink)' },
+  '.cm-completionMatchedText': { textDecoration: 'none', color: 'var(--accent-strong, var(--keyword))', fontWeight: '600' },
+  '.cm-completionDetail': { marginLeft: '0', color: 'var(--muted)', fontStyle: 'normal', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: '1' },
+  '.cm-completionSource': { marginLeft: 'auto', paddingLeft: '18px', color: 'var(--muted)', fontFamily: 'var(--font-sans)', fontSize: '11px' },
+  '.cm-completionIcon': { width: '16px', height: '16px', padding: '0', marginRight: '2px', display: 'inline-grid', placeItems: 'center', opacity: '1', fontSize: '10px', fontFamily: 'var(--font-sans)', fontWeight: '600', border: '1px solid var(--line)', color: 'var(--muted)' },
+  '.cm-completionIcon::after': { content: '"·"' },
+  '.cm-completionIcon-function::after, .cm-completionIcon-method::after': { content: '"f"' },
+  '.cm-completionIcon-function, .cm-completionIcon-method': { color: 'var(--function)', borderColor: 'color-mix(in srgb, var(--function) 45%, var(--line))' },
+  '.cm-completionIcon-class::after, .cm-completionIcon-type::after': { content: '"C"' },
+  '.cm-completionIcon-class, .cm-completionIcon-type': { color: 'var(--type)', borderColor: 'color-mix(in srgb, var(--type) 45%, var(--line))' },
+  '.cm-completionIcon-variable::after': { content: '"v"' },
+  '.cm-completionIcon-variable': { color: 'var(--variable)' },
+  '.cm-completionIcon-property::after': { content: '"p"' },
+  '.cm-completionIcon-property': { color: 'var(--property)' },
+  '.cm-completionIcon-keyword::after': { content: '"k"' },
+  '.cm-completionIcon-keyword': { color: 'var(--keyword)', borderColor: 'color-mix(in srgb, var(--keyword) 40%, var(--line))' },
+  '.cm-completionIcon-text::after': { content: '"a"' },
   '.cm-searchMatch': { backgroundColor: 'var(--accent-fill)', outline: '1px solid var(--accent-border)' },
   '.cm-searchMatch-selected': { outline: '1px solid var(--accent)' },
   '.cm-button, .cm-textfield': { background: 'var(--editor)', color: 'var(--ink)', border: '1px solid var(--line)', borderRadius: '0', backgroundImage: 'none' },
@@ -171,6 +205,18 @@ const completionKeys = Prec.highest(keymap.of([
   { key: 'PageUp', run: moveCompletionSelection(false, 'page') },
 ]))
 
+/** Ranked word suggestions for code; markup and data languages keep CodeMirror's own (tags, properties). */
+function completionFor(path: string, whileTyping: boolean) {
+  const name = mode(path)?.name ?? 'Plain Text'
+  const smart = ({ Python: 'python', Java: 'java', JavaScript: 'javascript', 'JavaScript JSX': 'javascript', TypeScript: 'javascript', 'TypeScript JSX': 'javascript' } as Record<string, string>)[name]
+  const own = smart !== undefined || ['Plain Text', 'Markdown', 'Rust', 'Go', 'C++', 'Kotlin', 'C#', 'Ruby', 'Shell', 'Groovy', 'PowerShell'].includes(name)
+  return autocompletion({
+    activateOnTyping: whileTyping, defaultKeymap: false, icons: true, maxRenderedOptions: 40,
+    addToOptions: [sourceColumn], optionClass: () => 'cm-completion-row',
+    ...(own ? { override: [smartCompletions(smart ?? '')] } : {}),
+  })
+}
+
 const configuration = new Compartment()
 function configure(options: EditorOptions, path: string): Extension {
   return [
@@ -178,11 +224,15 @@ function configure(options: EditorOptions, path: string): Extension {
     options.lineNumbers ? [lineNumbers(), highlightActiveLineGutter()] : [],
     options.highlightLine ? highlightActiveLine() : [],
     // Off: suggestions only appear with Ctrl+Space. On: they appear while typing.
-    autocompletion({ activateOnTyping: options.autocomplete, defaultKeymap: false, icons: false }),
+    completionFor(path, options.autocomplete),
     EditorState.tabSize.of(options.tabSize),
     indentUnit.of(' '.repeat(options.tabSize)),
     // Other uses of the word under the caret (or of the selected text) are marked.
-    options.occurrences !== false ? highlightSelectionMatches({ highlightWordAroundCursor: true, minSelectionLength: 2 }) : highlightSelectionMatches(),
+    // Other uses of the selected text are always marked. With nothing selected, the variable under the caret
+    // is marked where it's in scope (Python, JavaScript, Java), or the plain word elsewhere.
+    options.occurrences !== false && !['Python', 'Java', 'JavaScript', 'JavaScript JSX', 'TypeScript', 'TypeScript JSX'].includes(mode(path)?.name ?? '')
+      ? highlightSelectionMatches({ highlightWordAroundCursor: true, minSelectionLength: 2 }) : highlightSelectionMatches({ minSelectionLength: 2 }),
+    options.occurrences !== false ? scopedOccurrences : [],
     options.whitespace === 'all' ? highlightWhitespace() : options.whitespace === 'trailing' ? highlightTrailingWhitespace() : [],
     options.indentGuides !== false ? indentGuides : [],
     options.closeBrackets !== false ? [closeBrackets(), keymap.of(closeBracketsKeymap)] : [],
@@ -287,6 +337,52 @@ const changeTracker = ViewPlugin.fromClass(class {
   destroy() { clearTimeout(this.timer) }
 })
 const changeGutter = [baseText, changeMarks, changeTracker, gutter({ class: 'cm-gutter-changes', markers: view => view.state.field(changeMarks, false) ?? RangeSet.empty })]
+
+// ---- Breakpoints and the paused line (debugger) ----
+const setBreakpoints = StateEffect.define<number[]>()
+const setDebugLine = StateEffect.define<number | null>()
+class BreakpointMarker extends GutterMarker {
+  toDOM() { const node = document.createElement('div'); node.className = 'cm-breakpoint'; return node }
+}
+const breakpointMarker = new BreakpointMarker()
+const breakpointField = StateField.define<RangeSet<GutterMarker>>({
+  create: () => RangeSet.empty,
+  update(value, transaction) {
+    value = value.map(transaction.changes)
+    for (const effect of transaction.effects) if (effect.is(setBreakpoints)) {
+      const doc = transaction.state.doc
+      const builder = new RangeSetBuilder<GutterMarker>()
+      for (const line of [...new Set(effect.value)].filter(line => line >= 1 && line <= doc.lines).sort((a, b) => a - b)) builder.add(doc.line(line).from, doc.line(line).from, breakpointMarker)
+      value = builder.finish()
+    }
+    return value
+  },
+})
+export function breakpointLines(state: EditorState) {
+  const lines: number[] = []
+  state.field(breakpointField, false)?.between(0, state.doc.length, from => { lines.push(state.doc.lineAt(from).number) })
+  return lines
+}
+const debugLine = StateField.define<DecorationSet>({
+  create: () => Decoration.none,
+  update(value, transaction) {
+    value = value.map(transaction.changes)
+    for (const effect of transaction.effects) if (effect.is(setDebugLine)) {
+      const line = effect.value
+      value = line && line <= transaction.state.doc.lines ? Decoration.set([Decoration.line({ class: 'cm-debug-line' }).range(transaction.state.doc.line(line).from)]) : Decoration.none
+    }
+    return value
+  },
+  provide: field => EditorView.decorations.from(field),
+})
+function breakpointGutter(toggle: (line: number) => void) {
+  return [breakpointField, debugLine, gutter({
+    class: 'cm-breakpoints', renderEmptyElements: true,
+    markers: view => view.state.field(breakpointField, false) ?? RangeSet.empty,
+    initialSpacer: () => breakpointMarker,
+    domEventHandlers: { mousedown: (view, line) => { toggle(view.state.doc.lineAt(line.from).number); return true } },
+  })]
+}
 
 /** Lezer marks code it can't parse with error nodes; show them as syntax errors. */
 function syntaxErrors(state: EditorState): EditorDiagnostic[] {
@@ -432,6 +528,13 @@ interface Props {
   onIssues?: (issues: LiveIssue[]) => void
   onContextMenu?: (event: React.MouseEvent) => void
   onDefinition?: () => void
+  /** AI inline suggestions (ghost text); absent when the feature is off. */
+  suggest?: Suggest
+  breakpoints?: number[]
+  /** Called with the new list when a breakpoint is toggled or edits move breakpoints. */
+  onBreakpoints?: (lines: number[]) => void
+  /** The line the debugger is paused on in this file. */
+  debugLine?: number | null
 }
 
 function handleFor(editor: EditorView, path: string): EditorHandle {
@@ -544,13 +647,23 @@ export default function Editor(props: Props) {
     const source = normalize(current.diff?.after ?? current.text)
     const listener = EditorView.updateListener.of(update => {
       if (update.docChanged && !current.diff) callbacks.current.onEdit(update.state.doc.toString())
+      // Edits above a breakpoint move it; tell the owner where it went.
+      if (update.docChanged && update.startState.field(breakpointField, false)?.size) {
+        const before = breakpointLines(update.startState).join(), after = breakpointLines(update.state)
+        if (before !== after.join()) callbacks.current.onBreakpoints?.(after)
+      }
       if (update.selectionSet || update.docChanged) callbacks.current.onCursor(onCursor(update.view))
       if (update.focusChanged && !update.view.hasFocus) callbacks.current.onBlur?.()
     })
     const base = [setup(), configuration.of(configure(current.options, current.path)), lintGutter(),
       EditorView.contentAttributes.of({ 'aria-label': current.diff ? 'File diff' : current.path, spellcheck: 'false', autocorrect: 'off', autocapitalize: 'off' })]
     const live = current.diff ? [] : [
+      breakpointGutter(line => {
+        const lines = view.current ? breakpointLines(view.current.state) : []
+        callbacks.current.onBreakpoints?.(lines.includes(line) ? lines.filter(item => item !== line) : [...lines, line])
+      }),
       changeGutter,
+      inlineSuggestions(() => callbacks.current.suggest),
       linter(view => runChecks(view, callbacks.current), { delay: 650 }),
       // Alt+click adds a cursor; Ctrl/Cmd+click goes to the definition, as in other editors.
       EditorView.clickAddsSelectionRange.of(event => event.altKey),
@@ -624,6 +737,19 @@ export default function Editor(props: Props) {
     if (!editor || props.diff) return
     editor.dispatch({ effects: setBase.of(props.options.changes === false ? null : props.base ?? null) })
   }, [props.base, props.diff, props.path, options.changes])
+
+  const breakKey = (props.breakpoints ?? []).join(',')
+  useEffect(() => {
+    const editor = view.current
+    if (!editor || props.diff) return
+    if (breakpointLines(editor.state).join(',') !== breakKey) editor.dispatch({ effects: setBreakpoints.of(props.breakpoints ?? []) })
+  }, [breakKey, props.diff, props.path])
+  useEffect(() => {
+    const editor = view.current
+    if (!editor || props.diff) return
+    const line = props.debugLine ?? null
+    editor.dispatch({ effects: [setDebugLine.of(line), ...(line && line <= editor.state.doc.lines ? [EditorView.scrollIntoView(editor.state.doc.line(line).from, { y: 'center' })] : [])] })
+  }, [props.debugLine, props.diff, props.path])
 
   // Compiler results and the error setting feed the same checker; re-run it when they change.
   useEffect(() => { if (view.current && !props.diff) forceLinting(view.current) }, [props.diagnostics, props.diff, props.path, options.errors])

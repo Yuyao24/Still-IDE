@@ -5,7 +5,7 @@ import { type AppPaths, type PlanItem, type ShellOption, type SshOverview, deskt
 import { blankHost, HostDialog } from './Remote'
 import { editorFonts, useSettings } from './settings'
 import { findUpdate } from './updates'
-import { claudeModels, keys, ollamaModels } from './ai'
+import { type GithubModel, claudeModels, githubFallbackModels, githubModels, keys, ollamaModels } from './ai'
 import { type Theme, type ThemeColors, editableColors, exportTheme, isHex, parseTheme, presets, resolve } from './themes'
 import { Icon, IconButton, Segmented, Toggle } from './ui'
 
@@ -235,9 +235,14 @@ function Appearance({ notify }: { notify: (message: unknown) => void }) {
     </section>
 
     <section className="settings-group">
+      <h3>Window</h3>
+      <Toggle label="Hide the top bar until the pointer reaches it" description="Gives the editor the whole window. Move the pointer to the top edge to show the bar." checked={settings.autoHideTopBar} onChange={value => update({ autoHideTopBar: value })} />
+    </section>
+
+    <section className="settings-group">
       <h3>Motion</h3>
       <Toggle label="Reduce motion" description="Islands, menus and the canvas appear without sliding or fading." checked={settings.reduceMotion} onChange={value => update({ reduceMotion: value })} />
-      <Toggle label="Bounce at the ends of lists and files" description="Scrolling past the top or bottom stretches a little and springs back." checked={settings.bounce} onChange={value => update({ bounce: value })} />
+
     </section>
   </>
 }
@@ -448,12 +453,12 @@ function AiSettingsView() {
     void ollamaModels(settings.ollamaUrl).then(list => { setModels(list); if (!settings.ollamaModel && list[0]) update({ ollamaModel: list[0] }) })
       .catch(() => { setModels(null); setOllamaError("Couldn't reach Ollama at that address. Is it running? (ollama serve)") })
   }
-  useEffect(() => { if (settings.aiProvider === 'ollama') loadModels() }, [settings.aiProvider, settings.ollamaUrl])
+  useEffect(() => { if (settings.aiProvider === 'ollama' || settings.aiCompleteProvider === 'ollama') loadModels() }, [settings.aiProvider, settings.aiCompleteProvider, settings.ollamaUrl])
   return <>
     <section className="settings-group">
       <h3>Assistant</h3>
-      <div className="setting-row"><span className="setting-text"><span>Provider</span><small>Claude runs on Anthropic's servers with your API key. Ollama runs a model on this computer.</small></span>
-        <Segmented label="Provider" value={settings.aiProvider} onChange={value => update({ aiProvider: value })} options={[{ value: 'anthropic', label: 'Claude' }, { value: 'ollama', label: 'Ollama' }]} /></div>
+      <div className="setting-row"><span className="setting-text"><span>Provider</span><small>Claude runs on Anthropic's servers with your API key. GitHub Models gives your GitHub account access to GPT, Llama, DeepSeek, Mistral and others. Ollama runs a model on this computer.</small></span>
+        <Segmented label="Provider" value={settings.aiProvider} onChange={value => update({ aiProvider: value })} options={[{ value: 'anthropic', label: 'Claude' }, { value: 'github', label: 'GitHub' }, { value: 'ollama', label: 'Ollama' }]} /></div>
       <Toggle label="Apply the agent's file edits without asking" description="Off: every edit shows a diff to approve. Commands always ask first." checked={settings.aiAutoApprove} onChange={value => update({ aiAutoApprove: value })} />
     </section>
     {settings.aiProvider === 'anthropic' && <section className="settings-group">
@@ -475,6 +480,8 @@ function AiSettingsView() {
         <Segmented label="Effort" value={settings.aiEffort} onChange={value => update({ aiEffort: value })} options={[{ value: 'low', label: 'Low' }, { value: 'medium', label: 'Medium' }, { value: 'high', label: 'High' }]} /></div>
       <p className="help">Requests go straight from Still to Anthropic with your key and are billed to your account. The key is kept in your system's keychain, not in Still's settings file.</p>
     </section>}
+    {settings.aiProvider === 'github' && <GithubSettings />}
+    <InlineSuggestionSettings ollama={models} />
     {settings.aiProvider === 'ollama' && <section className="settings-group">
       <h3>Ollama</h3>
       <div className="form-grid">
@@ -487,6 +494,55 @@ function AiSettingsView() {
       {models && !models.length && <p className="help">Ollama is running but has no models. Run <code>ollama pull qwen3</code> in a terminal.</p>}
     </section>}
   </>
+}
+
+function GithubSettings() {
+  const { settings, update } = useSettings()
+  const [hasToken, setHasToken] = useState<boolean | null>(null)
+  const [draft, setDraft] = useState('')
+  const [message, setMessage] = useState('')
+  const [models, setModels] = useState<GithubModel[]>(githubFallbackModels)
+  const load = () => { void keys.get('github').then(token => token ? githubModels(token).then(list => { if (list.length) setModels(list) }) : undefined).catch(error => setMessage(String(error instanceof Error ? error.message : error))) }
+  useEffect(() => { void keys.status('github').then(value => { setHasToken(value); if (value) load() }).catch(() => setHasToken(false)) }, [])
+  return <section className="settings-group">
+    <h3>GitHub Models</h3>
+    <form className="form-grid" onSubmit={event => {
+      event.preventDefault()
+      void keys.set(draft, 'github').then(() => { setDraft(''); setHasToken(true); setMessage('Saved in the system keychain.'); load() }).catch(error => setMessage(String(error)))
+    }}>
+      <label>GitHub token<input className="field" type="password" value={draft} onChange={event => setDraft(event.target.value)} placeholder={hasToken ? 'A token is saved. Paste a new one to replace it.' : 'github_pat_…'} autoComplete="off" spellCheck={false} /></label>
+      <div className="flex items-center gap-2">
+        <button className="text-btn primary" type="submit" disabled={!draft.trim()}>Save token</button>
+        {hasToken && <button className="text-btn" type="button" onClick={() => { void keys.set(null, 'github').then(() => { setHasToken(false); setMessage('Token removed.') }) }}>Remove token</button>}
+        <span className="help">{message || (hasToken ? 'A token is saved.' : 'github.com → Settings → Developer settings → Fine-grained tokens, with the “Models: read” permission.')}</span>
+      </div>
+    </form>
+    <div className="setting-row"><span className="setting-text"><span>Model</span><small>Models marked “tools” can act as the agent (edit files, run commands); others answer questions. Copilot plans get higher limits.</small></span>
+      <select className="field" style={{ width: 240 }} value={settings.githubModel} onChange={event => update({ githubModel: event.target.value })}>
+        {!models.some(model => model.id === settings.githubModel) && <option value={settings.githubModel}>{settings.githubModel}</option>}
+        {models.map(model => <option key={model.id} value={model.id}>{model.name}{model.publisher ? ' · ' + model.publisher : ''}{model.tools ? ' · tools' : ''}</option>)}
+      </select></div>
+  </section>
+}
+
+function InlineSuggestionSettings({ ollama }: { ollama: string[] | null }) {
+  const { settings, update } = useSettings()
+  const provider = settings.aiCompleteProvider
+  const choices = provider === 'anthropic' ? claudeModels.map(model => ({ id: model.id, label: model.label + (model.id.includes('haiku') ? ' (fastest)' : '') }))
+    : provider === 'github' ? githubFallbackModels.map(model => ({ id: model.id, label: model.name + ' · ' + model.publisher }))
+    : (ollama ?? []).map(name => ({ id: name, label: name }))
+  return <section className="settings-group">
+    <h3>Inline suggestions</h3>
+    <Toggle label="Suggest code as you type (AI)" description="Grey text appears after the caret, from a whole line to a whole function. Tab accepts it, Esc dismisses it. Word suggestions work without this." checked={settings.aiComplete} onChange={value => update({ aiComplete: value })} />
+    <div className="setting-row"><span className="setting-text"><span>Suggestions come from</span><small>Uses the key or token saved above. Ollama works offline; coding models such as qwen2.5-coder fill in the middle of code best.</small></span>
+      <Segmented label="Suggestion provider" value={provider} onChange={value => update({ aiCompleteProvider: value, aiCompleteModel: value === 'anthropic' ? 'claude-opus-5-5' : value === 'github' ? 'openai/gpt-4.1-mini' : (ollama?.[0] ?? '') })}
+        options={[{ value: 'anthropic', label: 'Claude' }, { value: 'github', label: 'GitHub' }, { value: 'ollama', label: 'Ollama' }]} /></div>
+    <div className="setting-row"><span className="setting-text"><span>Suggestion model</span><small>Smaller models answer faster, which matters more here than in chat.</small></span>
+      <select className="field" style={{ width: 240 }} value={settings.aiCompleteModel} onChange={event => update({ aiCompleteModel: event.target.value })}>
+        {!choices.some(choice => choice.id === settings.aiCompleteModel) && <option value={settings.aiCompleteModel}>{settings.aiCompleteModel || 'Choose a model'}</option>}
+        {choices.map(choice => <option key={choice.id} value={choice.id}>{choice.label}</option>)}
+      </select></div>
+  </section>
 }
 
 function UpdateCheck() {
