@@ -34,44 +34,83 @@ export interface MenuItem {
   shortcut?: string
   danger?: boolean
   disabled?: boolean
-  action: () => void
+  checked?: boolean
+  /** A submenu, shown to the side on hover or with the right arrow key. */
+  items?: MenuEntry[]
+  action?: () => void
 }
 export type MenuEntry = MenuItem | 'separator'
 
-/** A small popup menu anchored at a point. Arrow keys move, Enter chooses, Escape closes. */
-export function Menu({ x, y, items, onClose }: { x: number; y: number; items: MenuEntry[]; onClose: () => void }) {
+/** A small popup menu anchored at a point. Arrow keys move, Enter chooses, → opens a submenu, ← and Escape go back. */
+export function Menu({ x, y, items, onClose, nested, onBack, minWidth, autoFocus = true }: { x: number; y: number; items: MenuEntry[]; onClose: () => void; nested?: boolean; onBack?: () => void; minWidth?: number; autoFocus?: boolean }) {
   const ref = useRef<HTMLDivElement>(null)
   const [position, setPosition] = useState({ left: x, top: y })
+  const [open, setOpen] = useState<{ index: number; x: number; y: number; focus: boolean } | null>(null)
+  const hoverTimer = useRef<ReturnType<typeof setTimeout>>(undefined)
   useLayoutEffect(() => {
     const node = ref.current
     if (!node) return
     const { width, height } = node.getBoundingClientRect()
-    setPosition({ left: Math.max(6, Math.min(x, innerWidth - width - 6)), top: Math.max(6, Math.min(y, innerHeight - height - 6)) })
-    node.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus()
+    // A submenu that doesn't fit on the right opens to the left of its parent instead.
+    const left = nested && x + width > innerWidth - 6 ? Math.max(6, x - width - (minWidth ?? 0)) : Math.max(6, Math.min(x, innerWidth - width - 6))
+    setPosition({ left, top: Math.max(6, Math.min(y, innerHeight - height - 6)) })
+    if (autoFocus) node.querySelector<HTMLButtonElement>(':scope > button:not(:disabled)')?.focus({ preventScroll: true })
   }, [x, y])
   useEffect(() => {
+    if (nested) return
     const close = (event: Event) => { if (!ref.current?.contains(event.target as Node)) onClose() }
     addEventListener('mousedown', close, true)
     addEventListener('blur', onClose)
     addEventListener('resize', onClose)
     return () => { removeEventListener('mousedown', close, true); removeEventListener('blur', onClose); removeEventListener('resize', onClose) }
-  }, [onClose])
-  return <div ref={ref} className="menu" role="menu" style={position} onKeyDown={event => {
-    const buttons = [...(ref.current?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)') ?? [])]
+  }, [onClose, nested])
+  useEffect(() => () => clearTimeout(hoverTimer.current), [])
+  const withIcons = items.some(item => item !== 'separator' && (item.icon || item.checked !== undefined))
+  function openSub(index: number, element: HTMLElement, focus: boolean) {
+    const box = element.getBoundingClientRect()
+    setOpen({ index, x: box.right + 2, y: box.top - 5, focus })
+  }
+  return <div ref={ref} className={'menu' + (nested ? ' menu-nested' : '')} role="menu" style={position} onKeyDown={event => {
+    if ((event.target as Element).closest('.menu') !== ref.current) return
+    const buttons = [...(ref.current?.querySelectorAll<HTMLButtonElement>(':scope > button:not(:disabled)') ?? [])]
     const index = buttons.indexOf(document.activeElement as HTMLButtonElement)
     if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); onClose() }
     else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
       event.preventDefault()
+      setOpen(null)
       buttons[(index + (event.key === 'ArrowDown' ? 1 : buttons.length - 1)) % buttons.length]?.focus()
-    } else if (event.key === 'Tab') event.preventDefault()
+    } else if (event.key === 'ArrowRight') {
+      const button = buttons[index]
+      const item = button && items[Number(button.dataset.index)]
+      if (item && item !== 'separator' && item.items) { event.preventDefault(); openSub(Number(button.dataset.index), button, true) }
+    } else if (event.key === 'ArrowLeft' && nested) { event.preventDefault(); event.stopPropagation(); onBack?.() }
+    else if (event.key === 'Home' || event.key === 'End') { event.preventDefault(); (event.key === 'Home' ? buttons[0] : buttons.at(-1))?.focus() }
+    else if (event.key === 'Tab') event.preventDefault()
   }}>
     {items.map((item, index) => item === 'separator' ? <div key={index} className="menu-separator" role="separator" /> :
-      <button key={index} type="button" role="menuitem" className={'menu-item' + (item.danger ? ' danger' : '')} disabled={item.disabled}
-        onClick={() => { onClose(); item.action() }}>
-        {item.icon ? <Icon glyph={item.icon} size={14} /> : <span className="w-[14px]" />}
-        <span className="flex-1 truncate">{item.label}</span>
+      <button key={index} type="button" role="menuitem" data-index={index} aria-haspopup={item.items ? 'menu' : undefined} aria-expanded={item.items ? open?.index === index : undefined}
+        className={'menu-item' + (item.danger ? ' danger' : '') + (open?.index === index ? ' is-open' : '')} disabled={item.disabled}
+        onMouseEnter={event => {
+          clearTimeout(hoverTimer.current)
+          const element = event.currentTarget
+          if (item.items) hoverTimer.current = setTimeout(() => openSub(index, element, false), open ? 0 : 120)
+          else if (open) hoverTimer.current = setTimeout(() => setOpen(null), 160)
+        }}
+        onClick={event => {
+          if (item.items) { openSub(index, event.currentTarget, true); return }
+          onClose(); item.action?.()
+        }}>
+        {withIcons && (item.checked !== undefined ? <span className="menu-check">{item.checked ? '✓' : ''}</span> : item.icon ? <Icon glyph={item.icon} size={13} /> : <span className="menu-check" />)}
+        <span className="menu-label">{item.label}</span>
         {item.shortcut && <kbd>{item.shortcut}</kbd>}
+        {item.items && <span className="menu-arrow" aria-hidden="true" />}
       </button>)}
+    {open && (() => {
+      const item = items[open.index]
+      if (item === 'separator' || !item.items) return null
+      return <Menu key={open.index} nested autoFocus={open.focus} x={open.x} y={open.y} items={item.items} minWidth={ref.current?.offsetWidth} onClose={onClose}
+        onBack={() => { setOpen(null); ref.current?.querySelector<HTMLButtonElement>(`:scope > button[data-index="${open.index}"]`)?.focus() }} />
+    })()}
   </div>
 }
 

@@ -303,3 +303,22 @@ export const api = {
     return result ? [result] : []
   },
 }
+
+// ---- Clipboard ------------------------------------------------------------------
+// The web view's own clipboard API may ask for permission (or refuse) when reading,
+// so the desktop app goes through Tauri's clipboard plugin.
+export const clipboard = {
+  read: async (): Promise<string> => {
+    if (desktop) { const { readText } = await import('@tauri-apps/plugin-clipboard-manager'); return (await readText()) ?? '' }
+    return navigator.clipboard.readText()
+  },
+  write: async (text: string) => {
+    if (desktop) { const { writeText } = await import('@tauri-apps/plugin-clipboard-manager'); await writeText(text); return }
+    await navigator.clipboard.writeText(text)
+  },
+}
+
+export const editorSupport = {
+  head: async (rootPath: string, path: string): Promise<string | null> => desktop ? invoke('git_head_text', { rootPath, path }) : null,
+  checkPython: (rootPath: string, source: string) => invoke<{ line: number; column: number; endLine?: number | null; endColumn?: number | null; severity: 'error' | 'warning'; message: string }[]>('check_python', { rootPath, source }),
+}

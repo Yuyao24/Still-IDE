@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import {
-  Check, Code2, Copy, FileDown, FolderOpen, FolderSearch, Import, Info, Keyboard, Palette, Pencil, Plus, Server, SquareTerminal, Trash2, X, Sparkles } from 'lucide-react'
+  Check, Code2, Copy, FileDown, FolderOpen, FolderSearch, Import, Info, Keyboard, Palette, Pencil, Plus, Search, Server, SquareTerminal, Trash2, X, Sparkles } from 'lucide-react'
 import { type AppPaths, type PlanItem, type ShellOption, type SshOverview, desktop, home, hostLabel, mod, pickFolder, ssh } from './bridge'
 import { blankHost, HostDialog } from './Remote'
 import { editorFonts, useSettings } from './settings'
@@ -25,29 +25,74 @@ const sections: { id: SettingsSection; label: string; icon: typeof Palette }[] =
 export default function SettingsView({ section, onSection, onClose, notify }: {
   section: SettingsSection; onSection: (section: SettingsSection) => void; onClose: () => void; notify: (message: unknown) => void
 }) {
+  const [query, setQuery] = useState('')
+  const body = useRef<HTMLDivElement>(null)
+  const [matches, setMatches] = useState<number | null>(null)
+  const searchInput = useRef<HTMLInputElement>(null)
   useEffect(() => {
     const previous = document.activeElement as HTMLElement | null
-    document.querySelector<HTMLElement>('.settings-nav button.is-active')?.focus({ preventScroll: true })
+    searchInput.current?.focus({ preventScroll: true })
     return () => { if (previous?.isConnected) previous.focus() }
   }, [])
+  const term = query.trim().toLowerCase()
+  // Searching shows every section and hides what doesn't match: whole groups when their title
+  // matches, otherwise just the matching rows inside them.
+  useLayoutEffect(() => {
+    const root = body.current
+    if (!root) return
+    const rows = '.setting-row, .theme-card, .color-field, .form-grid > label, .shortcut-row'
+    let count = 0
+    root.querySelectorAll<HTMLElement>('[data-search-hidden]').forEach(node => node.removeAttribute('data-search-hidden'))
+    if (!term) { setMatches(null); return }
+    const words = term.split(/\s+/)
+    const hit = (text: string) => { const lower = text.toLowerCase(); return words.every(word => lower.includes(word)) }
+    root.querySelectorAll<HTMLElement>('.settings-section').forEach(sectionNode => {
+      let visibleGroups = 0
+      sectionNode.querySelectorAll<HTMLElement>('.settings-group').forEach(group => {
+        const title = group.querySelector('h3')?.textContent ?? ''
+        if (hit(title + ' ' + (sectionNode.dataset.label ?? ''))) { visibleGroups++; count += Math.max(1, group.querySelectorAll(rows).length); return }
+        let visible = 0
+        group.querySelectorAll<HTMLElement>(rows).forEach(row => { if (hit(row.textContent ?? '')) { visible++ } else row.setAttribute('data-search-hidden', '') })
+        group.querySelectorAll<HTMLElement>(':scope > p, :scope > .help, .theme-grid > p, .settings-caption, .import-box').forEach(node => node.setAttribute('data-search-hidden', ''))
+        if (!visible) group.setAttribute('data-search-hidden', '')
+        else { visibleGroups++; count += visible }
+      })
+      if (!visibleGroups) sectionNode.setAttribute('data-search-hidden', '')
+    })
+    setMatches(count)
+  })
+  const shown = term ? sections : sections.filter(item => item.id === section)
   return <div className="modal-backdrop settings-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) onClose() }}>
-    <section className="settings" role="dialog" aria-modal="true" aria-label="Settings" onKeyDown={event => { if (event.key === 'Escape' && !(event.target instanceof HTMLInputElement && event.target.type === 'color')) { event.stopPropagation(); onClose() } }}>
+    <section className="settings" role="dialog" aria-modal="true" aria-label="Settings" onKeyDown={event => {
+      if (event.key === 'Escape' && !(event.target instanceof HTMLInputElement && event.target.type === 'color')) {
+        event.stopPropagation()
+        if (query && event.target === searchInput.current) setQuery(''); else onClose()
+      }
+    }}>
       <nav className="settings-nav" aria-label="Settings sections">
-        <p className="section-label px-3 pb-2 pt-1">Settings</p>
-        {sections.map(item => <button key={item.id} className={section === item.id ? 'is-active' : ''} aria-current={section === item.id ? 'page' : undefined}
-          onClick={() => onSection(item.id)}><Icon glyph={item.icon} size={14} />{item.label}</button>)}
+        <label className="settings-search">
+          <Icon glyph={Search} size={13} />
+          <input ref={searchInput} value={query} onChange={event => setQuery(event.target.value)} placeholder="Search settings" aria-label="Search settings" spellCheck={false} />
+          {query && <button type="button" aria-label="Clear search" onClick={() => { setQuery(''); searchInput.current?.focus() }}><Icon glyph={X} size={12} /></button>}
+        </label>
+        {sections.map(item => <button key={item.id} className={!term && section === item.id ? 'is-active' : ''} aria-current={!term && section === item.id ? 'page' : undefined}
+          onClick={() => { setQuery(''); onSection(item.id) }}><Icon glyph={item.icon} size={14} />{item.label}</button>)}
       </nav>
       <div className="settings-body">
-        <header className="settings-head"><h2>{sections.find(item => item.id === section)?.label}</h2><IconButton glyph={X} label="Close settings" onClick={onClose} /></header>
-        <div className="settings-scroll">
-          {section === 'appearance' && <Appearance notify={notify} />}
-          {section === 'editor' && <EditorSettings />}
-          {section === 'ai' && <AiSettingsView />}
-          {section === 'terminal' && <TerminalSettings />}
-          {section === 'projects' && <ProjectSettings notify={notify} />}
-          {section === 'remote' && <ServerSettings notify={notify} />}
-          {section === 'shortcuts' && <Shortcuts />}
-          {section === 'about' && <About notify={notify} />}
+        <header className="settings-head"><h2>{term ? (matches === 0 ? 'No matching settings' : 'Results for “' + query.trim() + '”') : sections.find(item => item.id === section)?.label}</h2><IconButton glyph={X} label="Close settings" onClick={onClose} /></header>
+        <div className="settings-scroll" ref={body}>
+          {shown.map(item => <div key={item.id} className="settings-section" data-label={item.label}>
+            {term && <p className="settings-section-label">{item.label}</p>}
+            {item.id === 'appearance' && <Appearance notify={notify} />}
+            {item.id === 'editor' && <EditorSettings />}
+            {item.id === 'ai' && <AiSettingsView />}
+            {item.id === 'terminal' && <TerminalSettings />}
+            {item.id === 'projects' && <ProjectSettings notify={notify} />}
+            {item.id === 'remote' && <ServerSettings notify={notify} />}
+            {item.id === 'shortcuts' && <Shortcuts />}
+            {item.id === 'about' && <About notify={notify} />}
+          </div>)}
+          {term && matches === 0 && <p className="help settings-none">Nothing matches “{query.trim()}”. Try a shorter word, like “font”, “tab” or “theme”.</p>}
         </div>
       </div>
     </section>
@@ -148,6 +193,15 @@ function Appearance({ notify }: { notify: (message: unknown) => void }) {
     </section>
 
     <section className="settings-group">
+      <div className="settings-group-head"><h3>Syntax colours</h3></div>
+      <p className="help mb-3">Colour the code with another theme's palette while keeping {theme.name} for everything else. Only {theme.kind} palettes are offered, so code stays readable.</p>
+      <div className="theme-grid syntax-grid">
+        <SyntaxSwatch label={'Match ' + theme.name} theme={theme} active={!settings.syntaxTheme || settings.syntaxTheme === theme.id || !all.some(item => item.id === settings.syntaxTheme && item.kind === theme.kind)} onClick={() => update({ syntaxTheme: '' })} />
+        {all.filter(item => item.kind === theme.kind && item.id !== theme.id).map(item => <SyntaxSwatch key={item.id} label={item.name} theme={item} background={resolved.editor} active={settings.syntaxTheme === item.id} onClick={() => update({ syntaxTheme: item.id })} />)}
+      </div>
+    </section>
+
+    <section className="settings-group">
       <div className="settings-group-head">
         <h3>Customize {theme.name}</h3>
         {theme.custom && <button className="text-btn danger" onClick={removeCustom}><Icon glyph={Trash2} size={13} />Delete theme</button>}
@@ -179,7 +233,26 @@ function Appearance({ notify }: { notify: (message: unknown) => void }) {
       <NumberRow label="Line height" value={settings.editorLineHeight} min={1.2} max={2.2} step={0.1} onChange={value => update({ editorLineHeight: Math.round(value * 10) / 10 })} />
       <Toggle label="Font ligatures" description="Render => and != as single glyphs in fonts that support them." checked={settings.ligatures} onChange={value => update({ ligatures: value })} />
     </section>
+
+    <section className="settings-group">
+      <h3>Motion</h3>
+      <Toggle label="Reduce motion" description="Islands, menus and the canvas appear without sliding or fading." checked={settings.reduceMotion} onChange={value => update({ reduceMotion: value })} />
+      <Toggle label="Bounce at the ends of lists and files" description="Scrolling past the top or bottom stretches a little and springs back." checked={settings.bounce} onChange={value => update({ bounce: value })} />
+    </section>
   </>
+}
+
+function SyntaxSwatch({ theme, label, active, onClick, background }: { theme: Theme; label: string; active: boolean; onClick: () => void; background?: string }) {
+  const { colors: c } = resolve(theme)
+  const line = (parts: [string, string][]) => <span className="syntax-line">{parts.map(([text, color], index) => <span key={index} style={{ color }}>{text}</span>)}</span>
+  return <button className={'theme-card syntax-card' + (active ? ' is-active' : '')} onClick={onClick} aria-pressed={active} title={label}>
+    <span className="syntax-preview" style={{ background: background ?? c.editor }}>
+      {line([['def ', c.keyword], ['orbit', c.function], ['(', c.operator], ['r', c.variable], [')', c.operator], [':', c.operator]])}
+      {line([['  # minutes', c.comment]])}
+      {line([['  return ', c.keyword], ['2', c.number], [' * ', c.operator], ['Pi', c.type], ['(', c.operator], ['"km"', c.string], [')', c.operator]])}
+    </span>
+    <span className="theme-name">{active && <Icon glyph={Check} size={12} />}{label}</span>
+  </button>
 }
 
 function ColorField({ label, value, onChange }: { label: string; value: string; onChange: (value: string) => void }) {
@@ -214,12 +287,38 @@ function EditorSettings() {
         <Segmented label="Tab size" value={String(settings.tabSize)} onChange={value => update({ tabSize: value === 'auto' ? 'auto' : Number(value) as 2 | 4 | 8 })}
           options={[{ value: 'auto', label: 'Auto' }, { value: '2', label: '2' }, { value: '4', label: '4' }, { value: '8', label: '8' }]} /></div>
       <Toggle label="Wrap long lines" checked={settings.wordWrap} onChange={value => update({ wordWrap: value })} />
-      <Toggle label="Line numbers" checked={settings.lineNumbers} onChange={value => update({ lineNumbers: value })} />
-      <Toggle label="Highlight the current line" checked={settings.highlightLine} onChange={value => update({ highlightLine: value })} />
       <Toggle label="Suggest completions while typing" description="Off: press Ctrl+Space to see suggestions. Either way, Tab accepts a suggestion and Enter always starts a new line." checked={settings.autocomplete} onChange={value => update({ autocomplete: value })} />
+      <Toggle label="Close brackets and quotes automatically" description="Typing ( [ { or a quote adds the closing one." checked={settings.closeBrackets} onChange={value => update({ closeBrackets: value })} />
       <div className="setting-row"><span className="setting-text"><span>Auto save</span><small>Save after a short pause, or when the editor loses focus.</small></span>
         <Segmented label="Auto save" value={settings.autoSave} onChange={value => update({ autoSave: value })}
           options={[{ value: 'off', label: 'Off' }, { value: 'delay', label: 'After delay' }, { value: 'blur', label: 'On focus change' }]} /></div>
+      <Toggle label="Trim trailing spaces when saving" checked={settings.trimOnSave} onChange={value => update({ trimOnSave: value })} />
+      <Toggle label="End files with a newline when saving" checked={settings.finalNewline} onChange={value => update({ finalNewline: value })} />
+    </section>
+    <section className="settings-group">
+      <h3>Display</h3>
+      <Toggle label="Line numbers" checked={settings.lineNumbers} onChange={value => update({ lineNumbers: value })} />
+      <Toggle label="Highlight the current line" checked={settings.highlightLine} onChange={value => update({ highlightLine: value })} />
+      <Toggle label="Highlight other uses of the word under the caret" checked={settings.occurrences} onChange={value => update({ occurrences: value })} />
+      <Toggle label="Indent guides" description="Thin lines at each indentation level." checked={settings.indentGuides} onChange={value => update({ indentGuides: value })} />
+      <Toggle label="Code folding" description="Arrows beside the line numbers fold blocks away." checked={settings.folding} onChange={value => update({ folding: value })} />
+      <div className="setting-row"><span className="setting-text"><span>Show whitespace</span></span>
+        <Segmented label="Show whitespace" value={settings.whitespace} onChange={value => update({ whitespace: value })}
+          options={[{ value: 'none', label: 'None' }, { value: 'trailing', label: 'Trailing' }, { value: 'all', label: 'All' }]} /></div>
+      <Toggle label="Scroll past the last line" checked={settings.scrollPastEnd} onChange={value => update({ scrollPastEnd: value })} />
+    </section>
+    <section className="settings-group">
+      <h3>Caret</h3>
+      <div className="setting-row"><span className="setting-text"><span>Caret style</span></span>
+        <Segmented label="Caret style" value={settings.cursorStyle} onChange={value => update({ cursorStyle: value })}
+          options={[{ value: 'line', label: 'Line' }, { value: 'block', label: 'Block' }, { value: 'underline', label: 'Underline' }]} /></div>
+      <Toggle label="Blinking caret" checked={settings.cursorBlink} onChange={value => update({ cursorBlink: value })} />
+      <Toggle label="Smooth caret" description="The caret glides to its new position instead of jumping." checked={settings.smoothCaret} onChange={value => update({ smoothCaret: value })} />
+    </section>
+    <section className="settings-group">
+      <h3>Checks and changes</h3>
+      <Toggle label="Show errors while typing" description="Underlines syntax errors as you type. Python files are also checked for undefined names (and, with pyflakes installed, unused imports and more)." checked={settings.errors} onChange={value => update({ errors: value })} />
+      <Toggle label="Mark lines changed since the last commit" description="A green bar for added lines, amber for changed lines and a red mark where lines were removed." checked={settings.gitGutter} onChange={value => update({ gitGutter: value })} />
     </section>
     <section className="settings-group">
       <h3>Diffs and files</h3>
@@ -229,11 +328,10 @@ function EditorSettings() {
     </section>
     <section className="settings-group">
       <h3>Calm</h3>
-      <Toggle label="Smooth caret" description="The caret glides to its new position instead of jumping." checked={settings.smoothCaret} onChange={value => update({ smoothCaret: value })} />
       <div className="setting-row"><span className="setting-text"><span>Idle screen</span><small>After this long without input, show drifting code, the time and today's numbers. Any key brings you back.</small></span>
         <Segmented label="Idle screen" value={String(settings.idleMinutes)} onChange={value => update({ idleMinutes: Number(value) })}
           options={[{ value: '0', label: 'Off' }, { value: '2', label: '2 min' }, { value: '5', label: '5 min' }, { value: '10', label: '10 min' }, { value: '20', label: '20 min' }]} /></div>
-      <Toggle label="Keep a journal" description="Notes saves, runs and commits on this computer. Shown on Home under Today." checked={settings.journal} onChange={value => update({ journal: value })} />
+      <Toggle label="Keep a journal" description="Notes saves, runs and commits on this computer. Shown on Home under Journal." checked={settings.journal} onChange={value => update({ journal: value })} />
     </section>
   </>
 }
@@ -250,6 +348,10 @@ function TerminalSettings() {
         {shells.map(shell => <option key={shell.path} value={shell.path}>{shell.name} — {shell.path}</option>)}
       </select></div>
     <NumberRow label="Font size" value={settings.terminalFontSize} min={10} max={24} onChange={value => update({ terminalFontSize: value })} />
+    <div className="setting-row"><span className="setting-text"><span>Scrollback</span><small>Lines kept above the screen in each terminal.</small></span>
+      <Segmented label="Scrollback" value={String(settings.terminalScrollback)} onChange={value => update({ terminalScrollback: Number(value) })}
+        options={[{ value: '1000', label: '1k' }, { value: '5000', label: '5k' }, { value: '10000', label: '10k' }, { value: '50000', label: '50k' }]} /></div>
+    <Toggle label="Copy selected text automatically" description="Selecting text in the terminal copies it, as in many Linux terminals." checked={settings.terminalCopyOnSelect} onChange={value => update({ terminalCopyOnSelect: value })} />
     <div className="setting-row"><span className="setting-text"><span>Cursor</span></span>
       <Segmented label="Cursor" value={settings.terminalCursor} onChange={value => update({ terminalCursor: value })}
         options={[{ value: 'block', label: 'Block' }, { value: 'bar', label: 'Bar' }, { value: 'underline', label: 'Underline' }]} /></div>
@@ -286,6 +388,10 @@ function ProjectSettings({ notify }: { notify: (message: unknown) => void }) {
         </select></div>
       <Toggle label="Initialize a Git repository" checked={settings.newProjectGit} onChange={value => update({ newProjectGit: value })} />
     </section>
+    <section className="settings-group">
+      <h3>Startup</h3>
+      <Toggle label="Reopen the last project when Still starts" description="Off: Still opens on Home." checked={settings.openLastProject} onChange={value => update({ openLastProject: value })} />
+    </section>
   </>
 }
 
@@ -309,23 +415,23 @@ function ServerSettings({ notify }: { notify: (message: unknown) => void }) {
       <p className="settings-caption mt-4">From ~/.ssh/config (read-only)</p>
       {overview.imported.map(host => <div className="setting-row" key={host.id}><span className="setting-text"><span>{host.name}</span><small>{hostLabel(host)}</small></span></div>)}
     </>}
-    <p className="help mt-4">{overview?.client ?? 'OpenSSH client not detected.'} Still runs your system's ssh, so keys, agents, ~/.ssh/config, ProxyJump and known_hosts behave exactly as in a terminal. Passwords and host-key prompts appear in the terminal. Still never stores passwords.</p>
+    <p className="help mt-4">{overview?.client ?? 'OpenSSH client not detected.'} Still runs your system's ssh, so keys, agents, ~/.ssh/config, ProxyJump and known_hosts behave exactly as in a terminal. Passwords, key passphrases and verification codes are asked for in a dialog when a server needs them; passwords are kept in memory until you quit and never written to disk.</p>
     {editing && <HostDialog host={editing} onClose={() => setEditing(null)} onSaved={refresh} />}
   </section>
 }
 
 const shortcutGroups: { title: string; items: [string, string][] }[] = [
-  { title: 'General', items: [['Command palette and file finder', 'K / P'], ['Commands only', 'Shift+K'], ['Settings', ','], ['Go to Home', 'Shift+H'], ['Open folder', 'O'], ['New project (Home)', 'N']] },
-  { title: 'Editor', items: [['Save', 'S'], ['Close tab', 'W'], ['Next / previous tab', 'Tab / Shift+Tab'], ['Find in file', 'F'], ['Find in all files', 'Shift+F'], ['Go to line', 'Alt+G'], ['Toggle comment', '/']] },
+  { title: 'General', items: [['Command palette and file finder', 'K / P'], ['Commands only', 'Shift+K'], ['Settings', ','], ['Go to Home', 'Shift+H'], ['Open folder', 'O'], ['New project (Home)', 'N'], ['Zoom code in / out / reset', '= / - / 0']] },
+  { title: 'Editor', items: [['Save / save all', 'S / Shift+S'], ['Close tab', 'W'], ['Next / previous tab', 'Tab / Shift+Tab'], ['Find in file', 'F'], ['Find in all files', 'Shift+F'], ['Go to line', 'Alt+G'], ['Toggle comment', '/'], ['Select next match', 'D'], ['Duplicate line', 'Shift+D'], ['Go to definition', '!F12 / Click'], ['Rename in this file', '!F2'], ['Add a cursor', '!Alt+Click'], ['Next problem', '!F8']] },
   { title: 'Run', items: [['Run active file', 'Enter'], ['Check or compile only', 'Shift+Enter']] },
-  { title: 'Layout', items: [['Overview of everything', '↑'], ['Focus mode', '.'], ['Toggle the left island', 'B'], ['Toggle the terminal island', 'J'], ['New terminal', 'Shift+`'], ['Files', 'Shift+E'], ['Git', 'Shift+G']] },
+  { title: 'Layout', items: [['Overview of everything', '↑'], ['Focus mode', '.'], ['Show or hide the sidebar', 'B'], ['Files', 'Shift+E'], ['Search', 'Shift+F'], ['Git', 'Shift+G'], ['Packages', 'Shift+U'], ['Servers', 'Shift+R'], ['Canvas', 'Shift+D'], ['Chat', 'Shift+A'], ['Terminal', 'J'], ['New terminal', 'Shift+`'], ['Fullscreen the focused island', 'Shift+M']] },
 ]
 
 function Shortcuts() {
   return <>{shortcutGroups.map(group => <section key={group.title} className="settings-group">
     <h3>{group.title}</h3>
-    {group.items.map(([label, keys]) => <div key={label} className="setting-row"><span className="setting-text"><span>{label}</span></span>
-      <span className="flex gap-1">{keys.split(' / ').map(key => <kbd key={key}>{mod + '+' + key}</kbd>)}</span></div>)}
+    {group.items.map(([label, keys]) => <div key={label} className="setting-row shortcut-row"><span className="setting-text"><span>{label}</span></span>
+      <span className="flex gap-1">{keys.replace(/^!/, '').split(' / ').map(key => <kbd key={key}>{keys.startsWith('!') ? key : key === 'Click' ? mod + '+Click' : mod + '+' + key}</kbd>)}</span></div>)}
   </section>)}</>
 }
 

@@ -289,15 +289,35 @@ export function RemotePanel(props: PanelProps) {
 
 /** Asks for a server password. The answer stays in memory for this session only. */
 export function PasswordDialog({ host, retry, onAnswer }: { host: string; retry: boolean; onAnswer: (password: string | null) => void }) {
+  return <LoginPrompt host={host} prompt="Password:" kind="password" retry={retry} onAnswer={onAnswer} />
+}
+
+/**
+ * One question from the server while signing in, in the server's own words: a password,
+ * a key passphrase, or a one-time verification code. Passwords stay in memory for this session.
+ */
+export function LoginPrompt({ host, prompt, kind, retry, onAnswer }: { host: string; prompt: string; kind: string; retry: boolean; onAnswer: (answer: string | null) => void }) {
   const [value, setValue] = useState('')
-  return <Modal title={'Password for ' + host} onClose={() => onAnswer(null)}>
+  const [show, setShow] = useState(false)
+  const code = kind === 'code'
+  const label = prompt.replace(/\s*:\s*$/, '').replace(/^\([^)]*\)\s*/, '') || 'Password'
+  return <Modal title={'Sign in to ' + host} onClose={() => onAnswer(null)} className="login-prompt">
     <form className="sheet-body form-grid" onSubmit={event => { event.preventDefault(); onAnswer(value) }}>
-      <label>Password<input className="field field-lg" type="password" value={value} onChange={event => setValue(event.target.value)} autoFocus autoComplete="current-password" /></label>
-      {retry && <p className="form-error" role="alert">That password didn't work. Try again.</p>}
-      <p className="help">Used to browse, save and run files on {host}. Still keeps it in memory until you quit and never writes it to disk. An SSH key avoids this prompt entirely.</p>
+      <label>{label}
+        <span className="flex gap-1">
+          <input className="field field-lg" type={code || show ? 'text' : 'password'} value={value} onChange={event => setValue(event.target.value)} autoFocus
+            autoComplete={code ? 'one-time-code' : 'current-password'} inputMode={code && /code|pin|otp/i.test(prompt) ? 'numeric' : undefined} spellCheck={false} />
+          {!code && <button type="button" className="text-btn" onClick={() => setShow(value => !value)}>{show ? 'Hide' : 'Show'}</button>}
+        </span>
+      </label>
+      {retry && <p className="form-error" role="alert">{kind === 'password' ? "That password didn't work. Try again." : 'The server asked again. Check what you typed.'}</p>}
+      <p className="help">{code
+        ? 'The server asks for a one-time code as a second step. It is sent straight to the server and not kept.'
+        : kind === 'passphrase' ? 'Unlocks your SSH key for this session. Still keeps it in memory until you quit and never writes it to disk.'
+        : 'Still keeps this password in memory until you quit and never writes it to disk. An SSH key avoids this prompt entirely.'}</p>
       <div className="sheet-actions">
         <button type="button" className="text-btn" onClick={() => onAnswer(null)}>Cancel</button>
-        <button type="submit" className="text-btn primary" disabled={!value}>Connect</button>
+        <button type="submit" className="text-btn primary" disabled={!value}>Continue</button>
       </div>
     </form>
   </Modal>

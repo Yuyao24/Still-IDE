@@ -7,14 +7,14 @@ import {
   Check, Circle, CircleAlert, CodeXml, Columns2, Copy, FilePlus2, Files, FolderOpen, FolderPlus,
   FolderSearch, GitBranch, GitCompareArrows, GitPullRequestArrow, Hammer, House, Moon, Package,  Pencil, Play, Plus,
   RefreshCw, Rows2, Search, Server, Settings2, Square, SquareTerminal, Sun, TerminalSquare, Trash2, WrapText, X,
-  Camera, Eye, PenLine, LayoutGrid, Maximize2, Minimize2, Network, BookOpen,
+  Camera, Eye, PenLine, LayoutGrid, Maximize2, Minimize2, Network, BookOpen, Sparkles,
 } from 'lucide-react'
 import {
-  api, desktop, fileName, fileSystem, home, mod, parentPath, pickFolder, ssh,
+  api, clipboard, desktop, editorSupport, fileName, fileSystem, home, mod, parentPath, pickFolder, ssh,
   type Branches, type Change, type Commit, type Diagnostic, type Diff, type Entry, type GitStatus, type JobEvent, type Packages, type Runtimes,
   type SshHost, type SshOverview, type Workspace,
 } from './bridge'
-import Editor, { defaultIndent, language, type CodeCapture, type Cursor, type EditorHandle, type EditorMemory, type EditorOptions } from './Editor'
+import Editor, { defaultIndent, language, type CodeCapture, type Cursor, type EditorHandle, type EditorMemory, type EditorOptions, type LiveIssue } from './Editor'
 import CodeShot from './CodeShot'
 import { Preview, docKind } from './Preview'
 import type { OpenOptions } from './Home'
@@ -36,7 +36,7 @@ import Terminal, { type TerminalSession } from './Terminal'
 import { presets } from './themes'
 import { TitleBar } from './TitleBar'
 import { Dialog, Output, Problems, SplitGrip, type DialogState, type OutputEntry } from './Workbench'
-import { Icon, IconButton, Menu, useSlider, type MenuEntry, type MenuState } from './ui'
+import { Icon, IconButton, Menu, useSlider, type MenuEntry, type MenuItem, type MenuState } from './ui'
 
 type Side = 'explorer' | 'search' | 'git' | 'packages' | 'remote'
 type Drawer = 'terminal' | 'output' | 'problems'
@@ -112,6 +112,10 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const [output, setOutput] = useState<OutputEntry[]>([])
   const [sampleRun, setSampleRun] = useState(false)
   const [diagnostics, setDiagnostics] = useState<Diagnostic[]>([])
+  // Errors found while typing in the active file (syntax errors, undefined names, compiler results).
+  const [live, setLive] = useState<{ path: string; issues: LiveIssue[] } | null>(null)
+  const [heads, setHeads] = useState<Record<string, string | null>>({})
+  const [searchSeed, setSearchSeed] = useState<{ query: string; key: number } | null>(null)
   const [job, setJob] = useState<Job | null>(null)
   const [runningRequest, setRunningRequest] = useState(false)
   const [jobReady, setJobReady] = useState(!desktop)
@@ -132,6 +136,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const [chatOpen, setChatOpen] = useState(() => localStorage.getItem('still.island.chat') === 'on')
   const [chatFocus, setChatFocus] = useState(0)
   const [maximized, setMaximized] = useState<'editor' | 'side' | 'terminal' | null>(null)
+  const [resizing, setResizing] = useState(false)
   const [overview, setOverview] = useState(false)
   const [graphView, setGraphView] = useState(false)
   const [graph, setGraph] = useState<Graph | null>(null)
@@ -161,8 +166,12 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const runnable = Boolean(active && !active.diff && mode && (remote ? remoteRunnable : localRunnable).includes(mode))
   const symbols = useMemo(() => active && !active.diff ? symbolsFor(active.contents, active.path) : [], [active?.path, active?.contents, active?.diff])
   const currentSymbol = [...symbols].reverse().find(symbol => symbol.line <= cursor.line)
-  const problemCount = diagnostics.filter(item => item.severity === 'error').length
-  const warningCount = diagnostics.length - problemCount
+  const problems: Diagnostic[] = useMemo(() => [
+    ...diagnostics.filter(item => !live || item.path !== live.path),
+    ...(live ? live.issues.map(issue => ({ path: live.path, line: issue.line, column: issue.column, severity: issue.severity === 'error' ? 'error' as const : 'warning' as const, message: issue.message })) : []),
+  ], [diagnostics, live])
+  const problemCount = problems.filter(item => item.severity === 'error').length
+  const warningCount = problems.length - problemCount
   const runtime = remote ? null : mode === 'Java' ? runtimes?.java : mode === 'JavaScript' ? runtimes?.node : mode === 'Python' ? runtimes?.python : runtimes?.python ?? runtimes?.java
   const runtimeMissing = mode === 'Java' ? 'JDK unavailable' : mode === 'Python' ? 'Python unavailable' : mode === 'JavaScript' ? 'Node unavailable' : 'No runtime'
   const sideMax = Math.max(160, Math.min(520, frame.width <= 690 ? Math.floor(frame.width * .3) : frame.width <= 790 ? Math.floor(frame.width * .34) : frame.width - 360))
@@ -172,7 +181,11 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const tabSize = settings.tabSize === 'auto' ? (active ? defaultIndent(active.path) : 4) : settings.tabSize
   const doc = active && !active.diff ? docKind(active.path) : null
   const docView: DocView = doc ? active?.view ?? 'edit' : 'edit'
-  const editorOptions: EditorOptions = { wrap: settings.wordWrap || Boolean(doc), lineNumbers: settings.lineNumbers, highlightLine: settings.highlightLine, tabSize, layout: settings.diffLayout, autocomplete: settings.autocomplete }
+  const editorOptions: EditorOptions = {
+    wrap: settings.wordWrap || Boolean(doc), lineNumbers: settings.lineNumbers, highlightLine: settings.highlightLine, tabSize, layout: settings.diffLayout, autocomplete: settings.autocomplete,
+    occurrences: settings.occurrences, whitespace: settings.whitespace, indentGuides: settings.indentGuides && !doc, closeBrackets: settings.closeBrackets, scrollPastEnd: settings.scrollPastEnd,
+    errors: settings.errors && !doc, changes: settings.gitGutter, cursorBlink: settings.cursorBlink, folding: settings.folding,
+  }
   const host = remote ? [...(servers?.saved ?? []), ...(servers?.imported ?? [])].find(item => item.id === workspace.remote) : undefined
 
   const notify = useCallback((error: unknown) => toast(errorText(error)), [toast])
@@ -182,6 +195,16 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const latestRecord = useRef(record)
   latestRecord.current = record
   const changedPaths = useMemo(() => new Set(status.changes.map(change => change.path)), [status])
+
+  // The last committed version of the active file, for the change markers beside the line numbers.
+  useEffect(() => {
+    if (!active || active.diff || remote || !desktop || !settings.gitGutter) return
+    const path = active.path
+    let current = true
+    void editorSupport.head(workspace.root, path).then(text => { if (current) setHeads(previous => previous[path] === text ? previous : { ...previous, [path]: text }) }).catch(() => {})
+    return () => { current = false }
+  }, [active?.path, status, settings.gitGutter])
+  useEffect(() => { if (live && live.path !== active?.path) setLive(null) }, [active?.path])
 
   useEffect(() => { if (!remote) localStorage.setItem('still.island.graph', graphOpen ? 'on' : 'off') }, [graphOpen])
   useEffect(() => { localStorage.setItem('still.island.chat', chatOpen ? 'on' : 'off') }, [chatOpen])
@@ -518,7 +541,15 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     const key = tab.id
     const previousSave = saving.current.get(key)
     if (previousSave) { await previousSave; return store(tab) }
-    const current = latest.current.tabs.find(item => item.id === tab.id)
+    let current = latest.current.tabs.find(item => item.id === tab.id)
+    if (current && (settings.trimOnSave || settings.finalNewline) && current.id === latest.current.selected) {
+      const tidied = editor.current?.tidy({ trim: settings.trimOnSave, finalNewline: settings.finalNewline })
+      if (tidied !== undefined && tidied !== null && tidied !== current.contents) {
+        current = { ...current, contents: tidied }
+        const replaced = current
+        latest.current.tabs = latest.current.tabs.map(item => item.id === replaced.id ? replaced : item)
+      }
+    }
     if (!current || !dirty(current)) return
     const task = fs.save(current.path, current.contents, current.saved).then(() => {
       if (generation.current !== id) return
@@ -616,7 +647,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     else run()
   }
 
-  function copyText(text: string) { void navigator.clipboard.writeText(text).then(() => notify('Copied ' + text)).catch(notify) }
+  function copyText(text: string) { void clipboard.write(text).then(() => notify('Copied ' + text)).catch(notify) }
   const absolute = (path: string) => {
     const separator = workspace.root.includes('\\') ? '\\' : '/'
     return path ? workspace.root.replace(/[\\/]$/, '') + separator + path.split('/').join(separator) : workspace.root
@@ -654,6 +685,170 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       else next.add(path)
       return next
     })
+  }
+
+  function searchFor(query: string) {
+    setSearchSeed(previous => ({ query, key: (previous?.key ?? 0) + 1 }))
+    showSide('search')
+  }
+
+  /** F12 / Ctrl+click: jump to where the word under the caret is defined, in this file or elsewhere in the project. */
+  async function goToDefinition() {
+    const word = editor.current?.word()
+    if (!word || !active || active.diff || !/^[A-Za-z_$][\w$]*$/.test(word.text)) return
+    const name = word.text
+    const local = symbols.find(symbol => symbol.name === name && symbol.line !== word.line)
+    if (local) { editor.current?.jump(local.line); return }
+    const pattern = '(\\b(def|class|function|fn|func|struct|enum|interface|trait|record|type|object|module)\\s+' + name + '\\b)|(\\b(const|let|var|val)\\s+' + name + '\\s*[=:])|(^\\s*' + name + '\\s*=[^=])|((public|private|protected|static)[\\w<>\\[\\],.? ]*\\s' + name + '\\s*\\()'
+    try {
+      const result = await fs.search(pattern, { regex: true, caseSensitive: true, wholeWord: false })
+      const matches = result.matches.filter(match => !(match.path === active.path && match.line === word.line))
+      const best = matches.find(match => match.path === active.path) ?? matches.find(match => /\b(def|class|function|fn|func|struct|interface|record)\b/.test(match.preview)) ?? matches[0]
+      if (best) jumpTo({ path: best.path, line: best.line, column: best.column })
+      else notify('No definition found for ' + name + '.')
+    } catch (error) { notify(error) }
+  }
+
+  const mainMenuItems = useRef<MenuEntry[] | null>(null)
+  /** The menu behind the Still logo, like the main menu in JetBrains IDEs. */
+  async function openMainMenu(anchor: HTMLElement) {
+    if (menu && menu.items === mainMenuItems.current) { setMenu(null); return }
+    const box = anchor.getBoundingClientRect()
+    const recent = desktop ? await home.state().then(state => state.projects.filter(project => !project.missing && project.lastOpened && project.path !== workspace.root)
+      .sort((a, b) => (b.lastOpened ?? 0) - (a.lastOpened ?? 0)).slice(0, 8)).catch(() => []) : []
+    const handle = editor.current
+    const editing = Boolean(active && !active.diff)
+    const item = (label: string, action: () => void, shortcut?: string, extra: Partial<MenuItem> = {}): MenuItem => ({ label, action, shortcut, ...extra })
+    const items: MenuEntry[] = [
+      { label: 'File', items: [
+        item('New file…', () => newFile()),
+        ...(desktop || remote ? [item('New folder…', () => newFolder())] : []),
+        'separator',
+        item('Open file…', () => openPalette(''), mod + '+P'),
+        item('Open folder…', chooseFolder, mod + '+O'),
+        { label: 'Open recent', disabled: !recent.length, items: recent.length ? recent.map(project => item(project.name, () => leave(() => { void home.open(project.path).then(onSwitch).catch(notify) }, 'Switch project?'))) : [item('Nothing yet', () => {}, undefined, { disabled: true })] },
+        'separator',
+        item('Save', () => { void store(active).catch(notify) }, mod + '+S', { disabled: !active || !dirty(active) }),
+        item('Save all', () => { void storeAll() }, mod + '+Shift+S', { disabled: !tabs.some(dirty) }),
+        'separator',
+        item('Close tab', () => { if (active) closeTab(active) }, mod + '+W', { disabled: !active }),
+        item('Close saved tabs', () => closeTabs(latest.current.tabs.filter(tab => !dirty(tab))), undefined, { disabled: !tabs.length }),
+        item('Close project', goHome, mod + '+Shift+H'),
+      ] },
+      { label: 'Edit', items: [
+        item('Undo', () => { handle?.command('undo') }, mod + '+Z', { disabled: !editing }),
+        item('Redo', () => { handle?.command('redo') }, mod + '+Shift+Z', { disabled: !editing }),
+        'separator',
+        item('Cut', () => { handle?.command('cut') }, mod + '+X', { disabled: !editing }),
+        item('Copy', () => { handle?.command('copy') }, mod + '+C', { disabled: !active }),
+        item('Paste', () => { void clipboard.read().then(text => { editor.current?.insert(text); editor.current?.focus() }).catch(notify) }, mod + '+V', { disabled: !editing }),
+        item('Select all', () => { handle?.command('selectAll') }, mod + '+A', { disabled: !active }),
+        'separator',
+        item('Find', () => handle?.find(), mod + '+F', { disabled: !active }),
+        item('Find in files', () => showSide('search'), mod + '+Shift+F'),
+        item('Select next match', () => { handle?.command('selectNext') }, mod + '+D', { disabled: !editing }),
+        item('Rename in this file', () => { handle?.command('rename') }, 'F2', { disabled: !editing }),
+        item('Toggle comment', () => { handle?.command('comment') }, mod + '+/', { disabled: !editing }),
+      ] },
+      { label: 'View', items: [
+        item('Command palette', () => openPalette('>'), mod + '+Shift+K'),
+        'separator',
+        item('Sidebar', () => setSidebar(value => value ? null : lastSide), mod + '+B', { checked: Boolean(sidebar) }),
+        ...sideItems.map(side => item(side.label, () => showSide(side.key), mod + '+' + side.keys, { checked: sidebar === side.key })),
+        'separator',
+        item('Canvas', () => setGraphOpen(value => !value), mod + '+Shift+D', { checked: showGraph }),
+        item('Chat', toggleChat, mod + '+Shift+A', { checked: showChat }),
+        item('Terminal', () => drawerOpen ? setDrawerOpen(false) : showDrawer('terminal', true), mod + '+J', { checked: drawerOpen }),
+        'separator',
+        item('Focus mode', toggleFocus, mod + '+.'),
+        item('Overview', openOverview, mod + '+↑'),
+        item('Fullscreen editor', () => toggleMaximize('editor'), mod + '+Shift+M', { checked: maximized === 'editor' }),
+        'separator',
+        item('Zoom in', () => update({ editorFontSize: Math.min(28, settings.editorFontSize + 1) }), mod + '+='),
+        item('Zoom out', () => update({ editorFontSize: Math.max(9, settings.editorFontSize - 1) }), mod + '+-'),
+        item('Reset zoom', () => update({ editorFontSize: 14 }), mod + '+0'),
+        item('Wrap long lines', () => update({ wordWrap: !settings.wordWrap }), undefined, { checked: settings.wordWrap }),
+        item(theme.kind === 'dark' ? 'Light theme' : 'Dark theme', onToggleTheme),
+      ] },
+      { label: 'Go', items: [
+        item('Go to file…', () => openPalette(''), mod + '+P'),
+        item('Go to line…', () => { handle?.command('gotoLine') }, mod + '+Alt+G', { disabled: !active }),
+        item('Go to definition', () => { void goToDefinition() }, 'F12', { disabled: !editing }),
+        'separator',
+        item('Next tab', () => cycleTab(1), mod + '+Tab', { disabled: tabs.length < 2 }),
+        item('Previous tab', () => cycleTab(-1), mod + '+Shift+Tab', { disabled: tabs.length < 2 }),
+        item('Problems', () => showDrawer('problems'), undefined),
+      ] },
+      { label: 'Run', items: [
+        item(active ? 'Run ' + fileName(active.path) : 'Run', () => { void run() }, mod + '+Enter', { disabled: !runnable || Boolean(job) }),
+        item('Run with arguments…', askArguments, undefined, { disabled: !runnable || Boolean(job) }),
+        ...(!remote ? [item(mode === 'Java' ? 'Compile' : 'Check', () => { void run(true) }, mod + '+Shift+Enter', { disabled: !runnable || Boolean(job) })] : []),
+        item('Stop', () => { if (job) void invoke('stop_job', { id: job.id }).catch(notify) }, undefined, { disabled: !job }),
+        'separator',
+        item('Show output', () => showDrawer('output')),
+        item('New terminal', () => { setDrawer('terminal'); setDrawerOpen(true); if (desktop) { remote ? remoteSession() : newSession() } }, mod + '+Shift+`'),
+      ] },
+      ...(!remote ? [{ label: 'Git', items: [
+        item('Show changes', () => showSide('git'), mod + '+Shift+G'),
+        item('Commit…', () => { showSide('git'); if (commit.trim()) gitAction('commit') }),
+        item('Pull', () => gitAction('pull')),
+        item('Push', () => gitAction('push')),
+        item('Fetch', () => gitAction('fetch')),
+      ] } as MenuEntry] : []),
+      { label: 'Tools', items: [
+        item('Create image of code', captureCode, undefined, { disabled: !active || Boolean(active.diff) }),
+        item('Ask the assistant', () => { if (!chatOpen) toggleChat() }, mod + '+Shift+A'),
+        item('Open the canvas', () => setGraphView(true)),
+        item('Journal', () => setJournalOpen(true)),
+        item('Servers (SSH)…', () => showSide('remote')),
+      ] },
+      { label: 'Help', items: [
+        item('Keyboard shortcuts', () => onSettings('shortcuts')),
+        item('Check for updates…', () => onSettings('about')),
+        item('About Still', () => onSettings('about')),
+      ] },
+      'separator',
+      item('Settings…', () => onSettings(), mod + '+,'),
+      item('Home', goHome, mod + '+Shift+H'),
+      ...(desktop ? ['separator' as const, item('Quit', () => { void getCurrentWindow().close().catch(notify) })] : []),
+    ]
+    mainMenuItems.current = items
+    setMenu({ x: box.left, y: box.bottom + 6, items })
+  }
+
+  function editorMenu(event: ReactMouseEvent) {
+    if (!active) return
+    const handle = editor.current
+    const selectedText = handle?.selection() ?? ''
+    const word = handle?.word()
+    const readOnly = Boolean(active.diff)
+    const items: MenuEntry[] = [
+      { label: 'Cut', shortcut: mod + '+X', disabled: !selectedText || readOnly, action: () => { handle?.command('cut') } },
+      { label: 'Copy', shortcut: mod + '+C', disabled: !selectedText, action: () => { handle?.command('copy') } },
+      { label: 'Paste', shortcut: mod + '+V', disabled: readOnly, action: () => { void clipboard.read().then(text => { editor.current?.insert(text); editor.current?.focus() }).catch(notify) } },
+      { label: 'Select all', shortcut: mod + '+A', action: () => { handle?.command('selectAll') } },
+      'separator',
+      ...(!readOnly ? [
+        { label: 'Go to definition', shortcut: 'F12', disabled: !word, action: () => { void goToDefinition() } },
+        { label: word ? 'Rename “' + word.text.slice(0, 24) + '” in this file' : 'Rename in this file', shortcut: 'F2', disabled: !word, action: () => { handle?.command('rename') } },
+        { label: 'Select next match', shortcut: mod + '+D', disabled: !word && !selectedText, action: () => { handle?.command('selectNext') } },
+      ] : []),
+      { label: 'Find in file', shortcut: mod + '+F', action: () => handle?.find() },
+      { label: (selectedText || word?.text) ? 'Find “' + (selectedText || word?.text || '').split('\n')[0].slice(0, 24) + '” in all files' : 'Find in all files', shortcut: mod + '+Shift+F', action: () => searchFor((selectedText || word?.text || '').split('\n')[0]) },
+      'separator',
+      ...(!readOnly ? [{ label: 'Toggle comment', shortcut: mod + '+/', action: () => { handle?.command('comment') } }] : []),
+      { label: 'Fold all', action: () => { handle?.command('foldAll') } },
+      { label: 'Unfold all', action: () => { handle?.command('unfoldAll') } },
+      'separator',
+      ...(runnable ? [{ label: 'Run ' + fileName(active.path), shortcut: mod + '+Enter', action: () => { void run() } }] : []),
+      { label: selectedText ? 'Create image of selection' : 'Create image of this file', icon: Camera, action: captureCode },
+      { label: 'Ask the assistant about this', icon: Sparkles, action: () => { if (!chatOpen) toggleChat(); else setChatFocus(count => count + 1) } },
+      'separator',
+      { label: 'Copy relative path', action: () => copyText(active.path) },
+      { label: 'Show in files', action: () => { showSide('explorer'); expandParents(active.path) } },
+      ...(desktop && !remote ? [{ label: 'Reveal in file manager', action: () => { void home.reveal(absolute(parentPath(active.path))).catch(notify) } }] : []),
+    ]
+    setMenu({ x: event.clientX, y: event.clientY, items })
   }
 
   function showSide(side: Side, toggle = false) {
@@ -864,7 +1059,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   function captureCode() {
     const captured = editor.current?.capture() ?? null
     if (captured) setShot(captured)
-    else notify('Select some code first, then create the image.')
+    else notify('This file is too long for one image. Select the lines you want, then try again.')
   }
 
   function openLink(href: string) {
@@ -913,6 +1108,12 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       // Plain Ctrl/Cmd+F outside the editor would open the web view's own find bar; send it to the editor instead.
       if (key === 'f' && !event.shiftKey && !event.altKey && !(event.target as Element | null)?.closest?.('.cm-editor, input, textarea, .xterm')) {
         event.preventDefault(); editor.current?.find(); return
+      }
+      // Code zoom: Ctrl+= / Ctrl+- / Ctrl+0, as in browsers and other editors.
+      if (!event.altKey && ['=', '+', '-', '_', '0'].includes(key) && !(event.target as Element | null)?.closest?.('.xterm, input, textarea')) {
+        event.preventDefault()
+        update({ editorFontSize: key === '0' ? 14 : Math.max(9, Math.min(28, settings.editorFontSize + (key === '-' || key === '_' ? -1 : 1))) })
+        return
       }
       if (event.altKey || !(['k', 'p', 's', 'w', 'b', 'j', 'o', 'enter', 'tab', ',', 'arrowup', '.'].includes(key) || shiftOnly)) return
       if ((overview || graphView) && !['k', 'p', '.'].includes(key)) return
@@ -1117,22 +1318,38 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   }
 
   const sideItems = ([
-    { key: 'explorer', label: 'Files', keys: 'Shift+E' },
-    { key: 'search', label: 'Search', keys: 'Shift+F' },
-    ...(!remote ? [{ key: 'git', label: 'Git', keys: 'Shift+G' }, { key: 'packages', label: 'Packages', keys: 'Shift+U' }] : []),
-    { key: 'remote', label: 'Servers', keys: 'Shift+R' },
-  ]) as { key: Side; label: string; keys: string }[]
+    { key: 'explorer', label: 'Files', keys: 'Shift+E', glyph: Files },
+    { key: 'search', label: 'Search', keys: 'Shift+F', glyph: Search },
+    ...(!remote ? [{ key: 'git', label: 'Git', keys: 'Shift+G', glyph: GitBranch }, { key: 'packages', label: 'Packages', keys: 'Shift+U', glyph: Package }] : []),
+    { key: 'remote', label: 'Servers', keys: 'Shift+R', glyph: Server },
+  ]) as { key: Side; label: string; keys: string; glyph: typeof Files }[]
   const editorProps = active ? {
     path: active.path, text: active.contents, memory: active.memory, diff: active.diff, initialLine: active.line,
     options: focusMode ? { ...editorOptions, lineNumbers: false, highlightLine: true } : editorOptions, diagnostics, handle: selectEditor, onCursor: setCursor,
     onBlur: () => { if (settings.autoSave === 'blur') void store(latest.current.tabs.find(tab => tab.id === active.id)).catch(notify) },
     onEdit: (contents: string) => edited(active, contents),
+    base: !active.diff && !remote ? heads[active.path] ?? null : null,
+    check: desktop && !remote && !active.diff && mode === 'Python' ? (text: string) => editorSupport.checkPython(workspace.root, text) : undefined,
+    onIssues: (issues: LiveIssue[]) => { const path = active.path; setLive(previous => previous && previous.path === path && JSON.stringify(previous.issues) === JSON.stringify(issues) ? previous : { path, issues }) },
+    onContextMenu: editorMenu,
+    onDefinition: () => { void goToDefinition() },
   } : null
   // On narrow windows the graph island steps aside on its own; the setting is kept for when there is room again.
   const showChat = chatOpen && frame.width >= 760
   const showGraph = graphOpen && frame.width >= (showChat ? 1560 : 1080)
-  const columns = maximized ? 'minmax(0, 1fr)' : [sidebar ? workspaceWidth + 'px' : '', 'minmax(0, 1fr)', showGraph ? '272px' : '', showChat ? (frame.width < 1100 ? '320px' : '380px') : ''].filter(Boolean).join(' ')
-  const rows = maximized ? 'minmax(0, 1fr)' : drawerOpen ? 'minmax(0, 1fr) ' + actualDrawerHeight + 'px' : 'minmax(0, 1fr)'
+  // The grid always has the same tracks (sidebar, editor, canvas, chat × editor, drawer); a hidden island's track
+  // is 0px. Keeping the track count fixed lets the browser animate the widths, so islands slide in and out.
+  const gap = frame.width <= 720 ? 12 : 20
+  const chatWidth = frame.width < 1100 ? 320 : 380
+  const sideTrack = sidebar && (!maximized || maximized === 'side') ? workspaceWidth + gap : 0
+  const columns = maximized === 'side' ? 'minmax(0, 1fr) 0px 0px 0px'
+    : [sideTrack + 'px', 'minmax(0, 1fr)', (showGraph && !maximized ? 272 + gap : 0) + 'px', (showChat && !maximized ? chatWidth + gap : 0) + 'px'].join(' ')
+  const rows = maximized === 'terminal' ? '0px minmax(0, 1fr)' : 'minmax(0, 1fr) ' + (drawerOpen && !maximized ? actualDrawerHeight + gap : 0) + 'px'
+  const sideMounted = usePresence(Boolean(sidebar))
+  const graphMounted = usePresence(showGraph)
+  const chatMounted = usePresence(showChat)
+  const shownSide: Side = sidebar ?? lastSide
+  const drawerMounted = usePresence(drawerOpen)
   const marks = active ? edits[active.path] ?? [] : []
   const tabSlider = useSlider(selected + tabs.length + sidebar + graphOpen + focusMode)
   const drawerSlider = useSlider(drawer + drawerOpen + sidebar)
@@ -1189,7 +1406,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       left={focusMode
         ? <span className="focus-path">{workspace.name}{active && active.path.split('/').map((part, index, all) => <span key={index}><i>/</i>{index === all.length - 1 ? <b>{part}</b> : part}</span>)}</span>
         : <>
-          <button className="brand" onClick={goHome} title={'Home (' + mod + '+Shift+H)'}><img src={mark} alt="" /><span className="brand-word">Still</span></button>
+          <button className={'brand' + (menu?.items === mainMenuItems.current ? ' is-open' : '')} onClick={event => { void openMainMenu(event.currentTarget) }} title="Menu" aria-haspopup="menu"><img src={mark} alt="" /><span className="brand-word">Still</span></button>
           <span className="chrome-slash">/</span>
           <button className="chrome-project" onClick={event => {
             const box = event.currentTarget.getBoundingClientRect()
@@ -1206,11 +1423,10 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
           </button>
         </>}
       center={focusMode ? undefined : <nav className="islands-nav" aria-label="Show or hide islands">
-        {sideItems.map(item => <button key={item.key} aria-pressed={sidebar === item.key} className={sidebar === item.key ? 'is-on' : ''} onClick={() => showSide(item.key, true)}
-          data-tip={(sidebar === item.key ? 'Hide ' : 'Show ') + item.label.toLowerCase() + ' · ' + mod + '+' + item.keys}>
-          {item.label}{item.key === 'git' && status.changes.length > 0 && <span className="nav-count">{Math.min(status.changes.length, 99)}</span>}
-        </button>)}
-        <span className="nav-rule" />
+        <button aria-pressed={Boolean(sidebar)} className={sidebar ? 'is-on' : ''} onClick={() => { if (focusMode) setFocusMode(false); setSidebar(value => value ? null : lastSide) }}
+          data-tip={(sidebar ? 'Hide' : 'Show') + ' sidebar · ' + mod + '+B'}>
+          Sidebar{status.changes.length > 0 && !remote && <span className="nav-count">{Math.min(status.changes.length, 99)}</span>}
+        </button>
         <button aria-pressed={graphOpen} className={graphOpen ? 'is-on' : ''} onClick={() => setGraphOpen(value => !value)} data-tip={(graphOpen ? 'Hide' : 'Show') + ' canvas · ' + mod + '+Shift+D'}>Canvas</button>
         <button aria-pressed={showChat} className={showChat ? 'is-on' : ''} onClick={toggleChat} data-tip={(showChat ? 'Hide' : 'Show') + ' chat · ' + mod + '+Shift+A'}>Chat</button>
         <button aria-pressed={drawerOpen} className={drawerOpen ? 'is-on' : ''} onClick={() => drawerOpen && drawer === 'terminal' ? setDrawerOpen(false) : showDrawer('terminal', true)} data-tip={(drawerOpen && drawer === 'terminal' ? 'Hide' : 'Show') + ' terminal · ' + mod + '+J'}>Terminal</button>
@@ -1241,22 +1457,32 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       </div>
     </aside>}
 
-    <div className={'bench' + (maximized ? ' max-' + maximized : '') + (focusMode && focusOutput ? ' with-output' : '') + (maximized === 'editor' || (!sidebar && !showGraph && !drawerOpen && !showChat) ? ' solo' : '')} style={{ gridTemplateColumns: focusMode ? undefined : columns, gridTemplateRows: focusMode ? undefined : rows }}>
-      {sidebar && <aside className={'island side' + (drawerOpen ? ' tall' : '')} key={'side-' + sidebar} aria-label={sideItems.find(item => item.key === sidebar)?.label + ' island'}>
-        {sidebar === 'explorer' && <Explorer workspace={workspace} directories={directories} expanded={expanded} active={active?.path} changes={status} symbols={symbols}
+    <div className={'bench' + (resizing ? ' is-resizing' : '') + (maximized ? ' max-' + maximized : '') + (focusMode && focusOutput ? ' with-output' : '') + (maximized === 'editor' || (!sidebar && !showGraph && !drawerOpen && !showChat) ? ' solo' : '')} style={{ gridTemplateColumns: focusMode ? undefined : columns, gridTemplateRows: focusMode ? undefined : rows }}>
+      <div className={'slot slot-side' + (sidebar ? ' is-open' : '')} aria-hidden={!sidebar || undefined}>
+      {sideMounted && <aside className="island side tall" style={{ width: maximized === 'side' ? undefined : workspaceWidth }} aria-label={sideItems.find(item => item.key === shownSide)?.label + ' island'} inert={!sidebar || undefined}>
+        <nav className="side-views" role="tablist" aria-label="Sidebar views">
+          {sideItems.map(item => <button key={item.key} type="button" role="tab" aria-selected={shownSide === item.key} className={shownSide === item.key ? 'is-active' : ''}
+            onClick={() => showSide(item.key)} data-tip={item.label + ' · ' + mod + '+' + item.keys} aria-label={item.label}>
+            <Icon glyph={item.glyph} size={14} /><span>{item.label}</span>{item.key === 'git' && status.changes.length > 0 && <span className="nav-count">{Math.min(status.changes.length, 99)}</span>}
+          </button>)}
+        </nav>
+        <div className="side-body" key={'side-' + shownSide}>
+        {shownSide === 'explorer' && <Explorer workspace={workspace} directories={directories} expanded={expanded} active={active?.path} changes={status} symbols={symbols}
           onOpen={path => { void openFile(path) }} onExpand={toggleFolder} onNew={() => newFile()} onNewFolder={() => newFolder()} onWorkspace={chooseFolder}
           onRefresh={() => { void refreshFiles() }} onJump={line => editor.current?.jump(line)} onContext={explorerMenu} onKey={explorerKey} />}
-        {sidebar === 'search' && <SearchPanel search={fs.search} remote={remote} focusKey={searchFocus} onOpen={(path, line, column, length) => jumpTo({ path, line, column, length })} />}
-        {sidebar === 'git' && <SourceControl status={status} busy={Boolean(job) || gitBusy} error={gitError} commit={commit} log={log} onCommitText={setCommit}
+        {shownSide === 'search' && <SearchPanel search={fs.search} remote={remote} focusKey={searchFocus} seed={searchSeed} onOpen={(path, line, column, length) => jumpTo({ path, line, column, length })} />}
+        {shownSide === 'git' && <SourceControl status={status} busy={Boolean(job) || gitBusy} error={gitError} commit={commit} log={log} onCommitText={setCommit}
           onDiff={(change, index) => { void openDiff(change, index) }} onStage={(change, index) => { void updateStage(change, index) }} onAction={gitAction}
           onStageAll={unstage => { void stageAll(unstage) }} onDiscard={discard} onBranch={event => { void branchMenu(event) }}
           onInit={() => { void api.gitInit(workspace.root).then(() => refreshGit()).catch(notify) }} onRefresh={() => { void refreshGit(); void refreshLog() }} />}
-        {sidebar === 'packages' && <PackagesPanel key={workspace.root} state={packageState} busy={Boolean(job)} onOpen={path => { void openFile(path) }}
+        {shownSide === 'packages' && <PackagesPanel key={workspace.root} state={packageState} busy={Boolean(job)} onOpen={path => { void openFile(path) }}
           onSearch={api.search} onAction={packageAction} onRefresh={() => { void refreshPackages() }} />}
-        {sidebar === 'remote' && <RemotePanel overview={servers} onRefresh={() => { void refreshServers() }} {...remoteActions}
+        {shownSide === 'remote' && <RemotePanel overview={servers} onRefresh={() => { void refreshServers() }} {...remoteActions}
           onMenu={(event, items) => setMenu({ x: event.clientX, y: event.clientY, items })} />}
-        <SplitGrip vertical value={workspaceWidth} min={180} max={sideMax} change={setSideWidth} />
+        </div>
+        <SplitGrip vertical value={workspaceWidth} min={180} max={sideMax} change={setSideWidth} onActive={setResizing} />
       </aside>}
+      </div>
 
       <main className="island main">
         <div className="tab-strip" onDoubleClick={event => { if (event.target === event.currentTarget || (event.target as Element).classList.contains('tab-scroll')) toggleMaximize('editor') }}>
@@ -1329,22 +1555,27 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
         </section>
       </main>
 
-      {showGraph && <aside className="island graph-island" aria-label="Canvas island">
+      <div className={'slot slot-graph' + (showGraph && !maximized ? ' is-open' : '')} aria-hidden={!showGraph || undefined}>
+      {graphMounted && <aside className="island graph-island" aria-label="Canvas island" inert={!showGraph || undefined}>
         <MiniCanvas graph={graph} root={workspace.root} active={active && !active.diff ? active.path : undefined} onOpen={path => { void openFile(path) }} onExpand={() => setGraphView(true)} />
       </aside>}
+      </div>
 
-      {showChat && <aside className="island chat-island" style={{ gridColumn: '-2 / -1' }} aria-label="Chat island">
+      <div className={'slot slot-chat' + (showChat && !maximized ? ' is-open' : '')} aria-hidden={!showChat || undefined}>
+      {chatMounted && <aside className="island chat-island" style={{ width: chatWidth }} aria-label="Chat island" inert={!showChat || undefined}>
         <Chat settings={{ provider: settings.aiProvider, model: settings.aiModel, effort: settings.aiEffort, ollamaUrl: settings.ollamaUrl, ollamaModel: settings.ollamaModel, autoApproveEdits: settings.aiAutoApprove }}
           host={agentHost} projectKey={(workspace.remote ?? '') + workspace.root} focusKey={chatFocus} onSettings={() => onSettings('ai')} onClose={() => setChatOpen(false)} />
       </aside>}
+      </div>
 
-      {(drawerOpen || sessions.length > 0) && <section className="island drawer" style={{ display: drawerOpen ? undefined : 'none', gridColumn: maximized ? '1 / -1' : (sidebar ? '2' : '1') + (showChat ? ' / -2' : ' / -1'), gridRow: maximized ? '1' : undefined }} aria-label="Terminal island">
-        <SplitGrip value={actualDrawerHeight} min={128} max={drawerMax} change={setDrawerHeight} />
+      <div className={'slot slot-drawer' + (drawerOpen && (!maximized || maximized === 'terminal') ? ' is-open' : '')} aria-hidden={!drawerOpen || undefined}>
+      {(drawerMounted || sessions.length > 0) && <section className="island drawer" style={{ height: maximized === 'terminal' ? undefined : actualDrawerHeight }} aria-label="Terminal island" inert={!drawerOpen || undefined}>
+        <SplitGrip value={actualDrawerHeight} min={128} max={drawerMax} change={setDrawerHeight} onActive={setResizing} />
         <div className="drawer-nav">
           <div className="drawer-tabs" role="tablist" aria-label="Console views" ref={drawerSlider.ref}>
             {drawerTabs.map(({ key, label }) => <button key={key} type="button" role="tab" aria-selected={drawer === key} data-slide={drawer === key ? '' : undefined}
               className={'drawer-tab' + (drawer === key ? ' is-active' : '')} onClick={() => showDrawer(key, true)}>
-              {label}{key === 'problems' && diagnostics.length > 0 && <span className="nav-count">{diagnostics.length}</span>}
+              {label}{key === 'problems' && problems.length > 0 && <span className="nav-count">{Math.min(99, problems.length)}</span>}
             </button>)}
             {drawerSlider.bar}
           </div>
@@ -1369,16 +1600,17 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
         </div>
         <div className="drawer-body">
           {desktop && sessions.map(session => <Terminal key={session.id} session={session} root={remote ? null : workspace.root} visible={drawerOpen && drawer === 'terminal' && session.id === activeSession}
-            theme={theme} fontSize={settings.terminalFontSize} fontFamily={settings.editorFont} cursor={settings.terminalCursor} shell={settings.terminalShell}
+            theme={theme} fontSize={settings.terminalFontSize} fontFamily={settings.editorFont} cursor={settings.terminalCursor} shell={settings.terminalShell} scrollback={settings.terminalScrollback} copyOnSelect={settings.terminalCopyOnSelect}
             onReady={value => { if (session.id === activeSession || !terminal.current) terminal.current = value }}
             onExit={id => setSessions(previous => previous.map(item => item.id === id ? { ...item, exited: true } : item))} />)}
           {desktop && drawer === 'terminal' && !sessions.length && <div className="console-scroll"><button className="text-btn" onClick={() => remote ? remoteSession() : newSession()}><Icon glyph={Plus} size={13} />New terminal</button></div>}
           {!desktop && drawer === 'terminal' && <div className="console-scroll"><div className="console-banner"><Icon glyph={TerminalSquare} />The local shell is available in the Still desktop app.</div></div>}
           {drawer === 'output' && <Output entries={output} sample={sampleRun}
             onInput={job?.kind === 'run' ? text => { void invoke('job_input', { id: job.id, text }).catch(notify) } : undefined} />}
-          {drawer === 'problems' && <Problems items={diagnostics} jump={jumpTo} />}
+          {drawer === 'problems' && <Problems items={problems} jump={jumpTo} />}
         </div>
       </section>}
+      </div>
     </div>
 
     {focusMode && focusOutput && <section className="focus-output" aria-label="Output">
@@ -1443,4 +1675,15 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       leave(() => onSwitch({ root, name: root.split('/').filter(Boolean).at(-1) ?? root, remote: remoteHost.id, hostName: remoteHost.name }), 'Switch project?')
     }} />}
   </div>
+}
+
+/** True while `open`, and for a moment after it turns false, so an island can slide away before it unmounts. */
+function usePresence(open: boolean, ms = 260) {
+  const [present, setPresent] = useState(open)
+  useEffect(() => {
+    if (open) { setPresent(true); return }
+    const timer = setTimeout(() => setPresent(false), ms)
+    return () => clearTimeout(timer)
+  }, [open, ms])
+  return open || present
 }

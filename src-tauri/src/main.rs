@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod ai;
+mod check;
 mod config;
 mod git;
 mod packages;
@@ -22,9 +23,11 @@ fn main() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_http::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(process::Jobs::default())
         .manage(terminal::TerminalState::default())
         .manage(ssh::Passwords::default())
+        .manage(ssh::Prompts::default())
         .manage(ssh::Workers::default())
         .setup(|app| {
             let store = config::Store::load(app.handle());
@@ -33,6 +36,8 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             config::settings_get,
+            check::git_head_text,
+            check::check_python,
             config::settings_set,
             projects::home_state,
             projects::set_projects_root,
@@ -89,6 +94,7 @@ fn main() {
             ssh::ssh_test,
             ssh::ssh_resolve,
             ssh::ssh_browse,
+            ssh::ssh_prompt_answer,
             ssh::ssh_list,
             ssh::ssh_files,
             ssh::ssh_read,

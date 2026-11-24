@@ -1,6 +1,6 @@
 import { createContext, useContext } from 'react'
 import { invoke } from '@tauri-apps/api/core'
-import { type Theme, applyTheme, findTheme } from './themes'
+import { type Theme, applySyntax, applyTheme, findTheme, presets } from './themes'
 import { desktop } from './bridge'
 
 export interface Settings {
@@ -37,6 +37,24 @@ export interface Settings {
   ollamaUrl: string
   ollamaModel: string
   aiAutoApprove: boolean
+  syntaxTheme: string
+  cursorStyle: 'line' | 'block' | 'underline'
+  cursorBlink: boolean
+  occurrences: boolean
+  whitespace: 'none' | 'trailing' | 'all'
+  indentGuides: boolean
+  closeBrackets: boolean
+  scrollPastEnd: boolean
+  folding: boolean
+  errors: boolean
+  gitGutter: boolean
+  trimOnSave: boolean
+  finalNewline: boolean
+  reduceMotion: boolean
+  bounce: boolean
+  openLastProject: boolean
+  terminalScrollback: number
+  terminalCopyOnSelect: boolean
 }
 
 export const defaults: Settings = {
@@ -73,6 +91,24 @@ export const defaults: Settings = {
   ollamaUrl: 'http://localhost:11434',
   ollamaModel: '',
   aiAutoApprove: false,
+  syntaxTheme: '',
+  cursorStyle: 'line',
+  cursorBlink: true,
+  occurrences: true,
+  whitespace: 'none',
+  indentGuides: true,
+  closeBrackets: true,
+  scrollPastEnd: false,
+  folding: true,
+  errors: true,
+  gitGutter: true,
+  trimOnSave: false,
+  finalNewline: false,
+  reduceMotion: false,
+  bounce: true,
+  openLastProject: false,
+  terminalScrollback: 5000,
+  terminalCopyOnSelect: false,
 }
 
 export const editorFonts = [
@@ -127,9 +163,18 @@ export function activeTheme(settings: Settings, systemDark: boolean): Theme {
   return findTheme(id, settings.customThemes)
 }
 
+/** The theme whose code colours are used, when it isn't the editor theme itself. Only themes of the same kind (light or dark) apply. */
+export function syntaxThemeFor(settings: Settings, theme: Theme): Theme | null {
+  if (!settings.syntaxTheme || settings.syntaxTheme === theme.id) return null
+  const found = [...presets, ...settings.customThemes].find(item => item.id === settings.syntaxTheme)
+  return found && found.kind === theme.kind ? found : null
+}
+
 export function applySettings(settings: Settings, systemDark: boolean) {
   const theme = activeTheme(settings, systemDark)
   applyTheme(theme)
+  const syntax = syntaxThemeFor(settings, theme)
+  if (syntax) applySyntax(syntax)
   const root = document.documentElement.style
   root.setProperty('--ui-font-size', settings.uiFontSize + 'px')
   root.setProperty('--font-mono', settings.editorFont + ', ui-monospace, Consolas, monospace')
@@ -137,7 +182,12 @@ export function applySettings(settings: Settings, systemDark: boolean) {
   root.setProperty('--editor-line-height', String(settings.editorLineHeight))
   root.setProperty('--ligatures', settings.ligatures ? 'contextual common-ligatures' : 'none')
   root.setProperty('--font-features', settings.ligatures ? '"liga" 1, "calt" 1' : '"liga" 0, "calt" 0')
-  document.documentElement.classList.toggle('smooth-caret', settings.smoothCaret)
+  const classes = document.documentElement.classList
+  classes.toggle('smooth-caret', settings.smoothCaret)
+  classes.toggle('cursor-block', settings.cursorStyle === 'block')
+  classes.toggle('cursor-underline', settings.cursorStyle === 'underline')
+  classes.toggle('reduce-motion', settings.reduceMotion)
+  classes.toggle('no-bounce', !settings.bounce)
   watchKeyRepeat()
   return theme
 }

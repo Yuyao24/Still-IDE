@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import { type Graph, type GraphNode, layout } from './graph'
 import { highlightToHtml } from './Editor'
 
@@ -107,13 +107,60 @@ interface ViewProps {
   onClose: () => void
 }
 
+interface Camera { x: number; y: number; k: number }
+
+/** One file on the desk. Memoised so moving the camera doesn't re-render every card. */
+const Card = memo(function Card({ node, x, y, html, active, selected, changed, dragging }: { node: GraphNode; x: number; y: number; html: string; active: boolean; selected: boolean; changed: boolean; dragging: boolean }) {
+  return <section data-card={node.id} className={['cv-card', 'group-' + node.group, active && 'is-active', selected && 'is-selected', changed && 'is-changed', dragging && 'is-dragging'].filter(Boolean).join(' ')}
+    style={{ left: x, top: y, width: cardWidth }} title={node.id}>
+    <header><b>{node.id}</b><span>{active ? 'open now' : changed ? 'changed' : node.lines ? node.lines + ' lines' : ''}</span></header>
+    {html && <pre dangerouslySetInnerHTML={{ __html: html }} />}
+  </section>
+})
+
 /** The full canvas, filling the window. */
 export function CanvasView({ graph, error, root, project, active, changed, onOpen, onClose }: ViewProps) {
   const [scope, setScope] = useState<Scope>('all')
   const [saved, setSaved] = useState(() => load(root))
-  const [camera, setCamera] = useState({ x: 0, y: 0, k: .8 })
+  // One camera drives everything (cards, links, the dot grid and the minimap), so they always move together.
+  const [camera, setCameraNow] = useState<Camera>({ x: 0, y: 0, k: .8 })
   const [selected, setSelected] = useState<string | null>(active ?? null)
-  const [animate, setAnimate] = useState(false)
+  const shownCamera = useRef(camera)
+  shownCamera.current = camera
+  const motion = useRef<{ raf: number; tween?: { from: Camera; to: Camera; start: number; ms: number }; zoom?: { k: number; px: number; py: number; wx: number; wy: number } }>({ raf: 0 })
+  const stop = () => { cancelAnimationFrame(motion.current.raf); motion.current = { raf: 0 } }
+  const frameStep = useCallback((time: number) => {
+    const state = motion.current, box = desk.current
+    const current = shownCamera.current
+    let next: Camera | null = null, done = true
+    if (state.tween && box) {
+      // Fly: the point at the centre of the screen moves in a straight line while the zoom changes evenly.
+      const { from, to, start, ms } = state.tween
+      const t = Math.min(1, (time - start) / ms), e = 1 - Math.pow(1 - t, 3)
+      const cx = box.clientWidth / 2, cy = box.clientHeight / 2
+      const k = from.k * Math.pow(to.k / from.k, e)
+      const wx = (cx - from.x) / from.k + ((cx - to.x) / to.k - (cx - from.x) / from.k) * e
+      const wy = (cy - from.y) / from.k + ((cy - to.y) / to.k - (cy - from.y) / from.k) * e
+      next = { k, x: cx - wx * k, y: cy - wy * k }
+      done = t >= 1
+    } else if (state.zoom) {
+      // Wheel zoom eases toward its target and keeps the point under the pointer still.
+      const { k: goal, px, py, wx, wy } = state.zoom
+      const k = Math.abs(goal - current.k) < goal * .002 ? goal : current.k + (goal - current.k) * .3
+      next = { k, x: px - wx * k, y: py - wy * k }
+      done = k === goal
+    }
+    if (next) { shownCamera.current = next; setCameraNow(next) }
+    if (done) motion.current = { raf: 0 }
+    else motion.current.raf = requestAnimationFrame(frameStep)
+  }, [])
+  const setCamera = useCallback((next: Camera | ((value: Camera) => Camera), smooth = false) => {
+    const value = typeof next === 'function' ? next(shownCamera.current) : next
+    stop()
+    if (!smooth) { shownCamera.current = value; setCameraNow(value); return }
+    motion.current = { raf: requestAnimationFrame(frameStep), tween: { from: shownCamera.current, to: value, start: performance.now(), ms: 360 } }
+  }, [frameStep])
+  useEffect(() => () => cancelAnimationFrame(motion.current.raf), [])
   const desk = useRef<HTMLDivElement>(null)
   const drag = useRef<{ kind: 'pan' | 'card' | 'note'; id?: string; sx: number; sy: number; ox: number; oy: number; moved: boolean } | null>(null)
   const fitted = useRef(false)
@@ -122,8 +169,10 @@ export function CanvasView({ graph, error, root, project, active, changed, onOpe
   const positions = useMemo(() => graph ? arrange(shown.nodes, graph, saved.cards) : {}, [shown, graph])
   const [live, setLive] = useState<Record<string, Placed>>({})
   useEffect(() => { setLive(positions) }, [positions])
-  const detailed = camera.k >= .42
-  const heights = useMemo(() => Object.fromEntries(shown.nodes.map(node => [node.id, cardHeight(node, detailed)])), [shown, detailed])
+  // Cards keep one size at every zoom (the code just fades when far away), so nothing jumps while zooming.
+  const far = camera.k < .42
+  const heights = useMemo(() => Object.fromEntries(shown.nodes.map(node => [node.id, cardHeight(node, true)])), [shown])
+  const previews = useMemo(() => Object.fromEntries(shown.nodes.map(node => [node.id, node.preview ? highlightToHtml(node.preview.join('\n'), node.name.split('.').at(-1) ?? '') : ''])), [shown])
 
   const persist = useCallback((cards: Record<string, Placed>, notes: Note[]) => {
     const next = { cards: { ...saved.cards, ...cards }, notes }
@@ -137,17 +186,15 @@ export function CanvasView({ graph, error, root, project, active, changed, onOpe
     const minX = Math.min(...items.map(item => item.x)), minY = Math.min(...items.map(item => item.y))
     const maxX = Math.max(...items.map(item => item.x + item.w)), maxY = Math.max(...items.map(item => item.y + item.h))
     const k = Math.max(.15, Math.min(1, (box.clientWidth - 120) / (maxX - minX), (box.clientHeight - 120) / (maxY - minY)))
-    setAnimate(smooth)
-    setCamera({ k, x: (box.clientWidth - (maxX - minX) * k) / 2 - minX * k, y: (box.clientHeight - (maxY - minY) * k) / 2 - minY * k })
-  }, [shown, live, positions, heights, saved.notes])
+    setCamera({ k, x: (box.clientWidth - (maxX - minX) * k) / 2 - minX * k, y: (box.clientHeight - (maxY - minY) * k) / 2 - minY * k }, smooth)
+  }, [shown, live, positions, heights, saved.notes, setCamera])
 
   const focusOn = useCallback((id: string, smooth = true) => {
     const box = desk.current, at = live[id] ?? positions[id]
     if (!box || !at) return
-    const k = Math.max(camera.k, .7)
-    setAnimate(smooth)
-    setCamera({ k, x: box.clientWidth / 2 - (at.x + cardWidth / 2) * k, y: box.clientHeight / 2 - (at.y + 120) * k })
-  }, [live, positions, camera.k])
+    const k = Math.max(shownCamera.current.k, .7)
+    setCamera({ k, x: box.clientWidth / 2 - (at.x + cardWidth / 2) * k, y: box.clientHeight / 2 - (at.y + 120) * k }, smooth)
+  }, [live, positions, setCamera])
 
   useEffect(() => {
     if (fitted.current || !graph || !Object.keys(live).length) return
@@ -175,21 +222,24 @@ export function CanvasView({ graph, error, root, project, active, changed, onOpe
     const wheel = (event: WheelEvent) => {
       event.preventDefault()
       const box = node.getBoundingClientRect(), px = event.clientX - box.left, py = event.clientY - box.top
-      setAnimate(false)
-      setCamera(value => {
-        const k = Math.max(.15, Math.min(2.2, value.k * Math.exp(-event.deltaY * .0015)))
-        return { k, x: px - (px - value.x) * (k / value.k), y: py - (py - value.y) * (k / value.k) }
-      })
+      const current = shownCamera.current
+      // Trackpad pinch arrives as ctrl+wheel with small deltas; mouse wheels send bigger steps.
+      const delta = event.deltaMode === 1 ? event.deltaY * 16 : event.deltaY
+      const goal = Math.max(.15, Math.min(2.2, (motion.current.zoom?.k ?? current.k) * Math.exp(-delta * (event.ctrlKey ? .01 : .0018))))
+      const zoom = { k: goal, px, py, wx: (px - current.x) / current.k, wy: (py - current.y) / current.k }
+      const running = motion.current.raf && motion.current.zoom
+      motion.current = { raf: running ? motion.current.raf : 0, zoom }
+      if (!running) { cancelAnimationFrame(motion.current.raf); motion.current.raf = requestAnimationFrame(frameStep) }
     }
     node.addEventListener('wheel', wheel, { passive: false })
     return () => node.removeEventListener('wheel', wheel)
-  }, [])
+  }, [frameStep])
 
   function down(event: ReactPointerEvent) {
     const target = event.target as Element
     if (target.closest('textarea, button, .cv-float, .cv-map')) return
     const card = target.closest<HTMLElement>('[data-card]'), note = target.closest<HTMLElement>('[data-note]')
-    setAnimate(false)
+    stop()
     if (card) {
       const id = card.dataset.card!, at = live[id]
       drag.current = { kind: 'card', id, sx: event.clientX, sy: event.clientY, ox: at.x, oy: at.y, moved: false }
@@ -252,7 +302,7 @@ export function CanvasView({ graph, error, root, project, active, changed, onOpe
       style={{ backgroundSize: `${22 * camera.k}px ${22 * camera.k}px`, backgroundPosition: `${camera.x}px ${camera.y}px` }}>
       {!graph && <p className="graph-note">{error || 'Laying out your files…'}</p>}
       {graph && !shown.nodes.length && <p className="graph-note">{scope === 'changed' ? 'No changed files.' : 'No files to show yet.'}</p>}
-      <div className={'cv-world' + (animate ? ' animate' : '')} style={{ transform: world }}>
+      <div className={'cv-world' + (far ? ' is-far' : '')} style={{ transform: world }}>
         <svg className="cv-links" aria-hidden="true">
           {shown.edges.map(edge => {
             const a = live[edge.from], b = live[edge.to]
@@ -263,12 +313,8 @@ export function CanvasView({ graph, error, root, project, active, changed, onOpe
         {shown.nodes.map(node => {
           const at = live[node.id]
           if (!at) return null
-          const dragging = drag.current?.id === node.id && drag.current.moved
-          return <section key={node.id} data-card={node.id} className={['cv-card', 'group-' + node.group, node.id === active && 'is-active', node.id === selected && 'is-selected', changed.has(node.id) && 'is-changed', dragging && 'is-dragging'].filter(Boolean).join(' ')}
-            style={{ left: at.x, top: at.y, width: cardWidth }} title={node.id}>
-            <header><b>{node.id}</b><span>{node.id === active ? 'open now' : changed.has(node.id) ? 'changed' : node.lines ? node.lines + ' lines' : ''}</span></header>
-            {detailed && node.preview && <pre dangerouslySetInnerHTML={{ __html: highlightToHtml(node.preview.join('\n'), node.name.split('.').at(-1) ?? '') }} />}
-          </section>
+          return <Card key={node.id} node={node} x={at.x} y={at.y} html={previews[node.id]} active={node.id === active} selected={node.id === selected}
+            changed={changed.has(node.id)} dragging={drag.current?.id === node.id && drag.current.moved} />
         })}
         {saved.notes.map(note => <section key={note.id} data-note={note.id} className="cv-note" style={{ left: note.x, top: note.y }}>
           <header><b>Note</b><button aria-label="Delete note" onClick={() => persist({}, saved.notes.filter(item => item.id !== note.id))}>Delete</button></header>
@@ -285,8 +331,7 @@ export function CanvasView({ graph, error, root, project, active, changed, onOpe
       {mapBounds && <div className="cv-map" aria-hidden="true" onClick={event => {
         const box = event.currentTarget.getBoundingClientRect(), deskBox = desk.current!
         const wx = (event.clientX - box.left - 6) / mapScale + mapBounds.minX, wy = (event.clientY - box.top - 6) / mapScale + mapBounds.minY
-        setAnimate(true)
-        setCamera(value => ({ ...value, x: deskBox.clientWidth / 2 - wx * value.k, y: deskBox.clientHeight / 2 - wy * value.k }))
+        setCamera(value => ({ ...value, x: deskBox.clientWidth / 2 - wx * value.k, y: deskBox.clientHeight / 2 - wy * value.k }), true)
       }}>
         {mapItems.map(item => <i key={item.id} className={item.id === active ? 'on' : ''} style={{ left: 6 + (item.x - mapBounds.minX) * mapScale, top: 6 + (item.y - mapBounds.minY) * mapScale, width: item.w * mapScale, height: item.h * mapScale }} />)}
         {desk.current && <span style={{ left: 6 + (-camera.x / camera.k - mapBounds.minX) * mapScale, top: 6 + (-camera.y / camera.k - mapBounds.minY) * mapScale, width: desk.current.clientWidth / camera.k * mapScale, height: desk.current.clientHeight / camera.k * mapScale }} />}

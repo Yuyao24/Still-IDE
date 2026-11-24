@@ -8,9 +8,10 @@ interface Props {
   remote: boolean
   focusKey: number
   onOpen: (path: string, line: number, column: number, length: number) => void
+  seed?: { query: string; key: number } | null
 }
 
-export function SearchPanel({ search, remote, focusKey, onOpen }: Props) {
+export function SearchPanel({ search, remote, focusKey, onOpen, seed }: Props) {
   const [query, setQuery] = useState('')
   const [options, setOptions] = useState<SearchOptions>({ regex: false, caseSensitive: false, wholeWord: false })
   const [result, setResult] = useState<SearchResult | null>(null)
@@ -21,6 +22,7 @@ export function SearchPanel({ search, remote, focusKey, onOpen }: Props) {
   const request = useRef(0)
 
   useEffect(() => { input.current?.focus(); input.current?.select() }, [focusKey])
+  useEffect(() => { if (seed?.query) { setQuery(seed.query); requestAnimationFrame(() => { input.current?.focus(); input.current?.select() }) } }, [seed?.key])
 
   useEffect(() => {
     const id = ++request.current

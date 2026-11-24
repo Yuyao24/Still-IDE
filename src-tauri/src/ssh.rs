@@ -14,7 +14,7 @@ use crate::{
     process::{command, parse_args, Jobs},
     workspace::{err, Result},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     sync::Mutex,
@@ -30,35 +30,246 @@ use tauri::{AppHandle, Manager, State};
 #[derive(Default)]
 pub struct Passwords(Mutex<HashMap<String, String>>);
 
-const ASKPASS_ENV: &str = "STILL_ASKPASS_SECRET";
+// ---- Login prompts --------------------------------------------------------------
+//
+// OpenSSH runs Still itself as its SSH_ASKPASS helper. The helper doesn't know any
+// secrets: it sends each prompt the server shows ("Password:", "Verification code:",
+// "Enter passphrase for key …") to the running app over a local socket, and prints
+// whatever comes back. The app answers a password prompt with the password typed
+// earlier this session; anything else (one-time codes, a password that was refused)
+// is shown to the person, with the server's own wording.
 
-/// When OpenSSH runs Still as its askpass helper, print the password and exit
-/// before any window is created. Returns true if this process was an askpass call.
+const PORT_ENV: &str = "STILL_ASKPASS_PORT";
+const TOKEN_ENV: &str = "STILL_ASKPASS_TOKEN";
+const ATTEMPT_ENV: &str = "STILL_ASKPASS_ATTEMPT";
+const HOST_ENV: &str = "STILL_ASKPASS_HOST";
+const LABEL_ENV: &str = "STILL_ASKPASS_LABEL";
+
+#[derive(Serialize, Deserialize)]
+struct PromptRequest {
+    token: String,
+    attempt: String,
+    host: String,
+    label: String,
+    prompt: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PromptReply {
+    answer: Option<String>,
+}
+
+/// When OpenSSH runs Still as its askpass helper, relay the prompt to the app, print the
+/// answer and exit before any window is created. Returns true if this process was an askpass call.
 pub fn askpass_mode() -> bool {
-    let Ok(secret) = std::env::var(ASKPASS_ENV) else { return false };
-    let prompt = std::env::args().nth(1).unwrap_or_default().to_lowercase();
-    // Host key questions are answered by StrictHostKeyChecking, never with the password.
-    if prompt.contains("yes/no") || prompt.contains("fingerprint") {
-        std::process::exit(1);
+    let Ok(port) = std::env::var(PORT_ENV) else { return false };
+    let prompt = std::env::args().nth(1).unwrap_or_default();
+    let request = PromptRequest {
+        token: std::env::var(TOKEN_ENV).unwrap_or_default(),
+        attempt: std::env::var(ATTEMPT_ENV).unwrap_or_default(),
+        host: std::env::var(HOST_ENV).unwrap_or_default(),
+        label: std::env::var(LABEL_ENV).unwrap_or_default(),
+        prompt,
+    };
+    let answer = (|| -> Option<String> {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port.parse::<u16>().ok()?)).ok()?;
+        let mut line = serde_json::to_string(&request).ok()?;
+        line.push('\n');
+        stream.write_all(line.as_bytes()).ok()?;
+        let mut reply = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(stream), &mut reply).ok()?;
+        serde_json::from_str::<PromptReply>(&reply).ok()?.answer
+    })();
+    match answer {
+        Some(answer) => {
+            let mut out = std::io::stdout();
+            let _ = writeln!(out, "{answer}");
+            let _ = out.flush();
+            true
+        }
+        None => std::process::exit(1),
     }
-    let mut out = std::io::stdout();
-    let _ = writeln!(out, "{secret}");
-    let _ = out.flush();
-    true
+}
+
+#[derive(Default)]
+struct Attempt {
+    /// Prompts already answered automatically with the saved password; seeing one again means it was refused.
+    answered: Vec<String>,
+    cancelled: bool,
+    asked_at: Option<Instant>,
+}
+
+#[derive(Default)]
+pub struct Prompts {
+    bridge: Mutex<Option<(u16, String)>>,
+    waiting: Mutex<HashMap<u64, std::sync::mpsc::Sender<Option<String>>>>,
+    attempts: Mutex<HashMap<String, Attempt>>,
+    next: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct PromptEvent {
+    request: u64,
+    host: String,
+    prompt: String,
+    kind: &'static str,
+    retry: bool,
+}
+
+fn random_token() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut text = String::new();
+    for salt in 0..2u64 {
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u64(salt ^ std::process::id() as u64);
+        hasher.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|time| time.as_nanos()).unwrap_or_default());
+        text.push_str(&format!("{:016x}", hasher.finish()));
+    }
+    text
+}
+
+/// Starts the local prompt relay on first use. Returns its port and the secret token.
+fn bridge(app: &AppHandle) -> Option<(u16, String)> {
+    let prompts = app.try_state::<Prompts>()?;
+    let mut bridge = prompts.bridge.lock().ok()?;
+    if let Some(found) = bridge.clone() {
+        return Some(found);
+    }
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).ok()?;
+    let port = listener.local_addr().ok()?.port();
+    let token = random_token();
+    let handle = app.clone();
+    let expected = token.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let handle = handle.clone();
+            let expected = expected.clone();
+            thread::spawn(move || answer_prompt(&handle, stream, &expected));
+        }
+    });
+    *bridge = Some((port, token.clone()));
+    Some((port, token))
+}
+
+fn answer_prompt(app: &AppHandle, stream: std::net::TcpStream, token: &str) {
+    use std::io::BufRead;
+    let Ok(mut writer) = stream.try_clone() else { return };
+    let mut line = String::new();
+    if std::io::BufReader::new(stream).read_line(&mut line).is_err() {
+        return;
+    }
+    let reply = |writer: &mut std::net::TcpStream, answer: Option<String>| {
+        let text = serde_json::to_string(&PromptReply { answer }).unwrap_or_else(|_| "{}".into());
+        let _ = writer.write_all(format!("{text}\n").as_bytes());
+    };
+    let Ok(request) = serde_json::from_str::<PromptRequest>(&line) else { return reply(&mut writer, None) };
+    let Some(prompts) = app.try_state::<Prompts>() else { return reply(&mut writer, None) };
+    if request.token != token {
+        return reply(&mut writer, None);
+    }
+    let text = request.prompt.trim().to_owned();
+    let lower = text.to_lowercase();
+    // New host keys are accepted by StrictHostKeyChecking=accept-new; a *changed* key must be
+    // looked at in a terminal, never waved through from a dialog.
+    if lower.contains("yes/no") || lower.contains("fingerprint") {
+        return reply(&mut writer, None);
+    }
+    let one_time = ["verification", "code", "otp", "token", "passcode", "authenticator", "2fa", "duo", "pin"].iter().any(|word| lower.contains(word));
+    let secret_kind = if one_time { "code" } else if lower.contains("passphrase") { "passphrase" } else if lower.contains("password") { "password" } else { "other" };
+    let retry;
+    {
+        let Ok(mut attempts) = prompts.attempts.lock() else { return reply(&mut writer, None) };
+        let attempt = attempts.entry(request.attempt.clone()).or_default();
+        if attempt.cancelled {
+            return reply(&mut writer, None);
+        }
+        // A password prompt straight after itself means the password was refused. After a code
+        // prompt, the server is just starting over (the code was wrong), so the password is fine.
+        retry = if secret_kind == "password" { attempt.answered.last() == Some(&text) } else { attempt.answered.contains(&text) };
+        if secret_kind == "password" && !retry {
+            if let Some(saved) = password_for(app, &request.host) {
+                attempt.answered.push(text.clone());
+                return reply(&mut writer, Some(saved));
+            }
+        }
+        attempt.asked_at = Some(Instant::now());
+    }
+    // Ask the person and wait for their answer.
+    let id = prompts.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    if let Ok(mut waiting) = prompts.waiting.lock() {
+        waiting.insert(id, sender);
+    }
+    let _ = tauri::Emitter::emit(app, "ssh-prompt", PromptEvent { request: id, host: request.label.clone(), prompt: text.clone(), kind: secret_kind, retry });
+    let answer = receiver.recv_timeout(Duration::from_secs(300)).ok().flatten();
+    if let Ok(mut waiting) = prompts.waiting.lock() {
+        waiting.remove(&id);
+    }
+    if let Ok(mut attempts) = prompts.attempts.lock() {
+        let attempt = attempts.entry(request.attempt.clone()).or_default();
+        attempt.asked_at = Some(Instant::now());
+        match &answer {
+            None => attempt.cancelled = true,
+            Some(_) if secret_kind != "password" => attempt.answered.push(text.clone()),
+            Some(value) => {
+                attempt.answered.push(text.clone());
+                if let Some(passwords) = app.try_state::<Passwords>() {
+                    if let Ok(mut map) = passwords.0.lock() {
+                        map.insert(request.host.clone(), value.clone());
+                    }
+                }
+            }
+        }
+    }
+    reply(&mut writer, answer)
+}
+
+/// The person answered (or cancelled) a login prompt.
+#[tauri::command]
+pub fn ssh_prompt_answer(app: AppHandle, request: u64, answer: Option<String>) -> Result<()> {
+    let prompts = app.state::<Prompts>();
+    if let Some(sender) = prompts.waiting.lock().map_err(err)?.remove(&request) {
+        let _ = sender.send(answer);
+    }
+    Ok(())
 }
 
 fn password_for(app: &AppHandle, id: &str) -> Option<String> {
     app.try_state::<Passwords>()?.0.lock().ok()?.get(id).cloned()
 }
 
-/// Let `cmd` answer password prompts with `password`, without a terminal.
-fn use_password(cmd: &mut Command, password: &str) {
-    if let Ok(exe) = std::env::current_exe() {
-        cmd.env("SSH_ASKPASS", exe).env("SSH_ASKPASS_REQUIRE", "force").env(ASKPASS_ENV, password);
-        if std::env::var_os("DISPLAY").is_none() {
-            cmd.env("DISPLAY", "still:0");
-        }
+/// Route `cmd`'s login prompts through the app. Returns the attempt id, to check afterwards
+/// whether the person cancelled or is still typing.
+fn use_prompts(app: &AppHandle, cmd: &mut Command, host: &SshHost) -> Option<String> {
+    let (port, token) = bridge(app)?;
+    let exe = std::env::current_exe().ok()?;
+    let attempt = random_token();
+    cmd.env("SSH_ASKPASS", exe)
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        .env(PORT_ENV, port.to_string())
+        .env(TOKEN_ENV, token)
+        .env(ATTEMPT_ENV, &attempt)
+        .env(HOST_ENV, &host.id)
+        .env(LABEL_ENV, &host.name);
+    if std::env::var_os("DISPLAY").is_none() {
+        cmd.env("DISPLAY", "still:0");
     }
+    Some(attempt)
+}
+
+/// True while someone is answering a prompt for this attempt (or did so in the last few minutes).
+fn prompting(app: &AppHandle, attempt: &Option<String>) -> bool {
+    let Some(attempt) = attempt else { return false };
+    let Some(prompts) = app.try_state::<Prompts>() else { return false };
+    let Ok(attempts) = prompts.attempts.lock() else { return false };
+    attempts.get(attempt).and_then(|item| item.asked_at).is_some_and(|time| time.elapsed() < Duration::from_secs(300))
+        || prompts.waiting.lock().map(|waiting| !waiting.is_empty()).unwrap_or(false)
+}
+
+fn cancelled(app: &AppHandle, attempt: &Option<String>) -> bool {
+    let Some(attempt) = attempt else { return false };
+    app.try_state::<Prompts>().and_then(|prompts| prompts.attempts.lock().ok().map(|attempts| attempts.get(attempt).is_some_and(|item| item.cancelled))).unwrap_or(false)
 }
 
 #[tauri::command]
@@ -200,7 +411,6 @@ fn control_dir(app: &AppHandle) -> Option<PathBuf> {
 fn base_args(app: &AppHandle, host: &SshHost, batch: bool) -> Result<Vec<String>> {
     validate(host)?;
     let mut args = Vec::new();
-    let password = batch && password_for(app, &host.id).is_some();
     if let Some(dir) = control_dir(app) {
         args.extend([
             "-o".into(),
@@ -213,11 +423,10 @@ fn base_args(app: &AppHandle, host: &SshHost, batch: bool) -> Result<Vec<String>
     }
     // Keep idle connections alive through routers and firewalls, and notice dead ones quickly.
     args.extend(["-o".into(), "ServerAliveInterval=15".into(), "-o".into(), "ServerAliveCountMax=4".into(), "-o".into(), "TCPKeepAlive=yes".into()]);
-    if password {
-        // The password is answered by askpass; new host keys are trusted on first use, as a terminal would ask.
-        args.extend(["-o".into(), "NumberOfPasswordPrompts=1".into(), "-o".into(), "StrictHostKeyChecking=accept-new".into(), "-o".into(), "ConnectTimeout=12".into()]);
-    } else if batch {
-        args.extend(["-o".into(), "BatchMode=yes".into(), "-o".into(), "ConnectTimeout=12".into()]);
+    if batch {
+        // No terminal here: login prompts go through Still (see Prompts above). New host keys are
+        // trusted on first use, as a terminal would ask; a changed key is refused.
+        args.extend(["-o".into(), "NumberOfPasswordPrompts=3".into(), "-o".into(), "StrictHostKeyChecking=accept-new".into(), "-o".into(), "ConnectTimeout=12".into()]);
     }
     if host.source != "config" {
         if let Some(port) = host.port {
@@ -273,8 +482,7 @@ fn friendly(stderr: &str) -> String {
     if stderr.contains("Host key verification failed") {
         "Confirm this server's host key first: open a terminal to it once, then try again.".into()
     } else if stderr.contains("Permission denied") {
-        // The front end recognises this prefix and asks for the password.
-        "PASSWORD: The server asked for a password.".into()
+        "The server didn't accept the login. Check the user name and password (or key), then try again.".into()
     } else if stderr.contains("Could not resolve hostname") {
         "Could not find that server. Check the host name.".into()
     } else if stderr.contains("Connection refused") || stderr.contains("timed out") {
@@ -324,9 +532,7 @@ fn worker_slot(app: &AppHandle, id: &str) -> Option<std::sync::Arc<Mutex<Option<
 fn start_worker(app: &AppHandle, host: &SshHost) -> Result<Worker> {
     let mut cmd: Command = command(program(), &std::env::temp_dir());
     cmd.args(base_args(app, host, true)?).arg("-T").arg("--").arg(destination(host)).arg(format!("sh -c {}", quote(WORKER_LOOP)));
-    if let Some(password) = password_for(app, &host.id) {
-        use_password(&mut cmd, &password);
-    }
+    let attempt = use_prompts(app, &mut cmd, host);
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|error| match error.kind() {
         std::io::ErrorKind::NotFound => "The ssh command was not found. Install OpenSSH and try again.".to_string(),
@@ -358,20 +564,32 @@ fn start_worker(app: &AppHandle, host: &SshHost) -> Result<Worker> {
             }
         }
     });
-    match replies.recv_timeout(Duration::from_secs(30)) {
-        Ok(line) if line == "STILL READY" => Ok(Worker { child, stdin, replies, next: 1 }),
-        _ => {
-            let _ = child.kill();
-            let _ = child.wait();
-            let stderr = errors.lock().map(|text| text.clone()).unwrap_or_default();
-            if password_for(app, &host.id).is_some() && stderr.contains("Permission denied") {
-                Err("PASSWORD: That password didn't work.".into())
-            } else if stderr.trim().is_empty() {
-                Err("WORKER: no reply".into())
-            } else {
-                Err(friendly(&stderr))
+    // Wait for the shell loop to start. While someone is typing a password or code, keep waiting.
+    let started = Instant::now();
+    let ready = loop {
+        match replies.recv_timeout(Duration::from_millis(400)) {
+            Ok(line) if line == "STILL READY" => break true,
+            Ok(_) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break false,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if matches!(child.try_wait(), Ok(Some(_))) || (started.elapsed() > Duration::from_secs(30) && !prompting(app, &attempt)) || started.elapsed() > Duration::from_secs(330) {
+                    break false;
+                }
             }
         }
+    };
+    if ready {
+        return Ok(Worker { child, stdin, replies, next: 1 });
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let stderr = errors.lock().map(|text| text.clone()).unwrap_or_default();
+    if cancelled(app, &attempt) {
+        Err("LOGIN: Login cancelled.".into())
+    } else if stderr.trim().is_empty() {
+        Err("WORKER: no reply".into())
+    } else {
+        Err(format!("LOGIN: {}", friendly(&stderr)))
     }
 }
 
@@ -412,7 +630,8 @@ fn exec(app: &AppHandle, host: &SshHost, script: &str, input: Option<Vec<u8>>, t
             if guard.is_none() {
                 match start_worker(app, host) {
                     Ok(worker) => *guard = Some(worker),
-                    Err(message) if message.starts_with("PASSWORD:") => return Err(message),
+                    // A refused or cancelled login: don't try again behind the person's back.
+                    Err(message) if message.starts_with("LOGIN: ") => return Err(message["LOGIN: ".len()..].to_owned()),
                     Err(message) if message.starts_with("WORKER:") => break,
                     Err(message) if attempt == 1 => return Err(message),
                     Err(_) => continue,
@@ -453,10 +672,7 @@ pub fn drop_worker(app: &AppHandle, id: &str) {
 fn exec_once(app: &AppHandle, host: &SshHost, script: &str, input: Option<Vec<u8>>, timeout: u64) -> Result<Vec<u8>> {
     let mut cmd: Command = command(program(), &std::env::temp_dir());
     cmd.args(base_args(app, host, true)?).arg("--").arg(destination(host)).arg(script);
-    let password = password_for(app, &host.id);
-    if let Some(password) = &password {
-        use_password(&mut cmd, password);
-    }
+    let attempt = use_prompts(app, &mut cmd, host);
     cmd.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|error| match error.kind() {
         std::io::ErrorKind::NotFound => "The ssh command was not found. Install OpenSSH and try again.".to_string(),
@@ -484,7 +700,7 @@ fn exec_once(app: &AppHandle, host: &SshHost, script: &str, input: Option<Vec<u8
         if let Some(status) = child.try_wait().map_err(err)? {
             break status;
         }
-        if Instant::now() > deadline {
+        if Instant::now() > deadline && !prompting(app, &attempt) {
             let _ = child.kill();
             let _ = child.wait();
             return Err("The server took too long to answer.".into());
@@ -495,7 +711,7 @@ fn exec_once(app: &AppHandle, host: &SshHost, script: &str, input: Option<Vec<u8
     let stderr = errors.join().unwrap_or_default();
     match status.code() {
         Some(0) => Ok(bytes),
-        Some(255) if password.is_some() && stderr.contains("Permission denied") => Err("PASSWORD: That password didn't work.".into()),
+        Some(255) if cancelled(app, &attempt) => Err("Login cancelled.".into()),
         Some(255) => Err(friendly(&stderr)),
         _ => Err(stderr.lines().rfind(|line| !line.trim().is_empty()).unwrap_or("The remote command failed.").trim().to_owned()),
     }
@@ -837,14 +1053,12 @@ pub fn ssh_run(
     let quoted_args: String = args.iter().map(|arg| format!(" {}", quote(arg))).collect();
     ssh_args.push(format!("cd -- {} && {runner} {}{quoted_args}", quote(&root), quote(&full)));
     let label = format!("$ ssh {} {runner} {path}{}\n", host.name, quoted_args);
-    let password = password_for(&app, &host.id);
+    let prompts_app = app.clone();
     jobs.start(app, id, true, move |job| {
         job.emit("command", label);
         let mut cmd = command(program(), &std::env::temp_dir());
         cmd.args(&ssh_args);
-        if let Some(password) = &password {
-            use_password(&mut cmd, password);
-        }
+        use_prompts(&prompts_app, &mut cmd, &host);
         let (code, _) = job.run(&mut cmd, false)?;
         Ok((code, Vec::new()))
     })

@@ -17,6 +17,8 @@
     "dialog:allow-save",
     "updater:default",
     "process:allow-restart",
+    "clipboard-manager:allow-read-text",
+    "clipboard-manager:allow-write-text",
     {
       "identifier": "http:default",
       "allow": [

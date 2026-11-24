@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useState } from 'react'
+import { invoke, isTauri } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
 import { CircleAlert, X } from 'lucide-react'
-import { type SshHost, type Workspace, nameHost, setPasswordPrompt, ssh } from './bridge'
+import { type SshHost, type Workspace, home, nameHost, setPasswordPrompt, ssh } from './bridge'
 import Home, { type OpenOptions } from './Home'
 import Ide from './Ide'
 import SettingsView, { type SettingsSection } from './SettingsView'
-import { PasswordDialog } from './Remote'
+import { LoginPrompt, PasswordDialog } from './Remote'
 import { type Update, findUpdate, installUpdate } from './updates'
 import { type Settings, SettingsContext, activeTheme, applySettings, cachedSettings, loadSettings, saveSettings } from './settings'
 import { findTheme } from './themes'
@@ -36,6 +38,13 @@ export default function App() {
     return () => removeEventListener('still-update', manual)
   }, [])
   const [asking, setAsking] = useState<{ host: string; retry: boolean; answer: (value: string | null) => void } | null>(null)
+  // Sign-in questions from SSH (password, key passphrase, verification code), one at a time.
+  const [logins, setLogins] = useState<{ request: number; host: string; prompt: string; kind: string; retry: boolean }[]>([])
+  useEffect(() => {
+    if (!isTauri()) return
+    const stop = listen<{ request: number; host: string; prompt: string; kind: string; retry: boolean }>('ssh-prompt', ({ payload }) => setLogins(previous => [...previous, payload]))
+    return () => { void stop.then(unlisten => unlisten()) }
+  }, [])
   useEffect(() => {
     setPasswordPrompt((host, retry) => new Promise(answer => setAsking({ host, retry, answer })))
     return () => setPasswordPrompt(null)
@@ -43,7 +52,18 @@ export default function App() {
   const theme = useMemo(() => activeTheme(settings, systemDark), [settings, systemDark])
 
   useLayoutEffect(() => { applySettings(settings, systemDark) }, [settings, systemDark])
-  useEffect(() => { void loadSettings().then(loaded => { setSettings(loaded); saveSettings(loaded) }) }, [])
+  useEffect(() => {
+    void loadSettings().then(async loaded => {
+      setSettings(loaded); saveSettings(loaded)
+      // Optionally pick up where you left off: the most recently opened local project.
+      if (!loaded.openLastProject || !isTauri()) return
+      try {
+        const state = await home.state()
+        const last = state.projects.filter(project => !project.missing && project.lastOpened).sort((a, b) => (b.lastOpened ?? 0) - (a.lastOpened ?? 0))[0]
+        if (last) { const workspace = await home.open(last.path); setView(view => view.kind === 'home' ? { kind: 'workspace', workspace } : view) }
+      } catch { /* stay on Home */ }
+    })
+  }, [])
   useEffect(() => {
     const query = darkQuery()
     const change = (event: MediaQueryListEvent) => setSystemDark(event.matches)
@@ -116,6 +136,8 @@ export default function App() {
           onHome={() => setView({ kind: 'home' })} onSwitch={workspace => setView({ kind: 'workspace', workspace })}
           onSettings={openSettings} onToggleTheme={toggleTheme} notify={notify} />}
     {settingsSection && <SettingsView section={settingsSection} onSection={setSettingsSection} onClose={() => setSettingsSection(null)} notify={notify} />}
+    {logins[0] && <LoginPrompt key={logins[0].request} host={logins[0].host} prompt={logins[0].prompt} kind={logins[0].kind} retry={logins[0].retry}
+      onAnswer={answer => { const request = logins[0].request; setLogins(previous => previous.slice(1)); void invoke('ssh_prompt_answer', { request, answer }).catch(() => {}) }} />}
     {asking && <PasswordDialog host={asking.host} retry={asking.retry} onAnswer={value => { asking.answer(value); setAsking(null) }} />}
     {pending && <div className="update-bar" role="status">
       <span>{installing === null ? <>Still {pending.version} is ready.</> : <>Downloading Still {pending.version}… {Math.round(installing * 100)}%</>}</span>

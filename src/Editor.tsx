@@ -1,14 +1,14 @@
-import { type Extension, Compartment, EditorState, Prec } from '@codemirror/state'
-import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands'
+import { type Extension, Compartment, EditorSelection, EditorState, Prec, RangeSet, RangeSetBuilder, StateEffect, StateField, Text } from '@codemirror/state'
+import { cursorDocEnd, defaultKeymap, history, historyKeymap, indentWithTab, redo, selectAll, toggleComment, undo } from '@codemirror/commands'
 import {
-  EditorView, crosshairCursor, drawSelection, dropCursor, highlightActiveLine, highlightActiveLineGutter,
-  highlightSpecialChars, keymap, lineNumbers, rectangularSelection,
+  Decoration, type DecorationSet, EditorView, GutterMarker, ViewPlugin, type ViewUpdate, crosshairCursor, drawSelection, dropCursor, gutter, highlightActiveLine, highlightActiveLineGutter,
+  highlightSpecialChars, highlightTrailingWhitespace, highlightWhitespace, keymap, lineNumbers, rectangularSelection, scrollPastEnd,
 } from '@codemirror/view'
-import { HighlightStyle, Language, LanguageSupport, StreamLanguage, bracketMatching, ensureSyntaxTree, foldGutter, foldKeymap, indentOnInput, indentUnit, syntaxHighlighting, syntaxTree } from '@codemirror/language'
-import { highlightSelectionMatches, openSearchPanel, searchKeymap } from '@codemirror/search'
+import { HighlightStyle, Language, LanguageSupport, StreamLanguage, bracketMatching, ensureSyntaxTree, foldAll, foldGutter, foldKeymap, getIndentUnit, indentOnInput, indentUnit, syntaxHighlighting, syntaxTree, unfoldAll } from '@codemirror/language'
+import { gotoLine, highlightSelectionMatches, openSearchPanel, searchKeymap, selectNextOccurrence, selectSelectionMatches } from '@codemirror/search'
 import { acceptCompletion, autocompletion, closeBrackets, closeBracketsKeymap, closeCompletion, moveCompletionSelection, startCompletion } from '@codemirror/autocomplete'
-import { lintGutter, lintKeymap, setDiagnostics, type Diagnostic as EditorDiagnostic } from '@codemirror/lint'
-import { MergeView, unifiedMergeView } from '@codemirror/merge'
+import { forceLinting, lintGutter, lintKeymap, linter, type Diagnostic as EditorDiagnostic } from '@codemirror/lint'
+import { Chunk, MergeView, unifiedMergeView } from '@codemirror/merge'
 import { highlightCode, highlightTree, tagHighlighter, tags } from '@lezer/highlight'
 import { python } from '@codemirror/lang-python'
 import { java } from '@codemirror/lang-java'
@@ -32,7 +32,7 @@ import { groovy } from '@codemirror/legacy-modes/mode/groovy'
 import { dockerFile } from '@codemirror/legacy-modes/mode/dockerfile'
 import { properties } from '@codemirror/legacy-modes/mode/properties'
 import { useEffect, useLayoutEffect, useRef } from 'react'
-import { type Diagnostic, type Diff, normalize } from './bridge'
+import { type Diagnostic, type Diff, clipboard, normalize } from './bridge'
 
 const look = EditorView.theme({
   '&': { backgroundColor: 'var(--editor)', color: 'var(--ink)', fontSize: 'var(--editor-font-size)', height: '100%' },
@@ -43,11 +43,36 @@ const look = EditorView.theme({
   '.cm-gutters': { backgroundColor: 'var(--editor)', color: 'var(--muted)', borderRight: '0', fontSize: 'calc(var(--editor-font-size) - 2px)' },
   '.cm-lineNumbers .cm-gutterElement': { padding: '0 8px 0 22px', minWidth: '46px', opacity: '.75' },
   '.cm-foldGutter .cm-gutterElement': { padding: '0 3px', color: 'var(--muted)', cursor: 'pointer' },
-  '.cm-activeLine, .cm-activeLineGutter': { backgroundColor: 'var(--current-line)' },
-  '.cm-activeLineGutter': { color: 'var(--ink)' },
-  '.cm-cursor, .cm-dropCursor': { borderLeftColor: 'var(--ink)', borderLeftWidth: '2px' },
-  '&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground, .cm-selectionBackground, ::selection': { background: 'var(--selection) !important' },
-  '.cm-selectionMatch': { background: 'var(--accent-fill)' },
+  // See-through so a selection on the current line still shows underneath.
+  '.cm-activeLine': { backgroundColor: 'color-mix(in srgb, var(--ink) 3.5%, transparent)' },
+  '.cm-activeLineGutter': { backgroundColor: 'var(--current-line)', color: 'var(--ink)' },
+  '.cm-cursor, .cm-dropCursor': { borderLeftColor: 'var(--caret, var(--ink))', borderLeftWidth: '2px' },
+  '&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground, .cm-selectionBackground, .cm-content ::selection': { background: 'var(--text-selection) !important' },
+  '.cm-selectionLayer .cm-selectionBackground': { opacity: '.75' },
+  '&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground': { opacity: '1' },
+  '.cm-selectionMatch': { background: 'var(--occurrence)', borderRadius: '0' },
+  '.cm-selectionMatch-main': { background: 'var(--occurrence)', outline: '1px solid var(--occurrence-border)' },
+  '.cm-lintRange-error': { backgroundImage: 'none', textDecoration: 'underline wavy var(--red)', textDecorationSkipInk: 'none', textUnderlineOffset: '3px', textDecorationThickness: '1px' },
+  '.cm-lintRange-warning': { backgroundImage: 'none', textDecoration: 'underline wavy var(--amber)', textDecorationSkipInk: 'none', textUnderlineOffset: '3px', textDecorationThickness: '1px' },
+  '.cm-lintRange-info': { backgroundImage: 'none', textDecoration: 'underline dotted var(--muted)', textUnderlineOffset: '3px' },
+  '.cm-tooltip.cm-tooltip-lint': { border: '1px solid var(--line)', boxShadow: '0 6px 20px var(--shadow)', fontFamily: 'var(--font-ui)', fontSize: '12px' },
+  '.cm-diagnostic': { padding: '6px 10px', borderLeft: '2px solid var(--line)' },
+  '.cm-diagnostic-error': { borderLeftColor: 'var(--red)' },
+  '.cm-diagnostic-warning': { borderLeftColor: 'var(--amber)' },
+  '.cm-diagnosticSource': { color: 'var(--muted)', opacity: '1' },
+  '.cm-lint-marker': { width: '7px', height: '7px', borderRadius: '0', content: 'none' },
+  '.cm-lint-marker-error': { content: 'none', background: 'var(--red)' },
+  '.cm-lint-marker-warning': { content: 'none', background: 'var(--amber)' },
+  '.cm-gutter-changes': { width: '3px', marginLeft: '4px' },
+  '.cm-gutter-changes .cm-gutterElement': { padding: '0' },
+  '.cm-change': { width: '3px', height: '100%' },
+  '.cm-change-add': { background: 'var(--green)' },
+  '.cm-change-mod': { background: 'var(--amber)' },
+  '.cm-change-del': { width: '0', height: '0', borderTop: '4px solid transparent', borderBottom: '4px solid transparent', borderLeft: '5px solid var(--red)', marginTop: '-4px' },
+  '.cm-indent-guide': { boxShadow: 'inset 1px 0 0 var(--indent-guide)' },
+  '.cm-highlightSpace': { backgroundImage: 'radial-gradient(circle at 50% 55%, var(--muted) 12%, transparent 13%)', opacity: '.5' },
+  '.cm-highlightTab': { opacity: '.5' },
+  '.cm-trailingSpace': { backgroundColor: 'color-mix(in srgb, var(--red) 18%, transparent)' },
   '&.cm-focused .cm-matchingBracket': { background: 'var(--accent-fill)', outline: '1px solid var(--accent-border)' },
   '.cm-panels, .cm-tooltip': { background: 'var(--panel)', color: 'var(--ink)', borderColor: 'var(--line)' },
   '.cm-panels.cm-panels-top': { borderBottom: '1px solid var(--line)' },
@@ -129,7 +154,11 @@ function mode(path: string) {
 export const language = (path: string) => mode(path)?.name ?? 'Plain Text'
 export const defaultIndent = (path: string) => mode(path)?.indent ?? 2
 
-export interface EditorOptions { wrap: boolean; lineNumbers: boolean; highlightLine: boolean; tabSize: number; layout: 'inline' | 'split'; autocomplete: boolean }
+export interface EditorOptions {
+  wrap: boolean; lineNumbers: boolean; highlightLine: boolean; tabSize: number; layout: 'inline' | 'split'; autocomplete: boolean
+  occurrences?: boolean; whitespace?: 'none' | 'trailing' | 'all'; indentGuides?: boolean; closeBrackets?: boolean; scrollPastEnd?: boolean
+  errors?: boolean; changes?: boolean; cursorBlink?: boolean; folding?: boolean
+}
 
 // Suggestions are accepted with Tab, never Enter, so Enter always makes a new line.
 const completionKeys = Prec.highest(keymap.of([
@@ -152,17 +181,165 @@ function configure(options: EditorOptions, path: string): Extension {
     autocompletion({ activateOnTyping: options.autocomplete, defaultKeymap: false, icons: false }),
     EditorState.tabSize.of(options.tabSize),
     indentUnit.of(' '.repeat(options.tabSize)),
+    // Other uses of the word under the caret (or of the selected text) are marked.
+    options.occurrences !== false ? highlightSelectionMatches({ highlightWordAroundCursor: true, minSelectionLength: 2 }) : highlightSelectionMatches(),
+    options.whitespace === 'all' ? highlightWhitespace() : options.whitespace === 'trailing' ? highlightTrailingWhitespace() : [],
+    options.indentGuides !== false ? indentGuides : [],
+    options.closeBrackets !== false ? [closeBrackets(), keymap.of(closeBracketsKeymap)] : [],
+    options.scrollPastEnd ? scrollPastEnd() : [],
+    options.folding !== false ? foldGutter({ markerDOM: open => { const marker = document.createElement('span'); marker.className = 'cm-fold-marker' + (open ? ' open' : ''); return marker } }) : [],
+    drawSelection({ cursorBlinkRate: options.cursorBlink === false ? 0 : 1100 }),
     mode(path)?.load() ?? [],
   ]
 }
 
+/** Thin vertical lines at each indentation level, like other editors. */
+const indentGuides = ViewPlugin.fromClass(class {
+  decorations: DecorationSet
+  constructor(view: EditorView) { this.decorations = this.build(view) }
+  update(update: ViewUpdate) { if (update.docChanged || update.viewportChanged) this.decorations = this.build(update.view) }
+  build(view: EditorView) {
+    const builder = new RangeSetBuilder<Decoration>()
+    const unit = Math.max(1, getIndentUnit(view.state))
+    const guide = Decoration.mark({ class: 'cm-indent-guide' })
+    for (const { from, to } of view.visibleRanges) {
+      for (let position = from; position <= to;) {
+        const line = view.state.doc.lineAt(position)
+        let column = 0
+        for (let index = 0; index < line.length; index++) {
+          const char = line.text.charCodeAt(index)
+          if (char === 9) { if (column > 0) builder.add(line.from + index, line.from + index + 1, guide); column += unit - (column % unit) }
+          else if (char === 32) { if (column > 0 && column % unit === 0) builder.add(line.from + index, line.from + index + 1, guide); column++ }
+          else break
+        }
+        position = line.to + 1
+      }
+    }
+    return builder.finish()
+  }
+}, { decorations: plugin => plugin.decorations })
+
+// ---- Change markers: lines added, changed or removed since the last commit ----
+const setBase = StateEffect.define<string | null>()
+const setChanges = StateEffect.define<RangeSet<GutterMarker>>()
+class ChangeMarker extends GutterMarker {
+  constructor(readonly kind: 'add' | 'mod' | 'del') { super() }
+  eq(other: ChangeMarker) { return other.kind === this.kind }
+  toDOM() { const node = document.createElement('div'); node.className = 'cm-change cm-change-' + this.kind; node.title = this.kind === 'add' ? 'Added since the last commit' : this.kind === 'mod' ? 'Changed since the last commit' : 'Lines removed here since the last commit'; return node }
+}
+const changeMarker = { add: new ChangeMarker('add'), mod: new ChangeMarker('mod'), del: new ChangeMarker('del') }
+const baseText = StateField.define<Text | null>({
+  create: () => null,
+  update(value, transaction) {
+    for (const effect of transaction.effects) if (effect.is(setBase)) return effect.value === null ? null : Text.of(effect.value.split('\n'))
+    return value
+  },
+})
+const changeMarks = StateField.define<RangeSet<GutterMarker>>({
+  create: () => RangeSet.empty,
+  update(value, transaction) {
+    for (const effect of transaction.effects) if (effect.is(setChanges)) return effect.value
+    if (transaction.effects.some(effect => effect.is(setBase)) && !transaction.state.field(baseText)) return RangeSet.empty
+    return transaction.docChanged ? value.map(transaction.changes) : value
+  },
+})
+function computeChanges(doc: Text, base: Text): RangeSet<GutterMarker> {
+  const builder = new RangeSetBuilder<GutterMarker>()
+  if (doc.length > 2_000_000 || base.length > 2_000_000) return builder.finish()
+  for (const chunk of Chunk.build(base, doc, { scanLimit: 2000, timeout: 120 })) {
+    if (chunk.fromB === chunk.toB) {
+      const line = doc.lineAt(Math.min(chunk.fromB, doc.length))
+      builder.add(line.from, line.from, changeMarker.del)
+      continue
+    }
+    // Ranges in this document that were typed in (insertions) or otherwise changed.
+    const inserted = chunk.changes.filter(change => change.fromA === change.toA).map(change => [chunk.fromB + change.fromB, chunk.fromB + change.toB] as const)
+    const changed = chunk.changes.map(change => [chunk.fromB + change.fromB, chunk.fromB + change.toB] as const)
+    const within = (position: number) => inserted.some(([from, to]) => position >= from && position < to)
+    const first = doc.lineAt(chunk.fromB).number, last = doc.lineAt(Math.max(chunk.fromB, Math.min(doc.length, chunk.toB - 1))).number
+    for (let number = first; number <= last; number++) {
+      const line = doc.line(number)
+      // A whole new line: its text and the line break before it were all inserted.
+      const added = line.from > 0 && within(line.from - 1) && (line.length === 0 || (within(line.from) && within(line.to - 1)))
+      const touched = changed.some(([from, to]) => from === to
+        ? from >= line.from && from <= line.to
+        : (from < line.to && to > line.from) || (from === line.to && doc.sliceString(from, from + 1) !== '\n') || (line.length === 0 && from === line.from && doc.sliceString(from, from + 1) !== '\n'))
+      if (added) builder.add(line.from, line.from, changeMarker.add)
+      else if (touched) builder.add(line.from, line.from, changeMarker.mod)
+    }
+  }
+  return builder.finish()
+}
+const changeTracker = ViewPlugin.fromClass(class {
+  timer: ReturnType<typeof setTimeout> | undefined
+  constructor(readonly view: EditorView) { this.schedule(0) }
+  update(update: ViewUpdate) {
+    if (update.docChanged || update.transactions.some(transaction => transaction.effects.some(effect => effect.is(setBase)))) this.schedule(220)
+  }
+  schedule(delay: number) {
+    clearTimeout(this.timer)
+    this.timer = setTimeout(() => {
+      const base = this.view.state.field(baseText, false)
+      if (!base) return
+      this.view.dispatch({ effects: setChanges.of(computeChanges(this.view.state.doc, base)) })
+    }, delay)
+  }
+  destroy() { clearTimeout(this.timer) }
+})
+const changeGutter = [baseText, changeMarks, changeTracker, gutter({ class: 'cm-gutter-changes', markers: view => view.state.field(changeMarks, false) ?? RangeSet.empty })]
+
+/** Lezer marks code it can't parse with error nodes; show them as syntax errors. */
+function syntaxErrors(state: EditorState): EditorDiagnostic[] {
+  const tree = ensureSyntaxTree(state, state.doc.length, 300) ?? syntaxTree(state)
+  const found: EditorDiagnostic[] = []
+  tree.iterate({
+    enter: node => {
+      if (found.length >= 60) return false
+      if (!node.type.isError) return
+      const from = node.from, to = Math.min(state.doc.length, Math.max(node.to, from + 1))
+      const previous = found.at(-1)
+      if (previous && from <= previous.to + 1) { previous.to = Math.max(previous.to, to); return }
+      found.push({ from, to: Math.min(to, state.doc.lineAt(from).to) > from ? Math.min(to, state.doc.lineAt(from).to) : to, severity: 'error', message: 'Syntax error', source: 'parser' })
+    },
+  })
+  return found
+}
+
 function setup(): Extension {
   return [
-    highlightSpecialChars(), history(), foldGutter(), drawSelection(), dropCursor(), EditorState.allowMultipleSelections.of(true),
-    indentOnInput(), syntaxHighlighting(syntax), bracketMatching(), closeBrackets(), completionKeys, rectangularSelection(),
-    crosshairCursor(), highlightSelectionMatches(), look,
-    keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...searchKeymap, ...historyKeymap, ...foldKeymap, ...lintKeymap, indentWithTab]),
+    highlightSpecialChars(), history(), dropCursor(), EditorState.allowMultipleSelections.of(true),
+    indentOnInput(), syntaxHighlighting(syntax), bracketMatching(), completionKeys, rectangularSelection(),
+    crosshairCursor(), look,
+    keymap.of([
+      { key: 'F2', run: renameOccurrences },
+      { key: 'F12', run: view => { const handler = definitionHandlers.get(view); if (!handler) return false; handler(); return true } },
+      ...defaultKeymap.filter(binding => binding.key !== 'Mod-Shift-k' && binding.key !== 'Mod-Enter'),
+      { key: 'Mod-Shift-d', run: duplicateLine },
+      ...searchKeymap, ...historyKeymap, ...foldKeymap, ...lintKeymap, indentWithTab,
+    ]),
   ]
+}
+
+const definitionHandlers = new WeakMap<EditorView, () => void>()
+
+/** Selects every use of the word under the caret, so typing renames them all in this file. */
+export function renameOccurrences(view: EditorView) {
+  const range = view.state.selection.main
+  if (range.empty) {
+    const word = view.state.wordAt(range.head)
+    if (!word) return false
+    view.dispatch({ selection: EditorSelection.single(word.from, word.to) })
+  }
+  return selectSelectionMatches(view)
+}
+
+function duplicateLine(view: EditorView) {
+  const changes = view.state.selection.ranges.map(range => {
+    const line = view.state.doc.lineAt(range.head)
+    return { from: line.to, insert: '\n' + line.text }
+  })
+  view.dispatch({ changes, scrollIntoView: true, userEvent: 'input.copyline' })
+  return true
 }
 
 const onCursor = (view: EditorView) => {
@@ -193,8 +370,12 @@ const tokenNames = tagHighlighter([
 
 /** The selected lines (whole lines) split into coloured tokens, or null when nothing is selected. */
 export function captureSelection(state: EditorState, path: string): CodeCapture | null {
-  const selection = state.selection.main
-  if (selection.empty) return null
+  let selection = state.selection.main
+  if (selection.empty) {
+    // Nothing selected: the whole file, if it fits on one image.
+    if (state.doc.lines > 150) return null
+    selection = EditorSelection.range(0, state.doc.length)
+  }
   const first = state.doc.lineAt(selection.from)
   let last = state.doc.lineAt(selection.to)
   if (selection.to === last.from && last.number > first.number) last = state.doc.line(last.number - 1)
@@ -221,7 +402,15 @@ export function captureSelection(state: EditorState, path: string): CodeCapture 
   return { path, startLine: first.number, lines }
 }
 
-export interface EditorHandle { focus: () => void; find: () => void; reveal: () => void; selection: () => string; jump: (line: number, column?: number, length?: number) => void; capture: () => CodeCapture | null }
+export type EditorCommand = 'undo' | 'redo' | 'selectAll' | 'comment' | 'foldAll' | 'unfoldAll' | 'rename' | 'gotoLine' | 'selectNext' | 'find' | 'cut' | 'copy' | 'end'
+export interface CodeIssue { line: number; column: number; endLine?: number | null; endColumn?: number | null; severity: 'error' | 'warning' | 'info'; message: string }
+export interface LiveIssue { line: number; column: number; severity: 'error' | 'warning' | 'info'; message: string; source: string }
+export interface EditorHandle {
+  focus: () => void; find: () => void; reveal: () => void; selection: () => string; jump: (line: number, column?: number, length?: number) => void; capture: () => CodeCapture | null
+  command: (name: EditorCommand) => boolean; insert: (text: string) => void; word: () => { text: string; line: number } | null
+  /** Trims trailing spaces and/or ensures a final newline, in the editor (undoable); returns the new text. */
+  tidy: (options: { trim: boolean; finalNewline: boolean }) => string | null
+}
 export interface EditorMemory { state?: EditorState; top?: number; left?: number }
 interface Props {
   path: string
@@ -236,10 +425,65 @@ interface Props {
   onCursor: (cursor: Cursor) => void
   onBlur?: () => void
   handle: (value: EditorHandle | null) => void
+  /** The file as of the last commit; lines changed since then get a marker. */
+  base?: string | null
+  /** Checks the whole file (Python); when absent, the parser's syntax errors are shown. */
+  check?: (text: string) => Promise<CodeIssue[]>
+  onIssues?: (issues: LiveIssue[]) => void
+  onContextMenu?: (event: React.MouseEvent) => void
+  onDefinition?: () => void
 }
 
 function handleFor(editor: EditorView, path: string): EditorHandle {
+  const copy = () => {
+    const text = editor.state.selection.ranges.map(range => editor.state.sliceDoc(range.from, range.to)).join('\n')
+    if (text) void clipboard.write(text).catch(() => {})
+    return text
+  }
   return {
+    command: name => {
+      switch (name) {
+        case 'undo': return undo(editor)
+        case 'redo': return redo(editor)
+        case 'selectAll': return selectAll(editor)
+        case 'comment': return toggleComment(editor)
+        case 'foldAll': return foldAll(editor)
+        case 'unfoldAll': return unfoldAll(editor)
+        case 'rename': return renameOccurrences(editor)
+        case 'gotoLine': return gotoLine(editor)
+        case 'selectNext': return selectNextOccurrence(editor)
+        case 'find': return openSearchPanel(editor)
+        case 'end': return cursorDocEnd(editor)
+        case 'copy': return Boolean(copy())
+        case 'cut': {
+          if (!copy() || editor.state.readOnly) return false
+          editor.dispatch(editor.state.replaceSelection(''), { userEvent: 'delete.cut' })
+          return true
+        }
+      }
+    },
+    tidy: ({ trim, finalNewline }) => {
+      if (editor.state.readOnly) return null
+      const changes: { from: number; to?: number; insert?: string }[] = []
+      const doc = editor.state.doc
+      const heads = new Set(editor.state.selection.ranges.map(range => doc.lineAt(range.head).number))
+      if (trim) for (let number = 1; number <= doc.lines; number++) {
+        const line = doc.line(number)
+        const match = /[ \t]+$/.exec(line.text)
+        // Leave the line being typed on alone, so the caret doesn't jump back.
+        if (match && !(heads.has(number) && editor.hasFocus && line.text.trim())) changes.push({ from: line.from + match.index, to: line.to })
+      }
+      if (finalNewline && doc.length && doc.sliceString(doc.length - 1) !== '\n') changes.push({ from: doc.length, insert: '\n' })
+      if (changes.length) editor.dispatch({ changes, userEvent: 'input.tidy' })
+      return editor.state.doc.toString()
+    },
+    insert: text => { if (!editor.state.readOnly) editor.dispatch(editor.state.replaceSelection(text), { userEvent: 'input.paste', scrollIntoView: true }) },
+    word: () => {
+      const range = editor.state.selection.main
+      const word = range.empty ? editor.state.wordAt(range.head) : range
+      if (!word || word.from === word.to) return null
+      return { text: editor.state.sliceDoc(word.from, word.to), line: editor.state.doc.lineAt(word.from).number }
+    },
     capture: () => captureSelection(editor.state, path),
     focus: () => editor.focus(),
     find: () => { editor.focus(); openSearchPanel(editor) },
@@ -252,6 +496,39 @@ function handleFor(editor: EditorView, path: string): EditorHandle {
       editor.focus()
     },
   }
+}
+
+async function runChecks(view: EditorView, props: Props): Promise<EditorDiagnostic[]> {
+  const state = view.state
+  const doc = state.doc
+  const position = (line: number, column: number) => {
+    const row = doc.line(Math.max(1, Math.min(line, doc.lines)))
+    return Math.min(row.to, row.from + Math.max(0, column - 1))
+  }
+  const found: EditorDiagnostic[] = props.diagnostics.filter(item => item.path === props.path).map(item => {
+    const from = position(item.line, item.column)
+    const word = state.wordAt(from)
+    return { from, to: word && word.from === from ? word.to : Math.min(doc.lineAt(from).to, from + 1), severity: item.severity, message: item.message, source: 'compiler' }
+  })
+  if (props.options.errors !== false) {
+    if (props.check) {
+      try {
+        const issues = await props.check(doc.toString())
+        for (const issue of issues) {
+          const from = position(issue.line, issue.column)
+          let to = issue.endLine && issue.endColumn ? position(issue.endLine, issue.endColumn) : from
+          if (to <= from) { const word = state.wordAt(from); to = word && word.from <= from && word.to > from ? word.to : Math.min(doc.lineAt(from).to, from + 1) }
+          if (to <= from) to = Math.min(doc.length, from + 1)
+          found.push({ from, to, severity: issue.severity, message: issue.message, source: 'python' })
+        }
+      } catch { /* the checker is optional */ }
+    } else found.push(...syntaxErrors(state))
+  }
+  if (view.state.doc === doc) props.onIssues?.(found.map(item => {
+    const line = doc.lineAt(item.from)
+    return { line: line.number, column: item.from - line.from + 1, severity: item.severity === 'hint' ? 'info' : item.severity, message: item.message, source: item.source ?? '' }
+  }))
+  return found
 }
 
 export default function Editor(props: Props) {
@@ -272,6 +549,23 @@ export default function Editor(props: Props) {
     })
     const base = [setup(), configuration.of(configure(current.options, current.path)), lintGutter(),
       EditorView.contentAttributes.of({ 'aria-label': current.diff ? 'File diff' : current.path, spellcheck: 'false', autocorrect: 'off', autocapitalize: 'off' })]
+    const live = current.diff ? [] : [
+      changeGutter,
+      linter(view => runChecks(view, callbacks.current), { delay: 650 }),
+      // Alt+click adds a cursor; Ctrl/Cmd+click goes to the definition, as in other editors.
+      EditorView.clickAddsSelectionRange.of(event => event.altKey),
+      EditorView.domEventHandlers({
+        mousedown: (event, view) => {
+          if (event.button !== 0 || !(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return false
+          const position = view.posAtCoords({ x: event.clientX, y: event.clientY })
+          if (position === null) return false
+          event.preventDefault()
+          view.dispatch({ selection: { anchor: position } })
+          callbacks.current.onDefinition?.()
+          return true
+        },
+      }),
+    ]
     const readOnly = [EditorState.readOnly.of(true), EditorView.editable.of(false)]
 
     if (current.diff && split) {
@@ -286,7 +580,7 @@ export default function Editor(props: Props) {
       return () => { merge.destroy(); view.current = null; callbacks.current.handle(null) }
     }
 
-    const extensions: Extension[] = [...base, listener]
+    const extensions: Extension[] = [...base, ...live, listener]
     if (current.diff) extensions.push(...readOnly, unifiedMergeView({ original: normalize(current.diff.before), mergeControls: false, gutter: true }))
     else if (current.readOnly) extensions.push(...readOnly)
     const line = current.initialLine ?? 1
@@ -304,6 +598,7 @@ export default function Editor(props: Props) {
       editor.dispatch({ effects: EditorView.scrollIntoView(initialPosition, { y: 'center' }) })
     }
     view.current = editor
+    definitionHandlers.set(editor, () => callbacks.current.onDefinition?.())
     current.onCursor(onCursor(editor))
     current.handle(handleFor(editor, current.path))
     return () => {
@@ -318,23 +613,31 @@ export default function Editor(props: Props) {
     }
   }, [props.path, props.diff, props.memory, split])
 
-  const { wrap, lineNumbers: numbers, highlightLine, tabSize, autocomplete } = props.options
+  const options = props.options
   useEffect(() => {
     view.current?.dispatch({ effects: configuration.reconfigure(configure(props.options, props.path)) })
-  }, [wrap, numbers, highlightLine, tabSize, autocomplete])
+  }, [options.wrap, options.lineNumbers, options.highlightLine, options.tabSize, options.autocomplete, options.occurrences, options.whitespace,
+    options.indentGuides, options.closeBrackets, options.scrollPastEnd, options.cursorBlink, options.folding])
 
   useEffect(() => {
     const editor = view.current
     if (!editor || props.diff) return
-    const diagnostics: EditorDiagnostic[] = props.diagnostics.filter(item => item.path === props.path).map(item => {
-      const row = editor.state.doc.line(Math.max(1, Math.min(item.line, editor.state.doc.lines)))
-      const from = Math.min(row.to, row.from + Math.max(0, item.column - 1))
-      return { from, to: Math.min(row.to, from + 1), severity: item.severity, message: item.message, source: 'javac' }
-    })
-    editor.dispatch(setDiagnostics(editor.state, diagnostics))
-  }, [props.diagnostics, props.diff, props.path])
+    editor.dispatch({ effects: setBase.of(props.options.changes === false ? null : props.base ?? null) })
+  }, [props.base, props.diff, props.path, options.changes])
 
-  return <div className={'editor-host' + (split ? ' split-diff' : '')} ref={host} />
+  // Compiler results and the error setting feed the same checker; re-run it when they change.
+  useEffect(() => { if (view.current && !props.diff) forceLinting(view.current) }, [props.diagnostics, props.diff, props.path, options.errors])
+
+  return <div className={'editor-host' + (split ? ' split-diff' : '')} ref={host} onContextMenu={event => {
+    const editor = view.current
+    if (!editor || !props.onContextMenu || !(event.target as Element).closest('.cm-content, .cm-gutters')) return
+    event.preventDefault()
+    // Right-clicking outside the selection moves the caret there first.
+    const position = editor.posAtCoords({ x: event.clientX, y: event.clientY })
+    if (position !== null && !editor.state.selection.ranges.some(range => position >= range.from && position <= range.to)) editor.dispatch({ selection: { anchor: position } })
+    editor.focus()
+    props.onContextMenu(event)
+  }} />
 }
 
 /** Highlighted HTML for a code block (used by the Markdown preview). Unknown languages come back escaped and plain. */

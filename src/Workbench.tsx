@@ -3,8 +3,8 @@ import { CircleAlert, CornerDownLeft, TerminalSquare, Trash2, X } from 'lucide-r
 import { type Diagnostic, fileName } from './bridge'
 import { Icon, IconButton } from './ui'
 
-export function SplitGrip({ vertical, value, min, max, change }: {
-  vertical?: boolean; value: number; min: number; max: number; change: (value: number) => void
+export function SplitGrip({ vertical, value, min, max, change, onActive }: {
+  vertical?: boolean; value: number; min: number; max: number; change: (value: number) => void; onActive?: (active: boolean) => void
 }) {
   function clamp(next: number) { return Math.max(min, Math.min(max, next)) }
   function drag(event: PointerEvent<HTMLDivElement>) {
@@ -12,6 +12,7 @@ export function SplitGrip({ vertical, value, min, max, change }: {
     event.preventDefault()
     event.currentTarget.setPointerCapture(event.pointerId)
     start.current = { origin: vertical ? event.clientX : event.clientY, value }
+    onActive?.(true)
   }
   const start = useRef<{ origin: number; value: number } | null>(null)
   function move(event: PointerEvent<HTMLDivElement>) {
@@ -29,7 +30,7 @@ export function SplitGrip({ vertical, value, min, max, change }: {
   return <div className={'grip ' + (vertical ? 'vertical' : 'horizontal')} role="separator"
     aria-label={vertical ? 'Resize sidebar' : 'Resize bottom drawer'} aria-orientation={vertical ? 'vertical' : 'horizontal'}
     aria-valuemin={min} aria-valuemax={max} aria-valuenow={value} tabIndex={0} onKeyDown={key}
-    onPointerDown={drag} onPointerMove={move} onLostPointerCapture={() => { start.current = null }} />
+    onPointerDown={drag} onPointerMove={move} onLostPointerCapture={() => { start.current = null; onActive?.(false) }} />
 }
 
 export interface OutputEntry { kind: 'command' | 'stdout' | 'stderr' | 'exit'; text: string; code?: number | null }

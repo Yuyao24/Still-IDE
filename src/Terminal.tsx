@@ -4,6 +4,7 @@ import { FitAddon } from '@xterm/addon-fit'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { type Theme, resolve } from './themes'
+import { clipboard } from './bridge'
 
 function colors(theme: Theme) {
   const { colors: c, terminal: t } = resolve(theme)
@@ -24,17 +25,21 @@ interface Props {
   fontFamily: string
   cursor: 'block' | 'bar' | 'underline'
   shell: string
+  scrollback?: number
+  copyOnSelect?: boolean
   onReady: (terminal: Xterm | null) => void
   onExit: (id: string) => void
 }
 
-export default function Terminal({ session, root, visible, theme, fontSize, fontFamily, cursor, shell, onReady, onExit }: Props) {
+export default function Terminal({ session, root, visible, theme, fontSize, fontFamily, cursor, shell, scrollback = 5000, copyOnSelect = false, onReady, onExit }: Props) {
   const host = useRef<HTMLDivElement>(null)
   const instance = useRef<Xterm | null>(null)
   const fitter = useRef<FitAddon | null>(null)
   const callbacks = useRef({ onReady, onExit })
   callbacks.current = { onReady, onExit }
-  const initial = useRef({ theme, fontSize, fontFamily, cursor, shell })
+  const initial = useRef({ theme, fontSize, fontFamily, cursor, shell, scrollback })
+  const copying = useRef(copyOnSelect)
+  copying.current = copyOnSelect
 
   useEffect(() => {
     const container = host.current
@@ -43,12 +48,13 @@ export default function Terminal({ session, root, visible, theme, fontSize, font
     const settings = initial.current
     const terminal = new Xterm({
       fontFamily: settings.fontFamily + ', "JetBrains Mono Variable", Consolas, monospace', fontSize: settings.fontSize, lineHeight: 1.2,
-      cursorStyle: settings.cursor, cursorBlink: true, theme: colors(settings.theme), scrollback: 8000, allowProposedApi: false,
+      cursorStyle: settings.cursor, cursorBlink: true, theme: colors(settings.theme), scrollback: settings.scrollback, allowProposedApi: false,
       macOptionIsMeta: true,
     })
     const fit = new FitAddon()
     terminal.loadAddon(fit)
     terminal.open(container)
+    terminal.onSelectionChange(() => { if (copying.current && terminal.hasSelection()) void clipboard.write(terminal.getSelection()).catch(() => {}) })
     instance.current = terminal
     fitter.current = fit
     callbacks.current.onReady(terminal)
@@ -115,8 +121,9 @@ export default function Terminal({ session, root, visible, theme, fontSize, font
     terminal.options.fontSize = fontSize
     terminal.options.fontFamily = fontFamily + ', "JetBrains Mono Variable", Consolas, monospace'
     terminal.options.cursorStyle = cursor
+    terminal.options.scrollback = scrollback
     try { fitter.current?.fit() } catch { /* hidden */ }
-  }, [theme, fontSize, fontFamily, cursor])
+  }, [theme, fontSize, fontFamily, cursor, scrollback])
 
   useEffect(() => {
     if (!visible) return

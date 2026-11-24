@@ -11,6 +11,7 @@ export interface ThemeColors {
   rail?: string; bar?: string; drawer?: string; hover?: string; selection?: string; secondary?: string; icon?: string
   accentFill?: string; accentBorder?: string; currentLine?: string
   variable?: string; property?: string; operator?: string; tag?: string; attribute?: string; shadow?: string
+  textSelection?: string; occurrence?: string; occurrenceBorder?: string; indentGuide?: string
 }
 
 export interface TerminalColors {
@@ -56,6 +57,8 @@ export type ResolvedColors = Required<ThemeColors>
 export function resolve(theme: Theme): { colors: ResolvedColors; terminal: Required<TerminalColors> } {
   const c = theme.colors
   const dark = theme.kind === 'dark'
+  // Themes whose accent is just the text colour get a soft blue for text selection.
+  const tint = c.accent.toLowerCase() === c.ink.toLowerCase() || luminance(c.accent) < .02 || luminance(c.accent) > .9 ? (dark ? '#5b8def' : '#3d6fd9') : c.accent
   const colors: ResolvedColors = {
     ...c,
     rail: c.rail ?? mix(c.editor, c.panel, .55),
@@ -74,6 +77,10 @@ export function resolve(theme: Theme): { colors: ResolvedColors; terminal: Requi
     tag: c.tag ?? c.keyword,
     attribute: c.attribute ?? c.type,
     shadow: c.shadow ?? (dark ? '#00000088' : '#32384633'),
+    textSelection: c.textSelection ?? mix(c.editor, tint, dark ? .36 : .22),
+    occurrence: c.occurrence ?? mix(c.editor, tint, dark ? .17 : .1),
+    occurrenceBorder: c.occurrenceBorder ?? mix(c.editor, tint, dark ? .45 : .38),
+    indentGuide: c.indentGuide ?? mix(c.editor, c.ink, dark ? .11 : .09),
   }
   const t = theme.terminal ?? {}
   const base: TerminalColors = {
@@ -97,6 +104,17 @@ export function resolve(theme: Theme): { colors: ResolvedColors; terminal: Requi
 }
 
 const kebab = (key: string) => key.replace(/[A-Z]/g, char => '-' + char.toLowerCase())
+
+/** The colours that make up a syntax theme; everything else belongs to the editor theme. */
+export const syntaxKeys = ['keyword', 'string', 'number', 'type', 'function', 'comment', 'variable', 'property', 'operator', 'tag', 'attribute'] as const
+
+/** Paints only the code colours from another theme (Settings → Appearance → Syntax colours). */
+export function applySyntax(theme: Theme) {
+  const { colors } = resolve(theme)
+  const root = document.documentElement
+  for (const key of syntaxKeys) root.style.setProperty('--' + kebab(key), colors[key])
+  root.style.setProperty('--comment-style', theme.italicComments === false ? 'normal' : 'italic')
+}
 
 export function applyTheme(theme: Theme) {
   const { colors } = resolve(theme)
@@ -134,6 +152,7 @@ export const presets: Theme[] = [
   {
     id: 'paper-yellow', name: 'Paper Yellow', kind: 'light',
     colors: {
+      textSelection: '#efd98a', occurrence: '#f3e4a6', occurrenceBorder: '#cdb45a',
       editor: '#fbf5dc', panel: '#fbf5dc', rail: '#fbf5dc', bar: '#fbf5dc', drawer: '#fbf5dc', line: '#e8dcb2', hover: '#f4ebc8',
       selection: '#efe2b4', ink: '#2a2516', secondary: '#4e4630', muted: '#7a6f52', icon: '#7a6f52', accent: '#2a2516',
       accentFill: '#f3e8c2', accentBorder: '#dccb94', green: '#4b6b2f', amber: '#9a5b0f', red: '#a33a2a', currentLine: '#f6eecd',
