@@ -115,7 +115,7 @@ export const home = {
   open: async (path: string): Promise<Workspace> => desktop ? invoke('open_project', { path }) : demo,
   forget: (path: string) => invoke<void>('forget_project', { path }),
   pin: (path: string, pinned: boolean) => invoke<void>('pin_project', { path, pinned }),
-  create: (name: string, templateKind: string, parent: string | null, git: boolean) => invoke<Workspace>('create_project', { name, templateKind, parent, git }),
+  create: (name: string, templateKind: string, parent: string | null, git: boolean, readme = true, requirements = true) => invoke<Workspace>('create_project', { name, templateKind, parent, git, readme, requirements }),
   clone: (id: string, url: string, name: string | null, parent: string | null) => invoke<string>('clone_project', { id, url, name, parent }),
   reveal: (path: string) => invoke<void>('reveal_path', { path }),
   paths: () => invoke<AppPaths>('app_paths'),
@@ -320,5 +320,43 @@ export const clipboard = {
 
 export const editorSupport = {
   head: async (rootPath: string, path: string): Promise<string | null> => desktop ? invoke('git_head_text', { rootPath, path }) : null,
-  checkPython: (rootPath: string, source: string) => invoke<{ line: number; column: number; endLine?: number | null; endColumn?: number | null; severity: 'error' | 'warning'; message: string }[]>('check_python', { rootPath, source }),
+  checkPython: (rootPath: string, source: string, path?: string, lint = true) => invoke<{ line: number; column: number; endLine?: number | null; endColumn?: number | null; severity: 'error' | 'warning'; message: string }[]>('check_python', { rootPath, source, path: path ?? null, lint }),
+  format: (rootPath: string, path: string, source: string) => invoke<{ text: string | null; tool: string | null; hint: string | null }>('format_code', { rootPath, path, source }),
+  tools: (rootPath: string | null) => invoke<{ name: string; purpose: string; found: string | null; install: string | null }[]>('tools_status', { rootPath }),
+  install: (rootPath: string | null, id: string, tool: string) => invoke<void>('install_tool', { rootPath, id, tool }),
+}
+
+/** Starting contents for a new file, from its name: a Java class with its package, a pytest file, an HTML page… */
+export function fileTemplate(path: string): string {
+  const name = path.split('/').at(-1) ?? path
+  const base = name.replace(/\.[^.]+$/, '')
+  const extension = name.includes('.') ? name.split('.').at(-1)!.toLowerCase() : ''
+  if (extension === 'java') {
+    const folders = path.split('/').slice(0, -1)
+    const start = folders.findIndex(part => part === 'java' || part === 'src')
+    const pkg = (start >= 0 ? folders.slice(start + 1) : []).filter(part => /^[a-z_][\w]*$/.test(part)).join('.')
+    const kind = /Test$/.test(base) ? 'test' : 'class'
+    const body = kind === 'test'
+      ? `import org.junit.jupiter.api.Test;\nimport static org.junit.jupiter.api.Assertions.*;\n\nclass ${base} {\n    @Test\n    void works() {\n        assertTrue(true);\n    }\n}\n`
+      : `public class ${base} {\n\n}\n`
+    return (pkg ? `package ${pkg};\n\n` : '') + body
+  }
+  if (extension === 'py' && /^test_|_test\.py$/.test(name)) return 'def test_example():\n    assert 1 + 1 == 2\n'
+  if (extension === 'py' && name === '__main__.py') return 'def main() -> None:\n    pass\n\n\nif __name__ == "__main__":\n    main()\n'
+  if (extension === 'html') return `<!doctype html>\n<html lang="en">\n<head>\n  <meta charset="utf-8">\n  <meta name="viewport" content="width=device-width, initial-scale=1">\n  <title>${base}</title>\n</head>\n<body>\n\n</body>\n</html>\n`
+  if (extension === 'sh') return '#!/usr/bin/env bash\nset -euo pipefail\n\n'
+  if (extension === 'md') return `# ${base.replace(/[-_]/g, ' ')}\n\n`
+  if (/^(test|spec)/.test(base) && ['js', 'ts'].includes(extension)) return `import { test } from 'node:test'\nimport assert from 'node:assert'\n\ntest('works', () => {\n  assert.equal(1 + 1, 2)\n})\n`
+  return ''
+}
+
+export interface BlameLine { line: number; hash: string; author: string; time: number; summary: string }
+export interface FileCommit { hash: string; subject: string; author: string; time: number; path: string }
+export const history = {
+  save: (rootPath: string, path: string, contents: string) => desktop ? invoke<void>('history_save', { rootPath, path, contents }) : Promise.resolve(),
+  list: async (rootPath: string, path: string): Promise<{ id: string; time: number; size: number }[]> => desktop ? invoke('history_list', { rootPath, path }) : [],
+  read: (rootPath: string, path: string, id: string) => invoke<string>('history_read', { rootPath, path, id }),
+  blame: async (rootPath: string, path: string, contents?: string): Promise<BlameLine[]> => desktop ? invoke('git_blame', { rootPath, path, contents: contents ?? null }) : [],
+  fileLog: async (rootPath: string, path: string): Promise<FileCommit[]> => desktop ? invoke('git_file_log', { rootPath, path }) : [],
+  showAt: (rootPath: string, rev: string, path: string) => invoke<string>('git_show_at', { rootPath, rev, path }),
 }

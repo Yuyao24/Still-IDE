@@ -7,10 +7,10 @@ import {
   Check, Circle, CircleAlert, CodeXml, Columns2, Copy, FilePlus2, Files, FolderOpen, FolderPlus,
   FolderSearch, GitBranch, GitCompareArrows, GitPullRequestArrow, Hammer, House, Moon, Package,  Pencil, Play, Plus,
   RefreshCw, Rows2, Search, Server, Settings2, Square, SquareTerminal, Sun, TerminalSquare, Trash2, WrapText, X,
-  Camera, Eye, PenLine, LayoutGrid, Maximize2, Minimize2, Network, BookOpen, Sparkles, Bug,
+  Camera, Eye, PenLine, LayoutGrid, Maximize2, Minimize2, Network, BookOpen, Sparkles, Bug, FlaskConical, ArrowLeftRight,
 } from 'lucide-react'
 import {
-  api, clipboard, desktop, editorSupport, fileName, fileSystem, home, mod, parentPath, pickFolder, ssh,
+  api, clipboard, desktop, editorSupport, fileName, fileTemplate, history, type BlameLine, type FileCommit, fileSystem, home, mod, parentPath, pickFolder, ssh,
   type Branches, type Change, type Commit, type Diagnostic, type Diff, type Entry, type GitStatus, type JobEvent, type Packages, type Runtimes,
   type SshHost, type SshOverview, type Workspace,
 } from './bridge'
@@ -28,6 +28,8 @@ import { type Graph, buildGraph } from './graph'
 import { CanvasView, MiniCanvas } from './Canvas'
 import { Chat } from './Chat'
 import { DebugPanel, type DebugOp, type DebugSession, type DebugStop } from './Debug'
+import { TestsPanel, resultFor, testsIn, type TestReport, type TestResult } from './Tests'
+import { lspLanguage, startServer, toUri, type Server as LanguageServer } from './lsp'
 import { type AgentHost, explain, keys, suggestCode } from './ai'
 import { Idle, useIdle } from './Idle'
 import { JournalSheet, useJournal } from './Journal'
@@ -37,10 +39,10 @@ import Terminal, { type TerminalSession } from './Terminal'
 import { presets } from './themes'
 import { TitleBar } from './TitleBar'
 import { Dialog, Output, Problems, SplitGrip, type DialogState, type OutputEntry } from './Workbench'
-import { Icon, IconButton, LayoutIcon, Menu, useSlider, type MenuEntry, type MenuItem, type MenuState } from './ui'
+import { Icon, IconButton, LayoutIcon, Menu, relativeTime, useSlider, type MenuEntry, type MenuItem, type MenuState } from './ui'
 
 type Side = 'explorer' | 'search' | 'git' | 'packages' | 'remote'
-type Drawer = 'terminal' | 'output' | 'problems' | 'debug'
+type Drawer = 'terminal' | 'output' | 'problems' | 'debug' | 'tests'
 type DocView = 'edit' | 'split' | 'preview'
 type Tab = { id: string; path: string; contents: string; saved: string; memory?: EditorMemory; diff?: Diff; staged?: boolean; line?: number; view?: DocView }
 type Job = { id: string; kind: 'run' | 'git' | 'packages'; action: string; path?: string; detail?: string }
@@ -90,6 +92,11 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const remote = Boolean(workspace.remote)
   const [tabs, setTabs] = useState<Tab[]>([])
   const [selected, setSelected] = useState('')
+  // Split editor: a second pane beside the first. `pane` is the one being typed in; commands follow it.
+  const [splitId, setSplitId] = useState<string | null>(null)
+  const [splitLine, setSplitLine] = useState<number | undefined>(undefined)
+  const [splitRatio, setSplitRatio] = useState(0.5)
+  const [pane, setPane] = useState<'main' | 'side'>('main')
   const [cursor, setCursor] = useState<Cursor>({ line: 1, column: 1 })
   const [sidebar, setSidebar] = useState<Side | null>('explorer')
   const [lastSide, setLastSide] = useState<Side>('explorer')
@@ -141,7 +148,15 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const [overview, setOverview] = useState(false)
   const [graphView, setGraphView] = useState(false)
   // Fullscreen Files and Git (opened from the overview, like the journal and the canvas).
-  const [fullView, setFullView] = useState<'files' | 'git' | null>(null)
+  const [fullView, setFullView] = useState<'files' | 'git' | 'history' | null>(null)
+  // History of one file: versions kept on each save (local) and the commits that changed it.
+  const [historyFor, setHistoryFor] = useState<{ path: string; tab: 'local' | 'commits' } | null>(null)
+  const [historyItems, setHistoryItems] = useState<{ local: { id: string; time: number; size: number }[]; commits: FileCommit[] }>({ local: [], commits: [] })
+  const [historyPick, setHistoryPick] = useState<{ key: string; label: string; before: string } | null>(null)
+  const [blame, setBlame] = useState<{ path: string; lines: BlameLine[] } | null>(null)
+  const [blameColumn, setBlameColumn] = useState(false)
+  const [testReport, setTestReport] = useState<TestReport | null>(null)
+  const [testsRunning, setTestsRunning] = useState(false)
   // Debugger: breakpoints per file (kept per project), watch expressions, and the running session.
   const [breakpoints, setBreakpoints] = useState<Record<string, number[]>>(() => { try { return JSON.parse(localStorage.getItem('still.breakpoints.' + workspace.root) ?? '{}') } catch { return {} } })
   const [watches, setWatches] = useState<string[]>(() => { try { return JSON.parse(localStorage.getItem('still.watches.' + workspace.root) ?? '[]') } catch { return [] } })
@@ -165,8 +180,11 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const editor = useRef<EditorHandle | null>(null)
   const terminal = useRef<Xterm | null>(null)
   const activeJob = useRef<Job | null>(null)
-  const latest = useRef({ tabs, selected, expanded })
-  latest.current = { tabs, selected, expanded }
+  const latest = useRef({ tabs, selected, expanded, splitId })
+  latest.current = { tabs, selected, expanded, splitId }
+  const paneRef = useRef<'main' | 'side'>('main')
+  const handles = useRef<{ main: EditorHandle | null; side: EditorHandle | null }>({ main: null, side: null })
+  const splitHost = useRef<HTMLDivElement>(null)
   const saving = useRef(new Map<string, Promise<void>>())
   const opening = useRef(new Map<string, Promise<void>>())
   const pendingJump = useRef<{ path: string; line: number; column?: number; length?: number } | null>(null)
@@ -174,7 +192,9 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const returnedFocus = useRef<HTMLElement | null>(null)
   const pendingVenv = useRef(Boolean(initial?.venv))
 
-  const active = tabs.find(tab => tab.id === selected)
+  const mainTab = tabs.find(tab => tab.id === selected)
+  const splitTab = splitId ? tabs.find(tab => tab.id === splitId) : undefined
+  const active = pane === 'side' && splitTab ? splitTab : mainTab
   const mode = active ? language(active.path) : null
   const runnable = Boolean(active && !active.diff && mode && (remote ? remoteRunnable : localRunnable).includes(mode))
   const symbols = useMemo(() => active && !active.diff ? symbolsFor(active.contents, active.path) : [], [active?.path, active?.contents, active?.diff])
@@ -192,12 +212,12 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const drawerMax = Math.max(128, frame.height - 220)
   const actualDrawerHeight = Math.min(drawerHeight, drawerMax)
   const tabSize = settings.tabSize === 'auto' ? (active ? defaultIndent(active.path) : 4) : settings.tabSize
-  const doc = active && !active.diff ? docKind(active.path) : null
+  const doc = mainTab && !mainTab.diff ? docKind(mainTab.path) : null
   const docView: DocView = doc ? active?.view ?? 'edit' : 'edit'
   const editorOptions: EditorOptions = {
     wrap: settings.wordWrap || Boolean(doc), lineNumbers: settings.lineNumbers, highlightLine: settings.highlightLine, tabSize, layout: settings.diffLayout, autocomplete: settings.autocomplete,
     occurrences: settings.occurrences, whitespace: settings.whitespace, indentGuides: settings.indentGuides && !doc, closeBrackets: settings.closeBrackets, scrollPastEnd: settings.scrollPastEnd,
-    errors: settings.errors && !doc, changes: settings.gitGutter, cursorBlink: settings.cursorBlink, folding: settings.folding,
+    errors: settings.errors && !doc, changes: settings.gitGutter, cursorBlink: settings.cursorBlink, folding: settings.folding, blameColumn,
   }
   const host = remote ? [...(servers?.saved ?? []), ...(servers?.imported ?? [])].find(item => item.id === workspace.remote) : undefined
 
@@ -277,6 +297,22 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     return () => { removeEventListener('resize', resize); window.removeEventListener('beforeunload', beforeUnload) }
   }, [])
 
+  // The open files, to reopen next time (Settings → Projects → When a project opens).
+  const sessionKey = 'still.session.' + (workspace.remote ?? '') + workspace.root
+  function savedSession(): { files: string[]; selected: string; lines: Record<string, number> } | null {
+    try { const value = JSON.parse(localStorage.getItem(sessionKey) ?? 'null'); return value && Array.isArray(value.files) ? value : null } catch { return null }
+  }
+  const sessionLines = useRef<Record<string, number>>(savedSession()?.lines ?? {})
+  useEffect(() => { if (active && !active.diff) sessionLines.current[active.path] = cursor.line }, [active?.path, cursor.line])
+  useEffect(() => {
+    if (workspace.sample) return
+    const files = tabs.filter(tab => !tab.diff).map(tab => tab.path)
+    const timer = setTimeout(() => {
+      try { localStorage.setItem(sessionKey, JSON.stringify({ files, selected: active && !active.diff ? active.path : files[0] ?? '', lines: Object.fromEntries(files.map(path => [path, sessionLines.current[path] ?? 1])) })) } catch { /* storage unavailable */ }
+    }, 400)
+    return () => clearTimeout(timer)
+  }, [tabs.map(tab => tab.path).join('|'), selected, cursor.line])
+
   async function refreshGit(id = generation.current) {
     if (remote) return
     try {
@@ -351,10 +387,17 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     void (async () => {
       const readme = ['README.md', 'readme.md', 'README.txt']
       const entries = await fs.list('').catch(() => [] as Entry[])
-      const resume = initial?.file
-      const found = workspace.sample ? ['README.md', 'src/app.py', 'src/Main.java'] : entries.filter(entry => !entry.directory && readme.includes(entry.name)).map(entry => entry.path).slice(0, 1)
+      // Where you left off (Settings → Projects): the files that were open last time, or the README.
+      const session = settings.openOnStart === 'last' && !workspace.sample ? savedSession() : null
+      const resume = initial?.file ?? (session?.selected || undefined)
+      const starters = ['main.py', 'app.py', 'index.js', 'main.js']
+      const readmeFile = entries.filter(entry => !entry.directory && readme.includes(entry.name)).map(entry => entry.path).slice(0, 1)
+      const found = workspace.sample ? ['README.md', 'src/app.py', 'src/Main.java']
+        : session?.files.length ? session.files
+        : readmeFile.length ? readmeFile
+        : [...starters.filter(path => entries.some(entry => entry.path === path)), 'src/Main.java'].slice(0, 1)
       const paths = resume && !found.includes(resume) ? [...found, resume] : found
-      const lineFor = (path: string) => path === resume ? initial?.line : workspace.sample && path === 'src/app.py' ? 11 : undefined
+      const lineFor = (path: string) => path === initial?.file ? initial?.line : session?.lines[path] ?? (workspace.sample && path === 'src/app.py' ? 11 : undefined)
       const opened = await Promise.all(paths.map(path => fs.read(path).then(contents => fileTab(path, contents, lineFor(path))).catch(() => null)))
       if (generation.current !== id) return
       const available = opened.filter(tab => tab !== null)
@@ -468,7 +511,37 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     return () => { cancelled = true; unsubscribe?.() }
   }, [])
 
+  function focusPane(which: 'main' | 'side') {
+    if (paneRef.current === which) return
+    paneRef.current = which
+    setPane(which)
+    editor.current = handles.current[which] ?? handles.current.main
+    // Problems follow the pane in use.
+    editor.current?.command('lint')
+  }
+  useEffect(() => { if (!splitTab && paneRef.current === 'side') focusPane('main') }, [splitTab])
+  function openToSide(tab: Tab | undefined = mainTab) {
+    if (!tab) return
+    setSplitLine(tab.id === selected ? cursor.line : tab.line)
+    setSplitId(tab.id)
+    requestAnimationFrame(() => requestAnimationFrame(() => { focusPane('side'); handles.current.side?.focus() }))
+  }
+  function closeSplit() {
+    focusPane('main')
+    setSplitId(null)
+    requestAnimationFrame(() => handles.current.main?.focus())
+  }
+  function toggleSplit() { if (splitTab) closeSplit(); else openToSide() }
+  function swapSplit() {
+    if (!splitTab || !mainTab) return
+    const main = mainTab.id
+    setSelected(splitTab.id)
+    setSplitId(main)
+    focusPane(paneRef.current === 'side' ? 'main' : 'side')
+  }
+
   function activate(path: string) {
+    focusPane('main')
     if (latest.current.selected === path) editor.current?.focus()
     else setSelected(path)
   }
@@ -502,8 +575,14 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     return task
   }
 
+  function selectSideEditor(handle: EditorHandle | null) {
+    handles.current.side = handle
+    if (paneRef.current === 'side') editor.current = handle ?? handles.current.main
+  }
+
   function selectEditor(handle: EditorHandle | null) {
-    editor.current = handle
+    handles.current.main = handle
+    if (paneRef.current === 'main' || !handles.current.side) editor.current = handle
     const jump = pendingJump.current
     if (handle && jump && jump.path === latest.current.selected) {
       pendingJump.current = null
@@ -512,7 +591,9 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   }
 
   function jumpTo(item: { path: string; line: number; column?: number; length?: number }) {
-    if (latest.current.selected === item.path) editor.current?.jump(item.line, item.column, item.length)
+    const side = latest.current.splitId ? latest.current.tabs.find(tab => tab.id === latest.current.splitId) : undefined
+    if (paneRef.current === 'side' && side?.path === item.path && !side.diff && handles.current.side) handles.current.side.jump(item.line, item.column, item.length)
+    else if (latest.current.selected === item.path) { focusPane('main'); handles.current.main?.jump(item.line, item.column, item.length) }
     else { pendingJump.current = item; void openFile(item.path) }
   }
 
@@ -555,6 +636,12 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     const previousSave = saving.current.get(key)
     if (previousSave) { await previousSave; return store(tab) }
     let current = latest.current.tabs.find(item => item.id === tab.id)
+    if (current && settings.formatOnSave && current.id === latest.current.selected && dirty(current) && !remote) {
+      if (await formatDocument(true)) {
+        const text = editor.current?.text()
+        if (text !== undefined) { current = { ...current, contents: text }; const replaced = current; latest.current.tabs = latest.current.tabs.map(item => item.id === replaced.id ? replaced : item) }
+      }
+    }
     if (current && (settings.trimOnSave || settings.finalNewline) && current.id === latest.current.selected) {
       const tidied = editor.current?.tidy({ trim: settings.trimOnSave, finalNewline: settings.finalNewline })
       if (tidied !== undefined && tidied !== null && tidied !== current.contents) {
@@ -572,6 +659,8 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
         if (record && !workspace.sample) journal.add({ kind: 'edit', project: workspace.name, root: workspace.root, path: current.path, text: 'Edited ' + fileName(current.path), detail: '+' + added + ' −' + removed, added, removed })
       }
       staleGraph()
+      if (!remote && !workspace.sample) void history.save(workspace.root, current.path, current.contents).catch(() => {})
+      tellServers([{ path: current.path, type: 'changed' }])
       const markSaved = (items: Tab[]) => items.map(item => item.id === current.id ? { ...item, saved: current.contents } : item)
       latest.current.tabs = markSaved(latest.current.tabs)
       setTabs(markSaved)
@@ -605,6 +694,9 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       title: 'New file', description: 'Enter a path relative to the ' + (remote ? 'remote folder.' : 'workspace.'), input: folder ? folder + '/' : '', label: 'Create file',
       action: path => { void fs.create(path).then(async () => {
         if (generation.current !== id) return
+        // New files start from a template that fits their name (a Java class with its package, a test…).
+        const template = fileTemplate(path)
+        if (template) await fs.save(path, template, '').catch(() => {})
         await openFile(path)
         void refreshFiles(new Set([...latest.current.expanded, parentPath(path)].filter(Boolean)), id)
         void refreshGit(id)
@@ -723,6 +815,45 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     }
   }
 
+  /** Formats the active file with the project's formatter (ruff/black, google-java-format, prettier…). */
+  async function formatDocument(quiet = false) {
+    const handle = editor.current
+    if (!active || active.diff || !handle || !desktop || remote) { if (!quiet) notify(remote ? 'Formatting works for local projects for now.' : 'Open a file to format it.'); return false }
+    const path = active.path
+    try {
+      const result = await editorSupport.format(workspace.root, path, handle.text())
+      if (result.text === null && !result.tool && handle.command('format')) return true
+      if (result.text === null) { if (!quiet) notify(result.hint ?? (result.tool ? result.tool + " couldn't format this file. Check it for syntax errors." : 'No formatter for this file.')); return false }
+      if (editor.current === handle) handle.replaceAll(result.text)
+      return true
+    } catch (error) { if (!quiet) notify(error); return false }
+  }
+
+  // Blame for the active file (who last changed each line), refreshed after edits settle and after Git changes.
+  const blameText = active && !active.diff ? active.contents : ''
+  useEffect(() => {
+    if (!active || active.diff || remote || !desktop || (!settings.inlineBlame && !blameColumn) || !status.branch) { setBlame(null); return }
+    const path = active.path, contents = active.contents
+    let current = true
+    const timer = setTimeout(() => { void history.blame(workspace.root, path, contents).then(lines => { if (current) setBlame({ path, lines }) }).catch(() => {}) }, 700)
+    return () => { current = false; clearTimeout(timer) }
+  }, [active?.path, blameText, status, settings.inlineBlame, blameColumn])
+
+  function openHistory(path: string, tab: 'local' | 'commits' = 'local') {
+    setHistoryPick(null)
+    setHistoryFor({ path, tab })
+    setFullView('history')
+    void Promise.all([history.list(workspace.root, path).catch(() => []), history.fileLog(workspace.root, path).catch(() => [] as FileCommit[])])
+      .then(([local, commits]) => setHistoryItems({ local, commits }))
+  }
+  function restoreVersion(path: string, text: string) {
+    setFullView(null)
+    const apply = () => { if (latest.current.tabs.find(tab => tab.id === latest.current.selected)?.path === path) editor.current?.replaceAll(text) }
+    if (active?.path === path) requestAnimationFrame(apply)
+    else void openFile(path).then(() => setTimeout(apply, 350))
+    notify('Restored the earlier version in the editor. Save to keep it, or undo to go back.')
+  }
+
   function searchFor(query: string) {
     setSearchSeed(previous => ({ query, key: (previous?.key ?? 0) + 1 }))
     showSide('search')
@@ -730,6 +861,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
 
   /** F12 / Ctrl+click: jump to where the word under the caret is defined, in this file or elsewhere in the project. */
   async function goToDefinition() {
+    if (editor.current?.command('definition')) return
     const word = editor.current?.word()
     if (!word || !active || active.diff || !/^[A-Za-z_$][\w$]*$/.test(word.text)) return
     const name = word.text
@@ -767,6 +899,8 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
         item('Save', () => { void store(active).catch(notify) }, mod + '+S', { disabled: !active || !dirty(active) }),
         item('Save all', () => { void storeAll() }, mod + '+Shift+S', { disabled: !tabs.some(dirty) }),
         'separator',
+        item('Local history of this file…', () => { if (active) openHistory(active.path, 'local') }, undefined, { disabled: !active || Boolean(active.diff) || remote }),
+        'separator',
         item('Close tab', () => { if (active) closeTab(active) }, mod + '+W', { disabled: !active }),
         item('Close saved tabs', () => closeTabs(latest.current.tabs.filter(tab => !dirty(tab))), undefined, { disabled: !tabs.length }),
         item('Close project', goHome, mod + '+Shift+H'),
@@ -785,6 +919,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
         item('Select next match', () => { handle?.command('selectNext') }, mod + '+D', { disabled: !editing }),
         item('Rename in this file', () => { handle?.command('rename') }, 'F2', { disabled: !editing }),
         item('Toggle comment', () => { handle?.command('comment') }, mod + '+/', { disabled: !editing }),
+        item('Format document', () => { void formatDocument() }, 'Shift+Alt+F', { disabled: !editing }),
       ] },
       { label: 'View', items: [
         item('Command palette', () => openPalette('>'), mod + '+Shift+K'),
@@ -796,6 +931,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
         item('Chat', toggleChat, mod + '+Shift+A', { checked: showChat }),
         item('Terminal', () => drawerOpen ? setDrawerOpen(false) : showDrawer('terminal', true), mod + '+J', { checked: drawerOpen }),
         'separator',
+        item('Split editor', toggleSplit, mod + '+\\', { checked: Boolean(splitTab), disabled: !mainTab }),
         item('Focus mode', toggleFocus, mod + '+.'),
         item('Overview', openOverview, mod + '+↑'),
         item('Fullscreen editor', () => toggleMaximize('editor'), mod + '+Shift+M', { checked: maximized === 'editor' }),
@@ -818,6 +954,11 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       { label: 'Run', items: [
         item(active ? 'Run ' + fileName(active.path) : 'Run', () => { void run() }, mod + '+Enter', { disabled: !runnable || Boolean(job) }),
         item('Run with arguments…', askArguments, undefined, { disabled: !runnable || Boolean(job) }),
+        'separator',
+        item('Run all tests', () => { void runTests(null) }, undefined, { disabled: Boolean(testsWhy) || Boolean(job) }),
+        item('Run tests in this file', () => runTestsFrom('file'), undefined, { disabled: Boolean(testsWhy) || Boolean(job) || !active }),
+        item('Show test results', () => showDrawer('tests')),
+        'separator',
         item('Debug', () => { void startDebug() }, 'F5', { disabled: Boolean(debugWhy) || !active || Boolean(job) }),
         item('Toggle breakpoint', () => { if (active) { const list = breakpoints[active.path] ?? []; changeBreakpoints(active.path, list.includes(cursor.line) ? list.filter(line => line !== cursor.line) : [...list, cursor.line]) } }, 'F9', { disabled: !active || Boolean(active.diff) }),
         ...(!remote ? [item(mode === 'Java' ? 'Compile' : 'Check', () => { void run(true) }, mod + '+Shift+Enter', { disabled: !runnable || Boolean(job) })] : []),
@@ -828,6 +969,8 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       ] },
       ...(!remote ? [{ label: 'Git', items: [
         item('Show changes', () => showSide('git'), mod + '+Shift+G'),
+        item('History of this file…', () => { if (active) openHistory(active.path, 'commits') }, undefined, { disabled: !active || Boolean(active.diff) }),
+        item('Blame for every line', () => setBlameColumn(value => !value), undefined, { checked: blameColumn, disabled: !active }),
         item('Commit…', () => { showSide('git'); if (commit.trim()) gitAction('commit') }),
         item('Pull', () => gitAction('pull')),
         item('Push', () => gitAction('push')),
@@ -860,6 +1003,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     const selectedText = handle?.selection() ?? ''
     const word = handle?.word()
     const readOnly = Boolean(active.diff)
+    const hasServer = Boolean(handle?.command('server'))
     const items: MenuEntry[] = [
       { label: 'Cut', shortcut: mod + '+X', disabled: !selectedText || readOnly, action: () => { handle?.command('cut') } },
       { label: 'Copy', shortcut: mod + '+C', disabled: !selectedText, action: () => { handle?.command('copy') } },
@@ -868,13 +1012,14 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       'separator',
       ...(!readOnly ? [
         { label: 'Go to definition', shortcut: 'F12', disabled: !word, action: () => { void goToDefinition() } },
-        { label: word ? 'Rename “' + word.text.slice(0, 24) + '” in this file' : 'Rename in this file', shortcut: 'F2', disabled: !word, action: () => { handle?.command('rename') } },
+        ...(hasServer ? [{ label: 'Find all references', shortcut: 'Shift+F12', disabled: !word, action: () => { handle?.command('references') } }] : []),
+        { label: hasServer ? (word ? 'Rename “' + word.text.slice(0, 24) + '”' : 'Rename symbol') : word ? 'Rename “' + word.text.slice(0, 24) + '” in this file' : 'Rename in this file', shortcut: 'F2', disabled: !word, action: () => { handle?.command('rename') } },
         { label: 'Select next match', shortcut: mod + '+D', disabled: !word && !selectedText, action: () => { handle?.command('selectNext') } },
       ] : []),
       { label: 'Find in file', shortcut: mod + '+F', action: () => handle?.find() },
       { label: (selectedText || word?.text) ? 'Find “' + (selectedText || word?.text || '').split('\n')[0].slice(0, 24) + '” in all files' : 'Find in all files', shortcut: mod + '+Shift+F', action: () => searchFor((selectedText || word?.text || '').split('\n')[0]) },
       'separator',
-      ...(!readOnly ? [{ label: 'Toggle comment', shortcut: mod + '+/', action: () => { handle?.command('comment') } }] : []),
+      ...(!readOnly ? [{ label: 'Toggle comment', shortcut: mod + '+/', action: () => { handle?.command('comment') } }, { label: 'Format document', shortcut: 'Shift+Alt+F', action: () => { void formatDocument() } }] : []),
       { label: 'Fold all', action: () => { handle?.command('foldAll') } },
       { label: 'Unfold all', action: () => { handle?.command('unfoldAll') } },
       'separator',
@@ -882,6 +1027,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       { label: selectedText ? 'Create image of selection' : 'Create image of this file', icon: Camera, action: captureCode },
       { label: 'Ask the assistant about this', icon: Sparkles, action: () => { if (!chatOpen) toggleChat(); else setChatFocus(count => count + 1) } },
       'separator',
+      ...(!remote && desktop ? [{ label: 'History of this file…', action: () => openHistory(active.path) }] : []),
       { label: 'Copy relative path', action: () => copyText(active.path) },
       { label: 'Show in files', action: () => { showSide('explorer'); expandParents(active.path) } },
       ...(desktop && !remote ? [{ label: 'Reveal in file manager', action: () => { void home.reveal(absolute(parentPath(active.path))).catch(notify) } }] : []),
@@ -960,13 +1106,137 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     return () => { cancelled = true; stop?.() }
   }, [])
 
-  const debugWhy = !desktop ? 'Debugging runs in the Still desktop app.' : remote ? 'Debugging works for local projects for now.' : mode !== 'Python' ? 'The debugger works with Python files for now.' : undefined
+ useEffect(() => {
+    if (!desktop) return
+    let stop: UnlistenFn | null = null, cancelled = false
+    void listen<{ id: string; tool: string; results: TestResult[] }>('test-results', ({ payload }) => {
+      setTestsRunning(false)
+      setTestReport({ tool: payload.tool, results: payload.results, time: Date.now() })
+      setDrawer('tests'); setDrawerOpen(true)
+    }).then(unlisten => { if (cancelled) unlisten(); else stop = unlisten })
+    return () => { cancelled = true; stop?.() }
+  }, [])
+  // Language servers: one per language in use, started when a file of that language is open.
+  const [langServers, setLangServers] = useState<Record<string, LanguageServer | 'starting' | 'none'>>({})
+  const [serverNonce, setServerNonce] = useState(0)
+  const langServersRef = useRef(langServers)
+  langServersRef.current = langServers
+  const openRef = useRef(openFile)
+  openRef.current = openFile
+  // A change from the language server (a rename) to a file no editor is showing.
+  async function editInBackground(path: string, edit: (text: string) => string) {
+    const tab = latest.current.tabs.find(item => item.path === path && !item.diff)
+    if (tab) { setTabs(previous => previous.map(item => item.id === tab.id ? { ...item, contents: edit(item.contents) } : item)); return }
+    const before = await fs.read(path)
+    const after = edit(before)
+    if (after !== before) { await fs.save(path, after, before); tellServers([{ path, type: 'changed' }]) }
+  }
+  const editRef = useRef(editInBackground)
+  editRef.current = editInBackground
+  const langServersOn = Boolean(settings.languageServers) && desktop && !remote
+  const langServersOnRef = useRef(langServersOn)
+  langServersOnRef.current = langServersOn
+  const serverKey = [...new Set([mainTab, splitTab].map(tab => tab && !tab.diff ? lspLanguage(tab.path)?.server : undefined).filter(Boolean))].sort().join(',')
+  useEffect(() => {
+    if (!langServersOn || !serverKey) return
+    for (const language of serverKey.split(',')) {
+      if (langServersRef.current[language]) continue
+      langServersRef.current = { ...langServersRef.current, [language]: 'starting' }
+      setLangServers(previous => ({ ...previous, [language]: 'starting' }))
+      const host = { root: workspace.root, open: async (path: string) => { await openRef.current(path) }, editFile: (path: string, edit: (text: string) => string) => editRef.current(path, edit), notify,
+        read: async (path: string) => latest.current.tabs.find(tab => tab.path === path && !tab.diff)?.contents ?? fs.read(path) }
+      void startServer(host, language, log => {
+        setLangServers(previous => ({ ...previous, [language]: 'none' }))
+        const last = log.split('\n').map(line => line.trim()).filter(Boolean).at(-1)
+        notify('The ' + language + ' language server stopped.' + (last ? ' ' + last.slice(0, 160) : '') + ' Click its name in the status bar to restart it.')
+      }).then(server => {
+        if (!langServersOnRef.current || langServersRef.current[language] !== 'starting') { server?.close(); return }
+        setLangServers(previous => ({ ...previous, [language]: server ?? 'none' }))
+      }).catch(() => setLangServers(previous => ({ ...previous, [language]: 'none' })))
+    }
+  }, [serverKey, langServersOn, serverNonce])
+  function closeServers() {
+    for (const value of Object.values(langServersRef.current)) if (typeof value === 'object') value.close()
+    langServersRef.current = {}
+    setLangServers({})
+  }
+  useEffect(() => { if (!langServersOn) closeServers() }, [langServersOn])
+  useEffect(() => () => closeServers(), [])
+  // Servers read files that aren't open from disk; tell them when files appear, go or are saved.
+  function tellServers(changes: { path: string; type: 'created' | 'changed' | 'deleted' }[]) {
+    for (const value of Object.values(langServersRef.current)) if (typeof value === 'object') value.filesChanged(changes)
+  }
+  const knownFiles = useRef<Set<string> | null>(null)
+  useEffect(() => {
+    const now = new Set(files.filter(entry => !entry.directory).map(entry => entry.path))
+    const before = knownFiles.current
+    knownFiles.current = now
+    if (!before) return
+    const changes = [
+      ...[...now].filter(path => !before.has(path)).map(path => ({ path, type: 'created' as const })),
+      ...[...before].filter(path => !now.has(path)).map(path => ({ path, type: 'deleted' as const })),
+    ]
+    if (changes.length && changes.length < 2000) tellServers(changes)
+  }, [files])
+  function restartServer(language: string) {
+    const value = langServersRef.current[language]
+    if (typeof value === 'object') value.close()
+    const { [language]: _, ...rest } = langServersRef.current
+    langServersRef.current = rest
+    setLangServers(rest)
+    setServerNonce(count => count + 1)
+  }
+  const serverOf = (tab: Tab) => {
+    const language = !tab.diff && langServersOn ? lspLanguage(tab.path)?.server : undefined
+    const value = language ? langServers[language] : undefined
+    return typeof value === 'object' ? value : null
+  }
+  const activeServerLanguage = active && !active.diff && langServersOn ? lspLanguage(active.path)?.server : undefined
+  const activeServer = activeServerLanguage ? langServers[activeServerLanguage] : undefined
+
+  const testLanguage = mode === 'Java' || (!mode && files.some(file => file.path === 'pom.xml' || file.path.startsWith('build.gradle'))) ? 'java' : 'python'
+  const testsWhy = !desktop ? 'Tests run in the Still desktop app.' : remote ? 'Running tests works for local projects for now.' : undefined
+  async function runTests(target: string | null, language = testLanguage) {
+    if (testsWhy) { notify(testsWhy); return }
+    if (activeJob.current) { notify('Wait for the current process to finish.'); return }
+    if (active && dirty(active)) await store(active).catch(notify)
+    await storeAll()
+    setTestsRunning(true)
+    await launch('run', 'test', 'tests_run', { rootPath: workspace.root, target, language })
+    setDrawer('tests'); setDrawerOpen(true)
+    if (!activeJob.current) setTestsRunning(false)
+  }
+  function runTestsFrom(which: 'all' | 'failed' | 'file') {
+    if (which === 'all') { void runTests(null); return }
+    if (which === 'file') {
+      if (!active) return
+      const found = testsIn(active.path, active.contents)
+      void runTests(mode === 'Java' ? (found[0]?.id.split('#')[0] ?? null) : active.path, mode === 'Java' ? 'java' : 'python')
+      return
+    }
+    const failed = testReport?.results.filter(result => result.status === 'failed' || result.status === 'error') ?? []
+    if (!failed.length) return
+    // pytest takes several ids; Maven/Gradle take one pattern, so run the first file's failures.
+    const ids = testReport?.tool === 'pytest' ? failed.map(result => (result.file ?? result.group.replace(/\./g, '/') + '.py') + '::' + (result.group.split('.').filter(part => /^Test/.test(part)).map(part => part + '::').join('')) + result.name).join(' ') : failed[0].group + '#' + failed[0].name
+    void runTests(ids)
+  }
+  function jumpToTest(result: TestResult) {
+    const byFile = result.file ?? files.find(file => file.path.replace(/\.(py|java)$/, '').replace(/\//g, '.').endsWith(result.group.split('.').filter(part => !/^Test[A-Z]/.test(part) || part.endsWith('Test')).join('.')))?.path
+    // Prefer the line a failure points at inside the test file.
+    const failureLine = byFile ? new RegExp(byFile.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ':(\\d+)').exec(result.message)?.[1] : undefined
+    if (byFile) jumpTo({ path: byFile, line: Number(failureLine ?? result.line ?? 1) })
+  }
+
+  const debugWhy = !desktop ? 'Debugging runs in the Still desktop app.' : remote ? (mode !== 'Python' ? 'Debugging on a server works with Python files for now.' : undefined) : mode !== 'Python' && mode !== 'Java' ? 'The debugger works with Python and Java files for now.' : undefined
   async function startDebug() {
     if (!active || debugWhy || activeJob.current) { if (debugWhy) notify(debugWhy); return }
     await store(active)
     const items = Object.entries(breakpoints).flatMap(([file, lines]) => lines.map(line => ({ file, line })))
     putDebug({ id: '', state: 'starting', stop: null, evals: [] })
-    const started = launch('run', 'debug', 'debug_start', { rootPath: workspace.root, path: active.path, breakpoints: items, watches, stopOnEntry: false, args: runArgs[active.path] || null }, { path: active.path })
+    const options = { path: active.path, breakpoints: items, watches, stopOnEntry: false, args: runArgs[active.path] || null }
+    const started = remote
+      ? launch('run', 'debug', 'ssh_debug_start', { ...options, hostId: workspace.remote, root: workspace.root }, { path: active.path })
+      : launch('run', 'debug', 'debug_start', { ...options, rootPath: workspace.root }, { path: active.path })
     const id = (activeJob.current as Job | null)?.id ?? ''
     putDebug({ id, state: 'starting', stop: null, evals: [] })
     setDrawer('debug'); setDrawerOpen(true)
@@ -1008,6 +1278,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   // F5 debug / continue, Shift+F5 stop, F9 breakpoint, F10 step over, F11 step into, Shift+F11 step out.
   useEffect(() => {
     const keys = (event: KeyboardEvent) => {
+      if (event.shiftKey && event.altKey && !event.ctrlKey && !event.metaKey && event.code === 'KeyF' && !document.querySelector('.modal-backdrop, .settings-backdrop')) { event.preventDefault(); void formatDocument(); return }
       if (!/^F(5|9|10|11)$/.test(event.key) || event.ctrlKey || event.metaKey || event.altKey || document.querySelector('.modal-backdrop, .settings-backdrop')) return
       event.preventDefault()
       const current = debugRef.current
@@ -1234,7 +1505,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
         update({ editorFontSize: key === '0' ? 14 : Math.max(9, Math.min(28, settings.editorFontSize + (key === '-' || key === '_' ? -1 : 1))) })
         return
       }
-      if (event.altKey || !(['k', 'p', 's', 'w', 'b', 'j', 'o', 'enter', 'tab', ',', 'arrowup', '.'].includes(key) || shiftOnly)) return
+      if (event.altKey || !(['k', 'p', 's', 'w', 'b', 'j', 'o', 'enter', 'tab', ',', 'arrowup', '.', '\\'].includes(key) || shiftOnly)) return
       if ((overview || graphView) && !['k', 'p', '.'].includes(key)) return
       if (key === 'enter' && palette !== null) return
       event.preventDefault()
@@ -1243,6 +1514,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       if (key === 'tab') { cycleTab(event.shiftKey ? -1 : 1); return }
       if (key === 'arrowup') { openOverview(); return }
       if (key === '.') { toggleFocus(); return }
+      if (key === '\\' && !event.shiftKey) { toggleSplit(); return }
       if (key === 'v' && event.shiftKey) { cycleDocView(); return }
       // The island shortcuts toggle: press once to show, again to hide.
       if (key === 'f') { if (focusMode) setFocusMode(false); showSide('search', true) }
@@ -1385,6 +1657,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     { id: 'folder', label: 'Open folder', shortcut: mod + '+O', icon: FolderOpen, action: chooseFolder },
     { id: 'overview', label: 'Overview of everything', shortcut: mod + '+↑', icon: LayoutGrid, action: openOverview },
     { id: 'focus', label: focusMode ? 'Leave focus mode' : 'Focus mode', shortcut: mod + '+.', icon: Maximize2, action: toggleFocus },
+    ...(mainTab ? [{ id: 'split', label: splitTab ? 'Close the split editor' : 'Split editor: open this file to the side', shortcut: mod + '+\\', icon: Columns2, action: toggleSplit }] : []),
     { id: 'graph-view', label: 'Open the canvas', icon: Network, action: () => setGraphView(true) },
     { id: 'graph-island', label: graphOpen ? 'Hide the canvas island' : 'Show the canvas island', icon: Network, action: () => setGraphOpen(value => !value) },
     { id: 'journal', label: 'Open journal', icon: BookOpen, action: () => setJournalOpen(true) },
@@ -1430,6 +1703,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     { key: 'terminal', label: 'Terminal', glyph: TerminalSquare },
     { key: 'output', label: 'Output', glyph: CodeXml },
     { key: 'problems', label: 'Problems', glyph: CircleAlert },
+    { key: 'tests', label: 'Tests', glyph: FlaskConical },
     { key: 'debug', label: 'Debug', glyph: Bug },
   ] as const
   const remoteActions = {
@@ -1446,21 +1720,64 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     ...(!remote ? [{ key: 'git', label: 'Git', keys: 'Shift+G', glyph: GitBranch }, { key: 'packages', label: 'Packages', keys: 'Shift+U', glyph: Package }] : []),
     { key: 'remote', label: 'Servers', keys: 'Shift+R', glyph: Server },
   ]) as { key: Side; label: string; keys: string; glyph: typeof Files }[]
-  const editorProps = active ? {
-    path: active.path, text: active.contents, memory: active.memory, diff: active.diff, initialLine: active.line,
-    options: focusMode ? { ...editorOptions, lineNumbers: false, highlightLine: true } : editorOptions, diagnostics, handle: selectEditor, onCursor: setCursor,
-    onBlur: () => { if (settings.autoSave === 'blur') void store(latest.current.tabs.find(tab => tab.id === active.id)).catch(notify) },
-    onEdit: (contents: string) => edited(active, contents),
-    base: !active.diff && !remote ? heads[active.path] ?? null : null,
-    check: desktop && !remote && !active.diff && mode === 'Python' ? (text: string) => editorSupport.checkPython(workspace.root, text) : undefined,
-    onIssues: (issues: LiveIssue[]) => { const path = active.path; setLive(previous => previous && previous.path === path && JSON.stringify(previous.issues) === JSON.stringify(issues) ? previous : { path, issues }) },
-    onContextMenu: editorMenu,
-    onDefinition: () => { void goToDefinition() },
-    suggest: settings.aiComplete && !active.diff ? suggestInline : undefined,
-    breakpoints: breakpoints[active.path] ?? [],
-    onBreakpoints: (lines: number[]) => changeBreakpoints(active.path, lines),
-    debugLine: debug?.state === 'paused' && debug.stop && debug.stop.frameFile === active.path ? debug.stop.frameLine : null,
-  } : null
+  const testsFor = (tab: Tab | undefined) => tab && !tab.diff && desktop && !remote ? testsIn(tab.path, tab.contents).map(test => ({ ...test, status: resultFor(testReport, tab.path, test) })) : []
+  const mainTests = useMemo(() => testsFor(mainTab), [mainTab?.path, mainTab?.contents, mainTab?.diff, testReport])
+  const sideTests = useMemo(() => testsFor(splitTab), [splitTab?.path, splitTab?.contents, splitTab?.diff, testReport])
+  // Ctrl+click and right-click can arrive before the pane they're in has become the current one,
+  // so they run on the next tick, against what is current then.
+  const later = useRef({ editorMenu, goToDefinition })
+  later.current = { editorMenu, goToDefinition }
+  function paneProps(tab: Tab, which: 'main' | 'side') {
+    return {
+      path: tab.path, text: tab.contents, memory: which === 'main' ? tab.memory : undefined, diff: tab.diff, initialLine: which === 'main' ? tab.line : splitLine,
+      options: focusMode ? { ...editorOptions, lineNumbers: false, highlightLine: true } : editorOptions, diagnostics,
+      handle: which === 'main' ? selectEditor : selectSideEditor,
+      onFocus: () => focusPane(which),
+      onCursor: (next: Cursor) => { if (paneRef.current === which) setCursor(next) },
+      onBlur: () => { if (settings.autoSave === 'blur') void store(latest.current.tabs.find(item => item.id === tab.id)).catch(notify) },
+      onEdit: (contents: string) => edited(tab, contents),
+      base: !tab.diff && !remote ? heads[tab.path] ?? null : null,
+      check: desktop && !remote && !tab.diff && language(tab.path) === 'Python' ? (text: string) => editorSupport.checkPython(workspace.root, text, tab.path, settings.lintWithRuff) : undefined,
+      onIssues: (issues: LiveIssue[]) => {
+        if (paneRef.current !== which) return
+        const path = tab.path
+        setLive(previous => previous && previous.path === path && JSON.stringify(previous.issues) === JSON.stringify(issues) ? previous : { path, issues })
+      },
+      onContextMenu: (event: ReactMouseEvent) => {
+        if (paneRef.current === which) { editorMenu(event); return }
+        focusPane(which)
+        const { clientX, clientY } = event
+        setTimeout(() => later.current.editorMenu({ clientX, clientY } as ReactMouseEvent))
+      },
+      onDefinition: () => { focusPane(which); setTimeout(() => { void later.current.goToDefinition() }) },
+      suggest: settings.aiComplete && !tab.diff ? suggestInline : undefined,
+      breakpoints: breakpoints[tab.path] ?? [],
+      onBreakpoints: (lines: number[]) => changeBreakpoints(tab.path, lines),
+      debugLine: debug?.state === 'paused' && debug.stop && debug.stop.frameFile === tab.path ? debug.stop.frameLine : null,
+      blame: blame && blame.path === tab.path ? blame.lines : null,
+      tests: which === 'main' ? mainTests : sideTests,
+      onRunTest: (id: string) => { void runTests(id, tab.path.endsWith('.java') ? 'java' : 'python') },
+      server: serverOf(tab),
+      serverUri: toUri(workspace.root, tab.path),
+      blameMode: blameColumn ? 'all' as const : settings.inlineBlame ? 'line' as const : 'off' as const,
+    }
+  }
+  const editorProps = mainTab ? paneProps(mainTab, 'main') : null
+  const sideProps = splitTab ? paneProps(splitTab, 'side') : null
+  function dragSplit(event: React.PointerEvent<HTMLDivElement>) {
+    if (event.button !== 0) return
+    event.preventDefault()
+    const grip = event.currentTarget
+    grip.setPointerCapture(event.pointerId)
+    setResizing(true)
+    const move = (next: PointerEvent) => {
+      const box = splitHost.current?.getBoundingClientRect()
+      if (box) setSplitRatio(Math.max(0.2, Math.min(0.8, (next.clientX - box.left) / box.width)))
+    }
+    const up = () => { grip.removeEventListener('pointermove', move); grip.removeEventListener('pointerup', up); setResizing(false) }
+    grip.addEventListener('pointermove', move)
+    grip.addEventListener('pointerup', up)
+  }
   // On narrow windows the graph island steps aside on its own; the setting is kept for when there is room again.
   const showChat = chatOpen && frame.width >= 760
   const showGraph = graphOpen && frame.width >= (showChat ? 1560 : 1080)
@@ -1627,6 +1944,8 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
                 { label: 'Close others', action: () => { const others = tabs.filter(item => item.id !== tab.id); if (others.some(dirty)) askDiscard('Close other tabs?', 'Some have unsaved changes.', () => closeTabs(others)); else closeTabs(others) } },
                 { label: 'Close saved tabs', action: () => closeTabs(tabs.filter(item => !dirty(item))) },
                 'separator',
+                { label: 'Open to the side', icon: Columns2, shortcut: tab.id === selected ? mod + '+\\' : undefined, action: () => openToSide(tab) },
+                ...(!remote && desktop && !tab.diff ? [{ label: 'History of this file…', action: () => openHistory(tab.path) }] : []),
                 { label: 'Copy relative path', icon: Copy, action: () => copyText(tab.path) },
                 ...(desktop && !remote ? [{ label: 'Reveal in file manager', icon: FolderSearch, action: () => { void home.reveal(absolute(parentPath(tab.path))).catch(notify) } }] : []),
               ] }) }}>
@@ -1666,12 +1985,27 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
         </div>
 
         <section className="editor-wrap" id="editor-panel" role="tabpanel" aria-labelledby={active ? 'file-tab-' + tabs.indexOf(active) : undefined}>
-          {active && editorProps ? (doc && docView !== 'edit'
-            ? <div className={'doc-split' + (docView === 'preview' ? ' preview-only' : '')}>
-                {docView === 'split' && <div className="doc-pane"><Editor {...editorProps} /></div>}
-                <div className="doc-pane doc-pane-preview"><Preview text={active.contents} kind={doc} onLink={openLink} /></div>
+          {mainTab && editorProps ? (() => {
+            const mainView = doc && docView !== 'edit'
+              ? <div className={'doc-split' + (docView === 'preview' ? ' preview-only' : '')}>
+                  {docView === 'split' && <div className="doc-pane"><Editor {...editorProps} /></div>}
+                  <div className="doc-pane doc-pane-preview"><Preview text={mainTab.contents} kind={doc} onLink={openLink} /></div>
+                </div>
+              : <Editor {...editorProps} />
+            if (!splitTab || !sideProps) return mainView
+            return <div className="split-editors" ref={splitHost} style={{ gridTemplateColumns: `minmax(0, ${splitRatio}fr) 1px minmax(0, ${1 - splitRatio}fr)` }}>
+              <div className={'split-pane' + (pane === 'main' ? ' is-current' : '')} onMouseDown={() => focusPane('main')}>{mainView}</div>
+              <div className="split-grip" role="separator" aria-orientation="vertical" aria-label="Resize split" onPointerDown={dragSplit} onDoubleClick={() => setSplitRatio(0.5)} />
+              <div className={'split-pane is-side' + (pane === 'side' ? ' is-current' : '')}>
+                <div className="split-head">
+                  <span className="split-name" title={splitTab.path}>{fileName(splitTab.path)}{splitTab.diff ? ' · diff' : ''}{dirty(splitTab) && <i className="split-dot" aria-label="unsaved" />}</span>
+                  <IconButton glyph={ArrowLeftRight} label="Swap sides" onClick={swapSplit} />
+                  <IconButton glyph={X} label={'Close split (' + mod + '+\\)'} onClick={closeSplit} />
+                </div>
+                <div className="split-body"><Editor key={'side:' + splitTab.id} {...sideProps} /></div>
               </div>
-            : <Editor {...editorProps} />) : <div className="empty-editor">
+            </div>
+          })() : <div className="empty-editor">
             <div className="empty-inner">
               <p className="empty-title">{workspace.name}</p>
               <div className="empty-keys">
@@ -1741,6 +2075,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
           {drawer === 'output' && <Output entries={output} sample={sampleRun}
             onInput={job?.kind === 'run' ? text => { void invoke('job_input', { id: job.id, text }).catch(notify) } : undefined} />}
           {drawer === 'problems' && <Problems items={problems} jump={jumpTo} />}
+          {drawer === 'tests' && <TestsPanel report={testReport} running={testsRunning} canRun={!testsWhy && !job} why={testsWhy} onRun={runTestsFrom} onJump={jumpToTest} />}
           {drawer === 'debug' && <DebugPanel session={debug} canDebug={!debugWhy && Boolean(active) && !job} why={debugWhy} breakpointCount={Object.values(breakpoints).reduce((sum, lines) => sum + lines.length, 0)}
             watches={watches} onStart={() => { void startDebug() }} onCommand={debugCommand} onFrame={index => debugSend({ op: 'frame', index })}
             onEval={expression => debugSend({ op: 'eval', expression })} onWatches={changeWatches} onJump={(file, line) => jumpTo({ path: file, line })}
@@ -1785,7 +2120,9 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       <div className="flex-1" />
       {active && <><span className="status-item">Ln {cursor.line}, Col {cursor.column}{cursor.selected ? ` (${cursor.selected} selected)` : ''}</span>
         <button className="status-item status-optional" onClick={() => onSettings('editor')} title="Indentation settings">Spaces: {tabSize}</button>
-        <span className="status-item status-language">{mode}</span></>}
+        <span className="status-item status-language">{mode}</span>
+        {activeServerLanguage && activeServer && activeServer !== 'none' && <button className="status-item status-optional" title={typeof activeServer === 'object' ? activeServer.name + ' is running. Click to restart it.' : 'Starting the language server…'}
+          onClick={() => restartServer(activeServerLanguage)}><span className={'status-dot' + (activeServer === 'starting' ? ' busy' : '')} />{typeof activeServer === 'object' ? activeServer.name : 'Starting…'}</button>}</>}
       {!remote && <button className="status-item" title="Show runtimes and packages" onClick={() => showSide('packages')}>
         <span className={'status-dot' + (!runtime ? ' inactive' : '')} />{!desktop ? 'Browser preview' : runtime ? runtime + (mode === 'Python' && (runtimes?.pythonVenv || isVirtual(packageState)) ? ' · .venv' : '') : runtimes ? runtimeMissing : 'Detecting runtimes…'}
       </button>}
@@ -1797,6 +2134,31 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       onNewSpace={() => { setOverview(false); chooseFolder() }}
       onLayout={id => applyLayout(id)}
       onSaveLayout={() => { try { localStorage.setItem('still.layout.custom', JSON.stringify(islands)) } catch { /* ignore */ } notify('Saved this layout. Pick it under Layouts as Saved.') }} />}
+    {fullView === 'history' && historyFor && <FullView title={'History · ' + fileName(historyFor.path)} project={workspace.name} onClose={() => { setFullView(null); requestAnimationFrame(() => editor.current?.focus()) }}>
+      <div className="full-side island side history-side">
+        <nav className="side-views" role="tablist" aria-label="History">
+          {(['local', 'commits'] as const).map(kind => <button key={kind} role="tab" aria-selected={historyFor.tab === kind} className={historyFor.tab === kind ? 'is-active' : ''} onClick={() => { setHistoryFor({ ...historyFor, tab: kind }); setHistoryPick(null) }}><span style={{ display: 'inline' }}>{kind === 'local' ? 'Saved versions' : 'Commits'}</span></button>)}
+        </nav>
+        <div className="history-list">
+          {historyFor.tab === 'local' && (historyItems.local.length ? historyItems.local.map(item => <button key={item.id} className={'history-row' + (historyPick?.key === 'local:' + item.id ? ' is-active' : '')}
+            onClick={() => { void history.read(workspace.root, historyFor.path, item.id).then(text => setHistoryPick({ key: 'local:' + item.id, label: 'Saved ' + new Date(item.time).toLocaleString(), before: text })).catch(notify) }}>
+            <b>{relativeTime(item.time)}</b><span>{new Date(item.time).toLocaleString(undefined, { weekday: 'short', hour: '2-digit', minute: '2-digit' })} · {(item.size / 1024).toFixed(1)} KB</span>
+          </button>) : <p className="full-empty">No saved versions yet. Still keeps a copy each time you save, for a week.</p>)}
+          {historyFor.tab === 'commits' && (historyItems.commits.length ? historyItems.commits.map(commit => <button key={commit.hash} className={'history-row' + (historyPick?.key === commit.hash ? ' is-active' : '')}
+            onClick={() => { void history.showAt(workspace.root, commit.hash, commit.path).then(text => setHistoryPick({ key: commit.hash, label: commit.subject + ' · ' + commit.hash.slice(0, 7), before: text })).catch(notify) }}>
+            <b>{commit.subject}</b><span>{commit.author} · {relativeTime(commit.time * 1000)} · {commit.hash.slice(0, 7)}{commit.path !== historyFor.path ? ' · was ' + fileName(commit.path) : ''}</span>
+          </button>) : <p className="full-empty">{status.branch ? 'This file has no commits yet.' : 'This project is not a Git repository.'}</p>)}
+        </div>
+      </div>
+      <div className="full-main">
+        {historyPick ? <>
+          <header className="full-main-head"><b>{historyPick.label}</b><span className="muted">left: that version · right: now</span>
+            <button className="text-btn primary" onClick={() => restoreVersion(historyFor.path, historyPick.before)}>Restore this version</button></header>
+          <div className="full-editor"><Editor key={historyPick.key} path={historyFor.path} text={tabs.find(tab => tab.path === historyFor.path && !tab.diff)?.contents ?? ''}
+            diff={{ before: historyPick.before, after: tabs.find(tab => tab.path === historyFor.path && !tab.diff)?.contents ?? '' }} options={{ ...editorOptions, layout: 'split' }} diagnostics={[]} onEdit={() => {}} onCursor={() => {}} handle={() => {}} /></div>
+        </> : <p className="full-empty">Choose a version to compare it with the file as it is now.</p>}
+      </div>
+    </FullView>}
     {fullView === 'files' && <FullView title="Files" project={workspace.name} onClose={() => { setFullView(null); requestAnimationFrame(() => editor.current?.focus()) }}>
       <div className="full-side island side">
         <Explorer workspace={workspace} directories={directories} expanded={expanded} active={filePreview?.path ?? active?.path} changes={status} symbols={[]}

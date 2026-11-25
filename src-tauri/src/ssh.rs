@@ -24,7 +24,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 /// Passwords typed this session, by host id. Memory only.
 #[derive(Default)]
@@ -1272,4 +1272,111 @@ pub fn prompt_env(app: &AppHandle, host: &SshHost) -> Vec<(String, String)> {
         return Vec::new();
     }
     probe.get_envs().filter_map(|(key, value)| Some((key.to_string_lossy().into_owned(), value?.to_string_lossy().into_owned()))).collect()
+}
+
+// ---- Debugging Python on the server --------------------------------------------------
+
+/// Runs a Python file on the server under Still's debugger. The driver is the same one used
+/// locally; over SSH its messages travel as marked lines on stderr and its commands as marked
+/// lines on stdin, so no port needs forwarding.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub fn ssh_debug_start(
+    app: AppHandle,
+    store: State<Store>,
+    jobs: State<Jobs>,
+    id: String,
+    host_id: String,
+    root: String,
+    path: String,
+    breakpoints: Vec<serde_json::Value>,
+    watches: Vec<String>,
+    stop_on_entry: bool,
+    args: Option<String>,
+) -> Result<()> {
+    use base64::Engine;
+    if !path.ends_with(".py") {
+        return Err("Debugging on a server works with Python files for now.".into());
+    }
+    let host = find_host(&store, &host_id)?;
+    let full = remote_path(&root, &path)?;
+    let args = parse_args(args)?;
+    let driver = base64::engine::general_purpose::STANDARD.encode(crate::debug::DRIVER);
+    let quoted_args: String = args.iter().map(|arg| format!(" {}", quote(arg))).collect();
+    let mut ssh_args = base_args(&app, &host, true)?;
+    ssh_args.push("--".into());
+    ssh_args.push(destination(&host));
+    ssh_args.push(format!(
+        "cd -- {root} && STILL_DEBUG_STDIO=1 STILL_DEBUG_ROOT={root} PYTHONIOENCODING=utf-8 python3 -u -c {code} {file}{quoted_args}",
+        root = quote(&root),
+        code = quote(&format!("import base64;exec(compile(base64.b64decode('{driver}'),'<still-debug>','exec'))")),
+        file = quote(&full),
+    ));
+    let setup = serde_json::json!({ "breakpoints": breakpoints, "watches": watches, "stopOnEntry": stop_on_entry });
+    let (sender, commands) = std::sync::mpsc::channel::<serde_json::Value>();
+    app.state::<crate::debug::Debuggers>().0.lock().map_err(err)?.insert(id.clone(), sender);
+    let label = format!("$ ssh {} debug {path}{}\n", host.name, quoted_args);
+    let events = app.clone();
+    let prompts_app = app.clone();
+    let session_id = id.clone();
+    jobs.start(app, id, true, move |job| {
+        job.emit("command", label);
+        let mut cmd = command(program(), &std::env::temp_dir());
+        cmd.args(&ssh_args);
+        use_prompts(&prompts_app, &mut cmd, &host);
+        let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(err)?;
+        let slot = job.input_slot();
+        if let Ok(mut input) = slot.lock() { *input = child.stdin.take(); }
+        let send = |slot: &crate::process::Input, line: String| {
+            if let Ok(mut input) = slot.lock() {
+                if let Some(stdin) = input.as_mut() { let _ = stdin.write_all(line.as_bytes()).and_then(|_| stdin.flush()); }
+            }
+        };
+        send(&slot, format!("\x1eSTILL {setup}\n"));
+        let forward = slot.clone();
+        thread::spawn(move || { for command in commands { send(&forward, format!("\x1eSTILL {command}\n")); } });
+        let stdout = child.stdout.take().ok_or("no output")?;
+        let mut stderr = child.stderr.take().ok_or("no output")?;
+        let code = thread::scope(|scope| {
+            scope.spawn(|| crate::process::stream(stdout, job, "stdout", false));
+            scope.spawn(|| {
+                let mut buffer = [0u8; 8192];
+                let mut pending = String::new();
+                let mut bytes = Vec::new();
+                let marker = "\x1eSTILL-DEBUG ";
+                loop {
+                    let size = match stderr.read(&mut buffer) { Ok(0) | Err(_) => break, Ok(size) => size };
+                    bytes.extend_from_slice(&buffer[..size]);
+                    let end = match std::str::from_utf8(&bytes) { Err(error) if error.error_len().is_none() => error.valid_up_to(), _ => bytes.len() };
+                    pending.push_str(&String::from_utf8_lossy(&bytes[..end]));
+                    bytes.drain(..end);
+                    while let Some(at) = pending.find('\n') {
+                        let line: String = pending.drain(..=at).collect();
+                        match line.find(marker) {
+                            Some(start) => {
+                                if start > 0 { job.emit("stderr", line[..start].to_owned()); }
+                                if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line[start + marker.len()..].trim()) {
+                                    value["id"] = serde_json::Value::String(session_id.clone());
+                                    let _ = events.emit("debug-event", value);
+                                }
+                            }
+                            None => job.emit("stderr", line),
+                        }
+                    }
+                    // Show a prompt without a newline right away, unless it may be the start of a marker.
+                    if !pending.is_empty() && !pending.contains('\x1e') { job.emit("stderr", std::mem::take(&mut pending)); }
+                }
+                if !pending.is_empty() { job.emit("stderr", pending); }
+            });
+            loop {
+                if job.is_cancelled() { let _ = child.kill(); let _ = child.wait(); break 130 }
+                if let Ok(Some(status)) = child.try_wait() { break status.code().unwrap_or(1) }
+                thread::sleep(Duration::from_millis(25));
+            }
+        });
+        if let Ok(mut input) = slot.lock() { input.take(); }
+        if let Ok(mut map) = events.state::<crate::debug::Debuggers>().0.lock() { map.remove(&session_id); }
+        let _ = events.emit("debug-event", serde_json::json!({ "id": session_id, "event": "ended" }));
+        Ok((code, Vec::new()))
+    })
 }

@@ -2,7 +2,7 @@
 // your own names and the most common built-ins first, each with its signature and where
 // it comes from ("builtins", "this file", "keyword"). Replaces CodeMirror's fuzzy lists,
 // which offer `property` and `PermissionError` when you type "pri".
-import type { Completion, CompletionContext, CompletionResult, CompletionSource } from '@codemirror/autocomplete'
+import { type Completion, type CompletionContext, type CompletionResult, type CompletionSource, snippetCompletion } from '@codemirror/autocomplete'
 import { syntaxTree } from '@codemirror/language'
 
 type Entry = [name: string, signature?: string]
@@ -129,6 +129,48 @@ function fileNames(context: CompletionContext, word: string) {
 const rank = (index: number, length: number) => 1 - index / Math.max(1, length)
 
 /** The completion source: typed prefix in, ranked names out. */
+// Snippets: type the prefix, press Tab, then Tab again to move between the parts to fill in.
+export interface Snippet { prefix: string; body: string; description: string; language: string }
+const builtinSnippets: Snippet[] = [
+  { language: 'python', prefix: 'main', description: 'Run main() when the file is run directly', body: 'def main() -> None:\n\t${pass}\n\n\nif __name__ == "__main__":\n\tmain()' },
+  { language: 'python', prefix: 'ifmain', description: 'if __name__ == "__main__"', body: 'if __name__ == "__main__":\n\t${main()}' },
+  { language: 'python', prefix: 'def', description: 'Function', body: 'def ${name}(${params}):\n\t${pass}' },
+  { language: 'python', prefix: 'class', description: 'Class with __init__', body: 'class ${Name}:\n\tdef __init__(self${, value}):\n\t\t${pass}' },
+  { language: 'python', prefix: 'for', description: 'for … in …', body: 'for ${item} in ${items}:\n\t${pass}' },
+  { language: 'python', prefix: 'fori', description: 'for i in range(n)', body: 'for ${i} in range(${n}):\n\t${pass}' },
+  { language: 'python', prefix: 'while', description: 'while loop', body: 'while ${condition}:\n\t${pass}' },
+  { language: 'python', prefix: 'if', description: 'if / else', body: 'if ${condition}:\n\t${pass}\nelse:\n\t${pass}' },
+  { language: 'python', prefix: 'try', description: 'try / except', body: 'try:\n\t${pass}\nexcept ${Exception} as ${error}:\n\t${raise}' },
+  { language: 'python', prefix: 'with', description: 'Open a file', body: 'with open(${"path"}) as ${file}:\n\t${text = file.read()}' },
+  { language: 'python', prefix: 'test', description: 'pytest test function', body: 'def test_${name}():\n\t${assert True}' },
+  { language: 'python', prefix: 'dataclass', description: 'Dataclass', body: 'from dataclasses import dataclass\n\n\n@dataclass\nclass ${Name}:\n\t${field}: ${int}' },
+  { language: 'python', prefix: 'prop', description: 'Property', body: '@property\ndef ${name}(self):\n\treturn self._${name}' },
+  { language: 'python', prefix: 'lc', description: 'List comprehension', body: '[${x} for ${x} in ${items}]' },
+  { language: 'java', prefix: 'psvm', description: 'public static void main', body: 'public static void main(String[] args) {\n\t${}\n}' },
+  { language: 'java', prefix: 'main', description: 'public static void main', body: 'public static void main(String[] args) {\n\t${}\n}' },
+  { language: 'java', prefix: 'sout', description: 'System.out.println', body: 'System.out.println(${});' },
+  { language: 'java', prefix: 'fori', description: 'for (int i …)', body: 'for (int ${i} = 0; ${i} < ${n}; ${i}++) {\n\t${}\n}' },
+  { language: 'java', prefix: 'foreach', description: 'for (Type item : items)', body: 'for (${String} ${item} : ${items}) {\n\t${}\n}' },
+  { language: 'java', prefix: 'if', description: 'if / else', body: 'if (${condition}) {\n\t${}\n} else {\n\t${}\n}' },
+  { language: 'java', prefix: 'while', description: 'while loop', body: 'while (${condition}) {\n\t${}\n}' },
+  { language: 'java', prefix: 'try', description: 'try / catch', body: 'try {\n\t${}\n} catch (${Exception} ${e}) {\n\t${e}.printStackTrace();\n}' },
+  { language: 'java', prefix: 'class', description: 'Class', body: 'public class ${Name} {\n\t${}\n}' },
+  { language: 'java', prefix: 'method', description: 'Method', body: 'public ${void} ${name}(${}) {\n\t${}\n}' },
+  { language: 'javascript', prefix: 'log', description: 'console.log', body: 'console.log(${})' },
+  { language: 'javascript', prefix: 'fn', description: 'Function', body: 'function ${name}(${params}) {\n\t${}\n}' },
+  { language: 'javascript', prefix: 'af', description: 'Arrow function', body: 'const ${name} = (${params}) => {\n\t${}\n}' },
+  { language: 'javascript', prefix: 'forof', description: 'for … of …', body: 'for (const ${item} of ${items}) {\n\t${}\n}' },
+  { language: 'javascript', prefix: 'if', description: 'if / else', body: 'if (${condition}) {\n\t${}\n} else {\n\t${}\n}' },
+  { language: 'javascript', prefix: 'try', description: 'try / catch', body: 'try {\n\t${}\n} catch (${error}) {\n\t${console.error(error)}\n}' },
+  { language: 'javascript', prefix: 'imp', description: 'import', body: "import ${name} from '${module}'" },
+]
+let customSnippets: Snippet[] = []
+/** Snippets from Settings → Editor → Snippets. */
+export function setCustomSnippets(list: Snippet[]) { customSnippets = Array.isArray(list) ? list.filter(item => item && item.prefix && item.body) : [] }
+export function snippetsFor(languageName: string) {
+  return [...customSnippets, ...builtinSnippets].filter(item => item.language === languageName || item.language === 'any' || !item.language)
+}
+
 export function smartCompletions(languageName: string): CompletionSource {
   const vocabulary = vocabularies[languageName] ?? { builtins: [], keywords: [], members: [] }
   return (context: CompletionContext): CompletionResult | null => {
@@ -168,6 +210,15 @@ export function smartCompletions(languageName: string): CompletionSource {
         if (matches(name)) add({ label: name, type: signature?.startsWith('(') || signature?.startsWith('<') ? 'function' : /^[A-Z]/.test(name) ? 'class' : 'variable', detail: signature, ['source' as never]: 'builtins' } as Completion, 1.6 + rank(index, vocabulary.builtins.length) * 1.2)
       })
       vocabulary.keywords.forEach((name, index) => { if (matches(name)) add({ label: name, type: 'keyword', ['source' as never]: 'keyword' } as Completion, 1.4 + rank(index, vocabulary.keywords.length)) })
+      // Snippets rank just above the keyword they're named after.
+      const seen = new Set<string>()
+      for (const snippet of snippetsFor(languageName)) {
+        if (seen.has(snippet.prefix) || !(snippet.prefix.startsWith(typed) || snippet.prefix.toLowerCase().startsWith(lower)) || (!typed && !context.explicit)) continue
+        seen.add(snippet.prefix)
+        const option = snippetCompletion(snippet.body, { label: snippet.prefix, detail: snippet.description, type: 'snippet' })
+        const exact = snippet.prefix === typed ? 1.2 : 0
+        scored.set(snippet.prefix + ' snippet', { ...option, ['source' as never]: 'snippet', score: 1.55 + exact - snippet.prefix.length * 0.004 } as Completion & { score: number })
+      }
     }
     const options = [...scored.values()].sort((a, b) => b.score - a.score).slice(0, 40)
       .map((option, index) => ({ ...option, boost: 99 - Math.min(198, index) }))

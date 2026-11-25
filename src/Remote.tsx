@@ -181,8 +181,8 @@ export function OpenRemoteDialog({ host, onClose, onOpen, onBack }: { host: SshH
 }
 
 /** "Connect to server": pick a known server or type user@host, then browse its folders. */
-export function ConnectDialog({ hosts, onClose, onOpen, onAdvanced }: { hosts: SshHost[]; onClose: () => void; onOpen: (host: SshHost, path: string) => Promise<void>; onAdvanced: (host: SshHost) => void }) {
-  const [target, setTarget] = useState('')
+export function ConnectDialog({ hosts, onClose, onOpen, onAdvanced, initial = '' }: { hosts: SshHost[]; onClose: () => void; onOpen: (host: SshHost, path: string) => Promise<void>; onAdvanced: (host: SshHost) => void; initial?: string }) {
+  const [target, setTarget] = useState(initial)
   const [host, setHost] = useState<SshHost | null>(null)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)

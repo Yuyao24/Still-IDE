@@ -355,6 +355,8 @@ pub fn create_project(
     template_kind: String,
     parent: Option<String>,
     git: bool,
+    readme: Option<bool>,
+    requirements: Option<bool>,
 ) -> Result<WorkspaceInfo> {
     let name = valid_name(&name)?.to_owned();
     let folder = parent_folder(&app, &store, parent)?.join(&name);
@@ -362,7 +364,12 @@ pub fn create_project(
         return Err(format!("A folder named “{name}” already exists there."));
     }
     fs::create_dir_all(&folder).map_err(err)?;
-    for (path, contents) in template(&template_kind, &name) {
+    // README.md and requirements.txt are optional (both on unless turned off in the dialog).
+    let files = template(&template_kind, &name).into_iter().filter(|(path, _)| {
+        !(*path == "README.md" && readme == Some(false) && template_kind != "sample")
+            && !(*path == "requirements.txt" && requirements == Some(false) && template_kind != "sample")
+    });
+    for (path, contents) in files {
         let target = folder.join(path);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).map_err(err)?;

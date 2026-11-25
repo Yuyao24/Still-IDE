@@ -46,6 +46,9 @@ export default function Home(props: Props) {
   const [connecting, setConnecting] = useState(false)
   const [menu, setMenu] = useState<MenuState | null>(null)
   const [showAll, setShowAll] = useState(false)
+  const [cloneUrl, setCloneUrl] = useState('')
+  const [connectTarget, setConnectTarget] = useState('')
+  const [newName, setNewName] = useState('')
   const filterInput = useRef<HTMLInputElement>(null)
   const list = useRef<HTMLDivElement>(null)
 
@@ -161,35 +164,39 @@ export default function Home(props: Props) {
     void api.git(latest.path).then(result => { if (live) setChanged(result.changes.length) }).catch(() => {})
     return () => { live = false }
   }, [latest?.path])
+  // The rows under the box: Continue first, then projects; or, while typing, matching projects plus
+  // "Clone …", "Connect to …" and "New project …" when the text looks like one of those.
+  const [picked, setPicked] = useState(0)
+  interface LaunchRow { key: string; kind: string; label: string; name: string; detail: string; project?: ProjectSummary; missing?: boolean; run: () => void }
+  const projectRow = (project: ProjectSummary): LaunchRow => ({
+    key: project.path, kind: 'project', label: '', name: project.name, project, missing: project.missing,
+    detail: project.missing ? 'missing' : [project.location === 'external' ? shortPath(project.path, homeDir) : '', project.languages.slice(0, 2).join(', '), project.lastOpened ? relativeTime(project.lastOpened).toLowerCase() : ''].filter(Boolean).join(' · '),
+    run: () => { if (!project.missing) void open(project.path) },
+  })
+  const typed = filter.trim()
+  const gitUrl = /^(https?:\/\/\S+|git@\S+:\S+|ssh:\/\/\S+)$/.test(typed) && (typed.endsWith('.git') || /github|gitlab|bitbucket|git@/.test(typed))
+  const sshTarget = !gitUrl && /^[^@\s/]+@[^\s/:]+(:\d+)?$/.test(typed)
+  const launchRows: LaunchRow[] = typed ? [
+    ...(gitUrl ? [{ key: 'clone', kind: 'action', label: 'Clone', name: typed.replace(/^https?:\/\//, '').replace(/\.git$/, ''), detail: 'into your projects folder', run: () => { setCloneUrl(typed); setCloning(true) } }] : []),
+    ...(sshTarget ? [{ key: 'ssh', kind: 'action', label: 'Connect', name: typed, detail: 'browse its folders', run: () => { setConnectTarget(typed); setConnecting(true) } }] : []),
+    ...filtered.slice(0, 8).map(projectRow),
+    ...(!gitUrl && !sshTarget && !/[<>:"/\\|?*]/.test(typed) && !projects.some(project => project.name.toLowerCase() === typed.toLowerCase())
+      ? [{ key: 'new', kind: 'action', label: 'New project', name: typed, detail: 'create it in your projects folder', run: () => { setNewName(typed); setCreating(true) } }] : []),
+  ] : [
+    ...(latest ? [{ ...projectRow(latest), key: 'continue', kind: 'continue', label: 'Continue', detail: [resume ? resume.path.split('/').at(-1) + ', line ' + resume.line : '', changed ? changed + ' changed' : '', relativeTime(latest.lastOpened).toLowerCase()].filter(Boolean).join(' · '), run: () => { void open(latest.path, resume ?? undefined) } }] : []),
+    ...(showAll ? filtered : filtered.slice(0, 6)).filter(project => project.path !== latest?.path).map(projectRow),
+  ]
   const todays = entries.filter(entry => sameDay(entry.time, Date.now())).slice(-3).reverse()
 
   return <div className="app home-app">
     <TitleBar onError={props.notify}
       left={<span className="brand"><img src={mark} alt="" /><span className="brand-word">Still</span></span>}
-      right={<>
-        <label className="paper-search">
-          <input ref={filterInput} value={filter} onChange={event => setFilter(event.target.value)} placeholder="Search" aria-label="Search projects" spellCheck={false}
-            onKeyDown={event => {
-              if (event.key === 'Escape') { setFilter(''); event.currentTarget.blur() }
-              if (event.key === 'Enter' && filtered[0] && !filtered[0].missing) void open(filtered[0].path)
-              if (event.key === 'ArrowDown') { event.preventDefault(); list.current?.querySelector<HTMLButtonElement>('.project-open')?.focus() }
-            }} />
-          {!filter && <kbd>{mod}+K</kbd>}
-        </label>
-        <button className="quiet-link" onClick={() => props.onSettings()}>Settings</button>
-      </>} />
+      right={<button className="quiet-link" onClick={() => props.onSettings()}>Settings</button>} />
 
-    <main className="home" onKeyDown={rowKey}>
-      <div className="paper">
-        <header className="paper-hero">
+    <main className="home launch">
+      <div className="launch-column">
+        <header className="launch-hero">
           <h1>{greeting()}.</h1>
-          <p>Pick up where you left off, or start something new.</p>
-          <div className="paper-actions">
-            <button className="paper-btn primary" onClick={() => setCreating(true)}>New project</button>
-            <button className="calm-action" onClick={() => { void openFolder() }}>Open folder</button>
-            <button className="calm-action" onClick={() => desktop ? setCloning(true) : props.notify('Cloning is available in the Still desktop app.')}>Clone</button>
-            <button className="calm-action" onClick={() => desktop ? setConnecting(true) : props.notify('SSH is available in the Still desktop app.')}>Connect to server</button>
-          </div>
         </header>
 
         {state && !state.projectsRoot && desktop && <section className="setup-card">
@@ -203,54 +210,56 @@ export default function Home(props: Props) {
           </div>
         </section>}
 
-        {latest && !term && <section className="calm-continue">
-          <button onClick={() => { void open(latest.path, resume ?? undefined) }} onContextMenu={event => showMenu(event, projectMenu(latest))}>
-            <span className="calm-label">Continue</span>
-            <b>{latest.name}</b>
-            <span className="calm-where">{[resume ? resume.path.split('/').at(-1) + ', line ' + resume.line : '', relativeTime(latest.lastOpened).toLowerCase()].filter(Boolean).join(' · ')}{changed ? <em> · {changed} changed</em> : null}</span>
-          </button>
-        </section>}
+        {/* One box for everything: find a project, paste a Git URL to clone, or type user@host to connect. */}
+        <div className="launch-box">
+          <input ref={filterInput} value={filter} onChange={event => { setFilter(event.target.value); setPicked(0) }} spellCheck={false} autoFocus
+            placeholder="Open a project, paste a Git URL, or type user@host" aria-label="Open a project, clone a repository or connect to a server"
+            onKeyDown={event => {
+              if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); setPicked(value => Math.max(0, Math.min(launchRows.length - 1, value + (event.key === 'ArrowDown' ? 1 : -1)))) }
+              else if (event.key === 'Enter') { event.preventDefault(); launchRows[picked]?.run() }
+              else if (event.key === 'Escape') { setFilter(''); setPicked(0) }
+            }} />
+          <kbd>{mod}+K</kbd>
+        </div>
 
-        <section className="calm-grid">
-          <div ref={list} className="calm-projects">
-            <div className="calm-head">
-              <h2>{term ? 'Matching projects' : 'Projects'}</h2>
-              {!term && <span className="calm-sort">
-                <button className={sort === 'recent' ? 'is-active' : ''} onClick={() => setSort('recent')}>Recent</button>
-                <button className={sort === 'name' ? 'is-active' : ''} onClick={() => setSort('name')}>Name</button>
-              </span>}
-            </div>
-            <div className="calm-list">
-              {(showAll || term ? filtered : filtered.slice(0, 7)).map(row)}
-              {state && !filtered.length && <p className="calm-quiet">
-                {term ? <>No projects match “{filter}”.</> : <>No projects yet. <button className="link" onClick={() => setCreating(true)}>Create one</button>, or try the Orbit Lab sample from New project.</>}
-              </p>}
-            </div>
-            {!term && filtered.length > 7 && <button className="calm-more" onClick={() => setShowAll(value => !value)}>{showAll ? 'Fewer' : 'All ' + filtered.length + ' projects'}</button>}
-            {state?.projectsRoot && !term && <button className="calm-root" onClick={event => showMenu(event, [
-              { label: 'Change projects folder…', icon: FolderOpen, action: () => { void chooseRoot() } },
-              { label: 'Reveal in file manager', icon: FolderSearch, action: () => { void home.reveal(state.projectsRoot!).catch(props.notify) } },
-            ], true)} title={state.projectsRoot}>{shortPath(state.projectsRoot, homeDir)}</button>}
-          </div>
-          {!term && <div className="calm-journal">
-            <div className="calm-head"><h2>Today</h2></div>
-            {todays.map(entry => <button key={entry.id} className="calm-entry" onClick={() => { void open(entry.root, entry.path ? { path: entry.path, line: 1, time: entry.time } : undefined) }} title={entry.project}>
-              <time>{clock(entry.time)}</time><span>{entryText(entry)}</span>
-            </button>)}
-            {!todays.length && <p className="calm-quiet">Nothing yet today.</p>}
-            <button className="calm-more" onClick={() => setJournal(true)}>Open journal</button>
-          </div>}
-        </section>
+        <div className="launch-list" ref={list} role="listbox" aria-label="Projects and actions">
+          {launchRows.map((row, index) => <div key={row.key} role="option" aria-selected={index === picked} className={'launch-row' + (index === picked ? ' is-picked' : '') + (row.kind === 'continue' ? ' is-continue' : '') + (row.missing ? ' missing' : '')}
+            onMouseEnter={() => setPicked(index)} onContextMenu={row.project ? event => showMenu(event, projectMenu(row.project!)) : undefined}>
+            <button className="project-open" onClick={row.run} disabled={row.missing}>
+              <span className="launch-kind">{row.label}</span>
+              <span className="launch-name">{row.name}</span>
+              <span className="launch-detail">{row.detail}</span>
+            </button>
+            {row.project && <IconButton glyph={Ellipsis} label={'Actions for ' + row.name} className="row-action" onClick={event => showMenu(event, projectMenu(row.project!), true)} />}
+          </div>)}
+          {state && !launchRows.length && <p className="calm-quiet">{term ? <>Nothing matches “{filter}”. Press Enter to create a project with that name.</> : <>No projects yet. <button className="link" onClick={() => setCreating(true)}>Create one</button>, or try the Orbit Lab sample from New project.</>}</p>}
+        </div>
+
+        <nav className="launch-actions" aria-label="Start something">
+          <button onClick={() => setCreating(true)}>New project <kbd>{mod}+N</kbd></button>
+          <button onClick={() => { void openFolder() }}>Open folder <kbd>{mod}+O</kbd></button>
+          <button onClick={() => desktop ? setCloning(true) : props.notify('Cloning is available in the Still desktop app.')}>Clone</button>
+          <button onClick={() => desktop ? setConnecting(true) : props.notify('SSH is available in the Still desktop app.')}>Connect to server</button>
+          {!term && projects.length > 6 && <button onClick={() => setShowAll(value => !value)}>{showAll ? 'Fewer projects' : 'All ' + projects.length + ' projects'}</button>}
+        </nav>
+
+        {!term && <section className="launch-today">
+          <span className="calm-label">Today</span>
+          {todays.length ? todays.map(entry => <button key={entry.id} className="calm-entry" onClick={() => { void open(entry.root, entry.path ? { path: entry.path, line: 1, time: entry.time } : undefined) }} title={entry.project}>
+            <time>{clock(entry.time)}</time><span>{entryText(entry)}</span>
+          </button>) : <p className="calm-quiet">Nothing yet today.</p>}
+          <button className="calm-more" onClick={() => setJournal(true)}>Open journal</button>
+        </section>}
       </div>
     </main>
 
-    {creating && <NewProjectDialog root={state?.projectsRoot ?? null} homeDir={homeDir} onClose={() => setCreating(false)} notify={props.notify}
+    {creating && <NewProjectDialog initialName={newName} root={state?.projectsRoot ?? null} homeDir={homeDir} onClose={() => { setCreating(false); setNewName('') }} notify={props.notify}
       onChooseRoot={() => { void chooseRoot() }} onCreated={(workspace, options) => {
         setCreating(false)
         if (settings.journal) journal.add({ kind: 'create', project: workspace.name, root: workspace.root, text: 'Created ' + workspace.name })
         props.onOpen(workspace, options)
       }} />}
-    {cloning && <CloneDialog root={state?.projectsRoot ?? null} homeDir={homeDir} onClose={() => setCloning(false)}
+    {cloning && <CloneDialog initialUrl={cloneUrl} root={state?.projectsRoot ?? null} homeDir={homeDir} onClose={() => { setCloning(false); setCloneUrl('') }}
       onCloned={path => {
         setCloning(false)
         if (settings.journal) journal.add({ kind: 'clone', project: path.split(/[\\/]/).filter(Boolean).at(-1) ?? path, root: path, text: 'Cloned ' + (path.split(/[\\/]/).filter(Boolean).at(-1) ?? path) })
@@ -259,7 +268,7 @@ export default function Home(props: Props) {
     {journalOpen && <JournalSheet onClose={() => setJournal(false)} onOpen={entry => { setJournal(false); void open(entry.root, entry.path ? { path: entry.path, line: 1, time: entry.time } : undefined) }} />}
     {editingHost && <HostDialog host={editingHost} onClose={() => setEditingHost(null)} onSaved={host => { void refresh(); setRemoteHost(host) }} />}
     {remoteHost && <OpenRemoteDialog host={remoteHost} onClose={() => setRemoteHost(null)} onOpen={path => props.onOpenRemote(remoteHost, path)} />}
-    {connecting && <ConnectDialog hosts={hosts} onClose={() => { setConnecting(false); void refresh() }} onOpen={props.onOpenRemote} onAdvanced={host => { setConnecting(false); setEditingHost(host) }} />}
+    {connecting && <ConnectDialog initial={connectTarget} hosts={hosts} onClose={() => { setConnecting(false); setConnectTarget(''); void refresh() }} onOpen={props.onOpenRemote} onAdvanced={host => { setConnecting(false); setEditingHost(host) }} />}
     {menu && <Menu {...menu} onClose={() => setMenu(null)} />}
   </div>
 }
@@ -292,14 +301,16 @@ function Location({ root, homeDir, custom, setCustom, onChooseRoot }: { root: st
   </fieldset>
 }
 
-function NewProjectDialog({ root, homeDir, onClose, onCreated, onChooseRoot, notify }: {
-  root: string | null; homeDir: string; onClose: () => void; onCreated: (workspace: Workspace, options: OpenOptions) => void; onChooseRoot: () => void; notify: (error: unknown) => void
+function NewProjectDialog({ root, homeDir, onClose, onCreated, onChooseRoot, notify, initialName = '' }: {
+  initialName?: string; root: string | null; homeDir: string; onClose: () => void; onCreated: (workspace: Workspace, options: OpenOptions) => void; onChooseRoot: () => void; notify: (error: unknown) => void
 }) {
   const { settings, update } = useSettings()
-  const [name, setName] = useState('')
+  const [name, setName] = useState(initialName)
   const [template, setTemplate] = useState(settings.newProjectTemplate)
   const [custom, setCustom] = useState<string | null>(root ? null : '')
   const [git, setGit] = useState(settings.newProjectGit)
+  const [readme, setReadme] = useState(settings.newProjectReadme)
+  const [requirements, setRequirements] = useState(settings.newProjectRequirements)
   const [venv, setVenv] = useState(false)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
@@ -314,8 +325,8 @@ function NewProjectDialog({ root, homeDir, onClose, onCreated, onChooseRoot, not
     setBusy(true)
     setError('')
     try {
-      const workspace = await home.create(name.trim(), template, custom || null, git)
-      update({ newProjectTemplate: template, newProjectGit: git })
+      const workspace = await home.create(name.trim(), template, custom || null, git, readme, requirements)
+      update({ newProjectTemplate: template, newProjectGit: git, newProjectReadme: readme, ...(template === 'python' ? { newProjectRequirements: requirements } : {}) })
       onCreated(workspace, { venv: venv && template === 'python' })
     } catch (failure) { setError(String(failure)) } finally { setBusy(false) }
   }
@@ -335,6 +346,8 @@ function NewProjectDialog({ root, homeDir, onClose, onCreated, onChooseRoot, not
       <Location root={root} homeDir={homeDir} custom={custom} setCustom={setCustom} onChooseRoot={onChooseRoot} />
       <div className="toggles">
         <Toggle label="Initialize a Git repository" checked={git} onChange={setGit} />
+        {template !== 'sample' && <Toggle label="Add a README" description="README.md with the project name, for notes about the project." checked={readme} onChange={setReadme} />}
+        {template === 'python' && <Toggle label="Add requirements.txt" description="Lists the packages the project needs, for pip install -r." checked={requirements} onChange={setRequirements} />}
         {template === 'python' && <Toggle label="Create a virtual environment (.venv)" description="Runs python -m venv .venv after the project opens." checked={venv} onChange={setVenv} />}
       </div>
       {error && <p className="form-error" role="alert">{error}</p>}
@@ -347,8 +360,8 @@ function NewProjectDialog({ root, homeDir, onClose, onCreated, onChooseRoot, not
   </Modal>
 }
 
-function CloneDialog({ root, homeDir, onClose, onCloned }: { root: string | null; homeDir: string; onClose: () => void; onCloned: (path: string) => void }) {
-  const [url, setUrl] = useState('')
+function CloneDialog({ root, homeDir, onClose, onCloned, initialUrl = '' }: { root: string | null; homeDir: string; onClose: () => void; onCloned: (path: string) => void; initialUrl?: string }) {
+  const [url, setUrl] = useState(initialUrl)
   const [name, setName] = useState('')
   const [custom, setCustom] = useState<string | null>(root ? null : '')
   const [log, setLog] = useState('')

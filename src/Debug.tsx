@@ -44,7 +44,7 @@ export function DebugPanel(props: Props) {
   const [expression, setExpression] = useState('')
   const [globalsOpen, setGlobalsOpen] = useState(false)
   const paused = session?.state === 'paused'
-  const status = !session ? (props.canDebug ? (props.breakpointCount ? props.breakpointCount + (props.breakpointCount === 1 ? ' breakpoint set.' : ' breakpoints set.') + ' Press F5 to start.' : 'Click beside a line number to set a breakpoint, then press F5.') : props.why ?? 'Open a Python file to debug it.')
+  const status = !session ? (props.canDebug ? (props.breakpointCount ? props.breakpointCount + (props.breakpointCount === 1 ? ' breakpoint set.' : ' breakpoints set.') + ' Press F5 to start.' : 'Click beside a line number to set a breakpoint, then press F5.') : props.why ?? 'Open a Python or Java file to debug it.')
     : session.state === 'starting' ? 'Starting…' : session.state === 'running' ? 'Running… it pauses at the next breakpoint.'
     : stop ? (stop.reason === 'exception' ? 'Stopped on an error: ' + stop.detail : 'Paused at ' + stop.file.split('/').at(-1) + ', line ' + stop.line + (stop.reason === 'breakpoint' ? ' (breakpoint)' : '')) : 'Paused'
   return <div className="dbg">
@@ -97,7 +97,7 @@ export function DebugPanel(props: Props) {
       {paused && <>
         {session.evals.length > 0 && <div className="dbg-evals">{session.evals.slice(-6).map((item, index) => <div key={index} className={item.ok ? '' : 'is-error'}><span>› {item.expression}</span>{item.value && <b>{item.value}</b>}</div>)}</div>}
         <form className="dbg-eval" onSubmit={event => { event.preventDefault(); if (expression.trim()) props.onEval(expression.trim()); setExpression('') }}>
-          <input className="field dbg-input" value={expression} onChange={event => setExpression(event.target.value)} placeholder="Evaluate in the paused frame, e.g. len(items)" spellCheck={false} />
+          <input className="field dbg-input" value={expression} onChange={event => setExpression(event.target.value)} placeholder={'Evaluate in the paused frame, e.g. ' + (session?.stop?.frameFile?.endsWith('.java') ? 'items.size()' : 'len(items)')} spellCheck={false} />
         </form>
       </>}
     </div>

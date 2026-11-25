@@ -1,7 +1,8 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import {
   Check, Code2, Copy, FileDown, FolderOpen, FolderSearch, Import, Info, Keyboard, Palette, Pencil, Plus, Search, Server, SquareTerminal, Trash2, X, Sparkles } from 'lucide-react'
-import { type AppPaths, type PlanItem, type ShellOption, type SshOverview, desktop, home, hostLabel, mod, pickFolder, ssh } from './bridge'
+import { type AppPaths, type PlanItem, type ShellOption, type SshOverview, desktop, editorSupport, home, hostLabel, mod, pickFolder, ssh } from './bridge'
+import { listen } from '@tauri-apps/api/event'
 import { blankHost, HostDialog } from './Remote'
 import { editorFonts, useSettings } from './settings'
 import { findUpdate } from './updates'
@@ -323,8 +324,20 @@ function EditorSettings() {
     <section className="settings-group">
       <h3>Checks and changes</h3>
       <Toggle label="Show errors while typing" description="Underlines syntax errors as you type. Python files are also checked for undefined names (and, with pyflakes installed, unused imports and more)." checked={settings.errors} onChange={value => update({ errors: value })} />
+      <Toggle label="Show who last changed the current line" description="At the end of the line you're on: the author, when, and the commit message (Git blame). Still menu → Git → Blame for every line shows it for the whole file." checked={settings.inlineBlame} onChange={value => update({ inlineBlame: value })} />
       <Toggle label="Mark lines changed since the last commit" description="A green bar for added lines, amber for changed lines and a red mark where lines were removed." checked={settings.gitGutter} onChange={value => update({ gitGutter: value })} />
     </section>
+    <section className="settings-group">
+      <h3>Language support</h3>
+      <Toggle label="Use language servers" description="When Pyright, jdtls, typescript-language-server, rust-analyzer, gopls or clangd is installed, Still uses it for completion, docs on hover, go to definition (F12), find references (Shift+F12), rename (F2) and type errors. Install Pyright below." checked={settings.languageServers} onChange={value => update({ languageServers: value })} />
+    </section>
+    <section className="settings-group">
+      <h3>Formatting and linting</h3>
+      <Toggle label="Format files when saving" description="Uses ruff or black for Python, google-java-format for Java and prettier for web files, when installed. Shift+Alt+F formats any time." checked={settings.formatOnSave} onChange={value => update({ formatOnSave: value })} />
+      <Toggle label="Lint Python with ruff" description="When ruff is installed, its warnings (unused imports, likely bugs, style) appear while you type." checked={settings.lintWithRuff} onChange={value => update({ lintWithRuff: value })} />
+    </section>
+    <ToolSettings />
+    <SnippetSettings />
     <section className="settings-group">
       <h3>Diffs and files</h3>
       <div className="setting-row"><span className="setting-text"><span>Diff layout</span></span>
@@ -339,6 +352,58 @@ function EditorSettings() {
       <Toggle label="Keep a journal" description="Notes saves, runs and commits on this computer. Shown on Home under Journal." checked={settings.journal} onChange={value => update({ journal: value })} />
     </section>
   </>
+}
+
+function ToolSettings() {
+  const [tools, setTools] = useState<{ name: string; purpose: string; found: string | null; install: string | null }[] | null>(null)
+  const [busy, setBusy] = useState<string | null>(null)
+  const [message, setMessage] = useState('')
+  const load = () => { if (desktop) void editorSupport.tools(null).then(setTools).catch(() => setTools([])) }
+  useEffect(load, [])
+  useEffect(() => {
+    if (!desktop) return
+    const stop = listen<{ id: string; kind: string; code?: number }>('job-output', ({ payload }) => {
+      if (!payload.id.startsWith('install-') || payload.kind !== 'exit') return
+      setBusy(null); setMessage(payload.code === 0 ? 'Installed. Restart open projects to use it.' : 'The install failed. Check that pip works for your Python.'); load()
+    })
+    return () => { void stop.then(unlisten => unlisten()) }
+  }, [])
+  return <section className="settings-group">
+    <h3>Tools</h3>
+    <p className="help mb-3">Still uses these when they're installed in the project (.venv, node_modules) or on PATH. Python tools install with one click.</p>
+    {!desktop && <p className="help">Tools are available in the Still desktop app.</p>}
+    {tools?.map(tool => <div key={tool.name} className="setting-row"><span className="setting-text"><span>{tool.name}</span><small>{tool.purpose}{tool.found ? ' · found' : ''}</small></span>
+      {tool.found ? <span className="help tool-found" title={tool.found}>Installed</span>
+        : tool.install ? <button className="text-btn" disabled={Boolean(busy)} onClick={() => { const id = 'install-' + crypto.randomUUID(); setBusy(tool.name); setMessage('Installing ' + tool.name + '…'); void editorSupport.install(null, id, tool.install!).catch(error => { setBusy(null); setMessage(String(error)) }) }}>{busy === tool.name ? 'Installing…' : 'Install'}</button>
+        : <span className="help">Not found</span>}</div>)}
+    {message && <p className="help mt-2">{message}</p>}
+  </section>
+}
+
+function SnippetSettings() {
+  const { settings, update } = useSettings()
+  const [draft, setDraft] = useState({ prefix: '', language: 'python', description: '', body: '' })
+  return <section className="settings-group">
+    <h3>Snippets</h3>
+    <p className="help mb-3">Type a snippet's prefix and press Tab to expand it; Tab again moves between the parts marked {'${like_this}'}. Built-in ones include main, def, class, for, try, test (Python), psvm, sout, fori (Java) and log, fn, af (JavaScript).</p>
+    {settings.customSnippets.map((snippet, index) => <div key={index} className="setting-row"><span className="setting-text"><span><code>{snippet.prefix}</code> · {snippet.language}</span><small>{snippet.description || snippet.body.split('\n')[0]}</small></span>
+      <IconButton glyph={Trash2} label={'Remove ' + snippet.prefix} onClick={() => update({ customSnippets: settings.customSnippets.filter((_, position) => position !== index) })} /></div>)}
+    <form className="form-grid snippet-form" onSubmit={event => {
+      event.preventDefault()
+      if (!draft.prefix.trim() || !draft.body.trim()) return
+      update({ customSnippets: [...settings.customSnippets, { ...draft, prefix: draft.prefix.trim() }] })
+      setDraft({ prefix: '', language: draft.language, description: '', body: '' })
+    }}>
+      <div className="grid grid-cols-[1fr_140px] gap-2">
+        <label>Prefix<input className="field" value={draft.prefix} onChange={event => setDraft({ ...draft, prefix: event.target.value })} placeholder="hello" spellCheck={false} /></label>
+        <label>Language<select className="field" value={draft.language} onChange={event => setDraft({ ...draft, language: event.target.value })}>
+          <option value="python">Python</option><option value="java">Java</option><option value="javascript">JavaScript / TypeScript</option><option value="any">Any file</option></select></label>
+      </div>
+      <label>Description<input className="field" value={draft.description} onChange={event => setDraft({ ...draft, description: event.target.value })} placeholder="Print a greeting" /></label>
+      <label>Body<textarea className="field font-mono" rows={4} value={draft.body} onChange={event => setDraft({ ...draft, body: event.target.value })} placeholder={'print(f"Hello, ${name}!")'} spellCheck={false} /></label>
+      <div className="flex justify-end"><button type="submit" className="text-btn primary" disabled={!draft.prefix.trim() || !draft.body.trim()}>Add snippet</button></div>
+    </form>
+  </section>
 }
 
 function TerminalSettings() {
@@ -392,10 +457,14 @@ function ProjectSettings({ notify }: { notify: (message: unknown) => void }) {
           <option value="python">Python</option><option value="java">Java</option><option value="node">JavaScript</option><option value="empty">Empty</option><option value="sample">Orbit Lab sample</option>
         </select></div>
       <Toggle label="Initialize a Git repository" checked={settings.newProjectGit} onChange={value => update({ newProjectGit: value })} />
+      <Toggle label="Add a README" checked={settings.newProjectReadme} onChange={value => update({ newProjectReadme: value })} />
+      <Toggle label="Add requirements.txt to Python projects" checked={settings.newProjectRequirements} onChange={value => update({ newProjectRequirements: value })} />
     </section>
     <section className="settings-group">
       <h3>Startup</h3>
       <Toggle label="Reopen the last project when Still starts" description="Off: Still opens on Home." checked={settings.openLastProject} onChange={value => update({ openLastProject: value })} />
+      <div className="setting-row"><span className="setting-text"><span>When a project opens, show</span><small>The files you had open last time (where you left off), or the project's README.</small></span>
+        <Segmented label="When a project opens" value={settings.openOnStart} onChange={value => update({ openOnStart: value })} options={[{ value: 'last', label: 'Last open files' }, { value: 'readme', label: 'README' }]} /></div>
     </section>
   </>
 }

@@ -210,9 +210,21 @@ pub fn create_file(root_path: String, path: String) -> Result<()> {
     let base = root(&root_path)?;
     let path = relative(&path)?;
     let parent = path.parent().ok_or("Enter a file name.")?;
-    let parent = base.join(parent).canonicalize().map_err(err)?;
+    // Folders in the path that don't exist yet are created, as in other editors. The deepest
+    // folder that does exist is checked first, so a link can't lead the new ones outside.
+    let mut existing = base.join(parent);
+    let mut missing = Vec::new();
+    while !existing.exists() {
+        missing.push(existing.file_name().ok_or("Enter a file name.")?.to_owned());
+        if !existing.pop() { break }
+    }
+    let mut parent = existing.canonicalize().map_err(err)?;
     if !parent.starts_with(&base) {
         return Err("The folder points outside the workspace.".into());
+    }
+    for folder in missing.into_iter().rev() {
+        parent.push(folder);
+        std::fs::create_dir(&parent).map_err(err)?;
     }
     let name = path.file_name().ok_or("Enter a file name.")?;
     OpenOptions::new()

@@ -114,7 +114,7 @@ fn pythons() -> &'static Mutex<HashMap<PathBuf, Option<PathBuf>>> {
 
 /// Checks Python source with the project's interpreter. Returns no issues when Python is missing.
 #[tauri::command]
-pub async fn check_python(root_path: String, source: String) -> Result<Vec<CodeIssue>> {
+pub async fn check_python(root_path: String, source: String, path: Option<String>, lint: Option<bool>) -> Result<Vec<CodeIssue>> {
     tauri::async_runtime::spawn_blocking(move || {
         let cwd = root(&root_path)?;
         let interpreter = {
@@ -134,7 +134,15 @@ pub async fn check_python(root_path: String, source: String) -> Result<Vec<CodeI
         }
         let output = child.wait_with_output().map_err(err)?;
         let text = String::from_utf8_lossy(&output.stdout);
-        Ok(serde_json::from_str(text.lines().last().unwrap_or("[]")).unwrap_or_default())
+        let mut issues: Vec<CodeIssue> = serde_json::from_str(text.lines().last().unwrap_or("[]")).unwrap_or_default();
+        // Ruff adds unused imports, style problems and more, when it's installed.
+        if lint != Some(false) && !issues.iter().any(|issue| issue.message.contains("syntax")) {
+            for found in crate::tools::ruff_lint(&cwd, path.as_deref().unwrap_or("file.py"), &source) {
+                if issues.iter().any(|issue| issue.line == found.line && found.message.contains("undefined name")) { continue }
+                issues.push(CodeIssue { line: found.line, column: found.column, end_line: found.end_line, end_column: found.end_column, severity: found.severity, message: found.message });
+            }
+        }
+        Ok(issues)
     })
     .await
     .map_err(err)?

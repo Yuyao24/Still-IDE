@@ -2,6 +2,7 @@ import { createContext, useContext } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { type Theme, applySyntax, applyTheme, findTheme, presets } from './themes'
 import { desktop } from './bridge'
+import { type Snippet, setCustomSnippets } from './completion'
 
 export interface Settings {
   theme: string
@@ -57,6 +58,15 @@ export interface Settings {
   reduceMotion: boolean
   autoHideTopBar: boolean
   settingsVersion: number
+  newProjectReadme: boolean
+  newProjectRequirements: boolean
+  openOnStart: 'last' | 'readme'
+  formatOnSave: boolean
+  inlineBlame: boolean
+  lintWithRuff: boolean
+  /** Start Pyright, jdtls, typescript-language-server and others when they're installed. */
+  languageServers: boolean
+  customSnippets: Snippet[]
   openLastProject: boolean
   terminalScrollback: number
   terminalCopyOnSelect: boolean
@@ -116,6 +126,14 @@ export const defaults: Settings = {
   reduceMotion: false,
   autoHideTopBar: false,
   settingsVersion: 2,
+  newProjectReadme: true,
+  newProjectRequirements: true,
+  openOnStart: 'last',
+  formatOnSave: false,
+  inlineBlame: true,
+  lintWithRuff: true,
+  languageServers: true,
+  customSnippets: [],
   openLastProject: false,
   terminalScrollback: 5000,
   terminalCopyOnSelect: false,
@@ -200,6 +218,7 @@ export function applySettings(settings: Settings, systemDark: boolean) {
   classes.toggle('cursor-underline', settings.cursorStyle === 'underline')
   classes.toggle('reduce-motion', settings.reduceMotion)
   watchKeyRepeat()
+  setCustomSnippets(settings.customSnippets)
   return theme
 }
 

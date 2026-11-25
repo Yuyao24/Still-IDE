@@ -1,4 +1,4 @@
-import { type Extension, Compartment, EditorSelection, EditorState, Prec, RangeSet, RangeSetBuilder, StateEffect, StateField, Text } from '@codemirror/state'
+import { type Extension, Annotation, Compartment, EditorSelection, EditorState, Prec, RangeSet, RangeSetBuilder, StateEffect, StateField, Text, Transaction } from '@codemirror/state'
 import { cursorDocEnd, defaultKeymap, history, historyKeymap, indentWithTab, redo, selectAll, toggleComment, undo } from '@codemirror/commands'
 import {
   Decoration, type DecorationSet, EditorView, GutterMarker, ViewPlugin, type ViewUpdate, crosshairCursor, drawSelection, dropCursor, gutter, highlightActiveLine, highlightActiveLineGutter,
@@ -7,8 +7,9 @@ import {
 import { HighlightStyle, Language, LanguageSupport, StreamLanguage, bracketMatching, ensureSyntaxTree, foldAll, foldGutter, foldKeymap, getIndentUnit, indentOnInput, indentUnit, syntaxHighlighting, syntaxTree, unfoldAll } from '@codemirror/language'
 import { gotoLine, highlightSelectionMatches, openSearchPanel, searchKeymap, selectNextOccurrence, selectSelectionMatches } from '@codemirror/search'
 import { acceptCompletion, autocompletion, closeBrackets, closeBracketsKeymap, closeCompletion, moveCompletionSelection, startCompletion } from '@codemirror/autocomplete'
-import { forceLinting, lintGutter, lintKeymap, linter, type Diagnostic as EditorDiagnostic } from '@codemirror/lint'
-import { Chunk, MergeView, unifiedMergeView } from '@codemirror/merge'
+import { lintGutter, lintKeymap, linter, type Diagnostic as EditorDiagnostic } from '@codemirror/lint'
+import { needsRefresh, relint } from './relint'
+import { Chunk, MergeView, diff as textDiff, unifiedMergeView } from '@codemirror/merge'
 import { highlightCode, highlightTree, tagHighlighter, tags } from '@lezer/highlight'
 import { python } from '@codemirror/lang-python'
 import { java } from '@codemirror/lang-java'
@@ -34,7 +35,10 @@ import { properties } from '@codemirror/legacy-modes/mode/properties'
 import { useEffect, useLayoutEffect, useRef } from 'react'
 import { scopedOccurrences } from './occurrences'
 import { smartCompletions, sourceColumn } from './completion'
+import { lspLanguage, serverCommands, serverDiagnostics, serverExtension, withServer, type Server } from './lsp'
 import { inlineSuggestions, type Suggest } from './ghost'
+import { blameGutter, gitLines, setBlame } from './gitlines'
+import type { BlameLine } from './bridge'
 import { type Diagnostic, type Diff, clipboard, normalize } from './bridge'
 
 const look = EditorView.theme({
@@ -56,6 +60,51 @@ const look = EditorView.theme({
   '.cm-selectionMatch': { background: 'var(--occurrence)', borderRadius: '0' },
   '.cm-selectionMatch-main': { background: 'var(--occurrence)', outline: '1px solid var(--occurrence-border)' },
   '.cm-occurrence': { background: 'var(--occurrence)' },
+  // Language server tooltips and panels, in the same paper style as the rest.
+  '.cm-tooltip.cm-lsp-hover-tooltip, .cm-tooltip.cm-lsp-signature-tooltip': { border: '1px solid var(--line)', boxShadow: '0 8px 24px var(--shadow)', borderRadius: '0', background: 'var(--editor)', maxWidth: 'min(560px, 70vw)', fontFamily: 'var(--font-ui)', fontSize: '12.5px', lineHeight: '1.55' },
+  '.cm-lsp-hover-tooltip': { padding: '6px 4px', maxHeight: '320px', overflow: 'auto' },
+  '.cm-lsp-documentation': { padding: '0 8px' },
+  '.cm-lsp-documentation p': { margin: '4px 0' },
+  '.cm-lsp-documentation code': { fontFamily: 'var(--font-mono)', fontSize: '12px' },
+  '.cm-lsp-documentation pre': { fontFamily: 'var(--font-mono)', fontSize: '12px', padding: '6px 8px', margin: '4px 0', background: 'var(--hover)', whiteSpace: 'pre-wrap' },
+  '.cm-lsp-documentation hr': { border: 'none', borderTop: '1px solid var(--line)', margin: '6px 0' },
+  '.cm-tooltip.cm-lsp-signature-tooltip': { padding: '4px 10px', borderRadius: '0' },
+  '.cm-lsp-signature': { fontFamily: 'var(--font-mono)', fontSize: '12.5px' },
+  '.cm-lsp-active-parameter': { color: 'var(--ink)', fontWeight: '700', textDecoration: 'underline', textUnderlineOffset: '3px' },
+  '.cm-lsp-signature-num': { color: 'var(--muted)', fontFamily: 'var(--font-ui)' },
+  '.cm-panel.cm-lsp-reference-panel': { fontFamily: 'var(--font-ui)', fontSize: '12.5px', maxHeight: '240px', overflow: 'auto', padding: '0 0 6px', outline: 'none' },
+  '.cm-lsp-reference-head': { display: 'flex', alignItems: 'center', padding: '4px 10px 4px 16px', color: 'var(--ink)', fontSize: '12px', borderBottom: '1px solid var(--line)', position: 'sticky', top: '0', background: 'var(--panel)' },
+  '.cm-lsp-reference-head span': { flex: '1' },
+  '.cm-lsp-reference-head button': { font: '12px var(--font-ui)', color: 'var(--muted)', background: 'none', border: 'none', cursor: 'pointer', padding: '2px 6px' },
+  '.cm-lsp-reference-head button:hover': { color: 'var(--ink)' },
+  '.cm-lsp-reference-file': { padding: '6px 16px 2px', color: 'var(--muted)', fontSize: '11px', fontWeight: '600' },
+  '.cm-lsp-reference strong': { fontWeight: '700', color: 'var(--ink)' },
+  '.cm-lsp-reference': { padding: '2px 16px', cursor: 'pointer', fontFamily: 'var(--font-mono)', fontSize: '12px', whiteSpace: 'pre', overflow: 'hidden', textOverflow: 'ellipsis' },
+  '.cm-lsp-reference:hover': { background: 'var(--hover)' },
+  '.cm-lsp-reference[aria-selected]': { background: 'var(--selection)' },
+  '.cm-lsp-reference-line': { color: 'var(--muted)', marginRight: '10px' },
+  '.cm-panel.cm-dialog': { padding: '8px 16px', fontFamily: 'var(--font-ui)', fontSize: '12.5px', display: 'flex', alignItems: 'center', gap: '8px' },
+  '.cm-panel.cm-dialog input': { font: '12.5px var(--font-mono)', padding: '4px 8px', border: '1px solid var(--line)', borderRadius: '0', background: 'var(--editor)', color: 'var(--ink)', outline: 'none' },
+  '.cm-panel.cm-dialog input:focus': { borderColor: 'var(--ink)' },
+  '.cm-panel.cm-dialog button': { font: '12px var(--font-ui)', padding: '3px 10px', border: '1px solid var(--line)', borderRadius: '0', background: 'transparent', color: 'var(--ink)', cursor: 'pointer' },
+  '.cm-panel.cm-dialog button[name=close]': { border: 'none', color: 'var(--muted)', marginLeft: 'auto' },
+  '.cm-lsp-message-error': { color: 'var(--red)' },
+  '.cm-tests .cm-gutterElement': { padding: '0 2px 0 4px', cursor: 'pointer' },
+  '.cm-test-marker': { display: 'inline-block', width: '12px', textAlign: 'center', fontSize: '10px', fontFamily: 'var(--font-sans)', color: 'var(--green)' },
+  '.cm-test-marker.is-idle': { color: 'var(--muted)' },
+  '.cm-test-marker.is-failed': { color: 'var(--red)', fontWeight: '700' },
+  '.cm-test-marker.is-skipped': { color: 'var(--muted)' },
+  '.cm-test-marker:hover': { color: 'var(--ink)' },
+  '.cm-blame': { marginLeft: '3em', color: 'var(--muted)', opacity: '.75', fontFamily: 'var(--font-sans)', fontSize: '11.5px', fontStyle: 'normal', whiteSpace: 'pre', pointerEvents: 'none' },
+  '.cm-blame-gutter .cm-gutterElement': { padding: '0 12px 0 10px', color: 'var(--muted)', fontFamily: 'var(--font-sans)', fontSize: '11px', whiteSpace: 'pre', opacity: '.8' },
+  '.cm-blame-gutter .is-fresh': { color: 'var(--ink)' },
+  '.cm-conflict-bar': { display: 'flex', gap: '14px', padding: '3px 14px 3px 14px', fontFamily: 'var(--font-sans)', fontSize: '11.5px' },
+  '.cm-conflict-bar button': { color: 'var(--muted)', cursor: 'pointer', textDecoration: 'underline', textUnderlineOffset: '3px', textDecorationColor: 'var(--line)' },
+  '.cm-conflict-bar button:hover': { color: 'var(--ink)' },
+  '.cm-conflict-current': { background: 'color-mix(in srgb, var(--green) 12%, transparent)' },
+  '.cm-conflict-incoming': { background: 'color-mix(in srgb, #3d6fd9 12%, transparent)' },
+  '.cm-conflict-base': { background: 'color-mix(in srgb, var(--muted) 10%, transparent)' },
+  '.cm-conflict-marker': { color: 'var(--muted)', background: 'color-mix(in srgb, var(--ink) 5%, transparent)' },
   '.cm-breakpoints': { width: '14px', cursor: 'pointer' },
   '.cm-breakpoints .cm-gutterElement': { display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '0' },
   '.cm-breakpoints .cm-gutterElement:hover::after': { content: '""', width: '8px', height: '8px', borderRadius: '50%', background: 'color-mix(in srgb, var(--red) 35%, transparent)' },
@@ -112,6 +161,10 @@ const look = EditorView.theme({
   '.cm-completionIcon-keyword::after': { content: '"k"' },
   '.cm-completionIcon-keyword': { color: 'var(--keyword)', borderColor: 'color-mix(in srgb, var(--keyword) 40%, var(--line))' },
   '.cm-completionIcon-text::after': { content: '"a"' },
+  '.cm-completionIcon-snippet::after': { content: '"s"' },
+  '.cm-completionIcon-snippet': { color: 'var(--accent-strong, var(--keyword))', borderStyle: 'dashed' },
+  '.cm-snippetField': { background: 'var(--occurrence)', outline: '1px solid var(--occurrence-border)' },
+  '.cm-snippetFieldPosition': { borderLeft: '1px solid var(--muted)' },
   '.cm-searchMatch': { backgroundColor: 'var(--accent-fill)', outline: '1px solid var(--accent-border)' },
   '.cm-searchMatch-selected': { outline: '1px solid var(--accent)' },
   '.cm-button, .cm-textfield': { background: 'var(--editor)', color: 'var(--ink)', border: '1px solid var(--line)', borderRadius: '0', backgroundImage: 'none' },
@@ -191,7 +244,7 @@ export const defaultIndent = (path: string) => mode(path)?.indent ?? 2
 export interface EditorOptions {
   wrap: boolean; lineNumbers: boolean; highlightLine: boolean; tabSize: number; layout: 'inline' | 'split'; autocomplete: boolean
   occurrences?: boolean; whitespace?: 'none' | 'trailing' | 'all'; indentGuides?: boolean; closeBrackets?: boolean; scrollPastEnd?: boolean
-  errors?: boolean; changes?: boolean; cursorBlink?: boolean; folding?: boolean
+  errors?: boolean; changes?: boolean; cursorBlink?: boolean; folding?: boolean; blameColumn?: boolean
 }
 
 // Suggestions are accepted with Tab, never Enter, so Enter always makes a new line.
@@ -213,11 +266,16 @@ function completionFor(path: string, whileTyping: boolean) {
   return autocompletion({
     activateOnTyping: whileTyping, defaultKeymap: false, icons: true, maxRenderedOptions: 40,
     addToOptions: [sourceColumn], optionClass: () => 'cm-completion-row',
-    ...(own ? { override: [smartCompletions(smart ?? '')] } : {}),
+    ...(own ? { override: [withServer(smartCompletions(smart ?? ''))] } : {}),
   })
 }
 
 const configuration = new Compartment()
+const serverSlot = new Compartment()
+function serverFor(props: Props): Extension {
+  const language = lspLanguage(props.path)
+  return props.server && props.serverUri && language && !props.diff && !props.readOnly ? serverExtension(props.server, props.serverUri, language.id) : []
+}
 function configure(options: EditorOptions, path: string): Extension {
   return [
     options.wrap ? EditorView.lineWrapping : [],
@@ -239,6 +297,7 @@ function configure(options: EditorOptions, path: string): Extension {
     options.scrollPastEnd ? scrollPastEnd() : [],
     options.folding !== false ? foldGutter({ markerDOM: open => { const marker = document.createElement('span'); marker.className = 'cm-fold-marker' + (open ? ' open' : ''); return marker } }) : [],
     drawSelection({ cursorBlinkRate: options.cursorBlink === false ? 0 : 1100 }),
+    options.blameColumn ? blameGutter : [],
     mode(path)?.load() ?? [],
   ]
 }
@@ -384,6 +443,51 @@ function breakpointGutter(toggle: (line: number) => void) {
   })]
 }
 
+/** Marks a change copied in from the same file open in another pane. */
+const synced = Annotation.define<boolean>()
+
+// ---- Tests: ▶ beside each test, ✓ or ✗ after a run ----
+const setTests = StateEffect.define<{ line: number; id: string; status?: string }[]>()
+class TestMarker extends GutterMarker {
+  constructor(readonly id: string, readonly status: string) { super() }
+  eq(other: TestMarker) { return other.id === this.id && other.status === this.status }
+  toDOM() {
+    const node = document.createElement('span')
+    node.className = 'cm-test-marker is-' + (this.status || 'idle')
+    node.textContent = this.status === 'passed' ? '✓' : this.status === 'failed' ? '✗' : this.status === 'skipped' ? '–' : '▶'
+    node.title = (this.status ? this.status[0].toUpperCase() + this.status.slice(1) + ' · ' : '') + 'Run ' + this.id.split(/::|#/).at(-1)
+    return node
+  }
+}
+const testField = StateField.define<RangeSet<GutterMarker>>({
+  create: () => RangeSet.empty,
+  update(value, transaction) {
+    value = value.map(transaction.changes)
+    for (const effect of transaction.effects) if (effect.is(setTests)) {
+      const doc = transaction.state.doc
+      const builder = new RangeSetBuilder<GutterMarker>()
+      for (const test of [...effect.value].sort((a, b) => a.line - b.line)) if (test.line <= doc.lines) builder.add(doc.line(test.line).from, doc.line(test.line).from, new TestMarker(test.id, test.status ?? ''))
+      value = builder.finish()
+    }
+    return value
+  },
+})
+function testGutter(run: (id: string) => void) {
+  return [testField, gutter({
+    class: 'cm-tests',
+    markers: view => view.state.field(testField, false) ?? RangeSet.empty,
+    domEventHandlers: {
+      mousedown: (view, line) => {
+        let id = ''
+        view.state.field(testField, false)?.between(line.from, line.from, (_from, _to, marker) => { id = (marker as TestMarker).id })
+        if (!id) return false
+        run(id)
+        return true
+      },
+    },
+  })]
+}
+
 /** Lezer marks code it can't parse with error nodes; show them as syntax errors. */
 function syntaxErrors(state: EditorState): EditorDiagnostic[] {
   const tree = ensureSyntaxTree(state, state.doc.length, 300) ?? syntaxTree(state)
@@ -407,7 +511,7 @@ function setup(): Extension {
     indentOnInput(), syntaxHighlighting(syntax), bracketMatching(), completionKeys, rectangularSelection(),
     crosshairCursor(), look,
     keymap.of([
-      { key: 'F2', run: renameOccurrences },
+      { key: 'F2', run: view => serverCommands.rename(view) || renameOccurrences(view) },
       { key: 'F12', run: view => { const handler = definitionHandlers.get(view); if (!handler) return false; handler(); return true } },
       ...defaultKeymap.filter(binding => binding.key !== 'Mod-Shift-k' && binding.key !== 'Mod-Enter'),
       { key: 'Mod-Shift-d', run: duplicateLine },
@@ -498,12 +602,15 @@ export function captureSelection(state: EditorState, path: string): CodeCapture 
   return { path, startLine: first.number, lines }
 }
 
-export type EditorCommand = 'undo' | 'redo' | 'selectAll' | 'comment' | 'foldAll' | 'unfoldAll' | 'rename' | 'gotoLine' | 'selectNext' | 'find' | 'cut' | 'copy' | 'end'
+export type EditorCommand = 'undo' | 'redo' | 'selectAll' | 'comment' | 'foldAll' | 'unfoldAll' | 'rename' | 'gotoLine' | 'selectNext' | 'find' | 'cut' | 'copy' | 'end' | 'lint' | 'definition' | 'references' | 'format' | 'server'
 export interface CodeIssue { line: number; column: number; endLine?: number | null; endColumn?: number | null; severity: 'error' | 'warning' | 'info'; message: string }
 export interface LiveIssue { line: number; column: number; severity: 'error' | 'warning' | 'info'; message: string; source: string }
 export interface EditorHandle {
   focus: () => void; find: () => void; reveal: () => void; selection: () => string; jump: (line: number, column?: number, length?: number) => void; capture: () => CodeCapture | null
   command: (name: EditorCommand) => boolean; insert: (text: string) => void; word: () => { text: string; line: number } | null
+  /** Replaces the text with `next` as a minimal, undoable change (the caret stays put). */
+  replaceAll: (next: string) => void
+  text: () => string
   /** Trims trailing spaces and/or ensures a final newline, in the editor (undoable); returns the new text. */
   tidy: (options: { trim: boolean; finalNewline: boolean }) => string | null
 }
@@ -535,6 +642,15 @@ interface Props {
   onBreakpoints?: (lines: number[]) => void
   /** The line the debugger is paused on in this file. */
   debugLine?: number | null
+  blame?: BlameLine[] | null
+  blameMode?: 'off' | 'line' | 'all'
+  tests?: { line: number; id: string; status?: string }[]
+  onRunTest?: (id: string) => void
+  /** Called when this editor gets focus (the split editor uses it to know which pane is current). */
+  onFocus?: () => void
+  /** The language server for this file, and the file's URI as the server knows it. */
+  server?: Server | null
+  serverUri?: string
 }
 
 function handleFor(editor: EditorView, path: string): EditorHandle {
@@ -552,11 +668,16 @@ function handleFor(editor: EditorView, path: string): EditorHandle {
         case 'comment': return toggleComment(editor)
         case 'foldAll': return foldAll(editor)
         case 'unfoldAll': return unfoldAll(editor)
-        case 'rename': return renameOccurrences(editor)
+        case 'rename': return serverCommands.rename(editor) || renameOccurrences(editor)
+        case 'definition': return serverCommands.definition(editor)
+        case 'references': return serverCommands.references(editor)
+        case 'format': return serverCommands.format(editor)
+        case 'server': return serverCommands.active(editor)
         case 'gotoLine': return gotoLine(editor)
         case 'selectNext': return selectNextOccurrence(editor)
         case 'find': return openSearchPanel(editor)
         case 'end': return cursorDocEnd(editor)
+        case 'lint': relint(editor); return true
         case 'copy': return Boolean(copy())
         case 'cut': {
           if (!copy() || editor.state.readOnly) return false
@@ -564,6 +685,13 @@ function handleFor(editor: EditorView, path: string): EditorHandle {
           return true
         }
       }
+    },
+    text: () => editor.state.doc.toString(),
+    replaceAll: next => {
+      const current = editor.state.doc.toString()
+      if (current === next || editor.state.readOnly) return
+      const changes = textDiff(current, next).map(change => ({ from: change.fromA, to: change.toA, insert: next.slice(change.fromB, change.toB) }))
+      editor.dispatch({ changes, userEvent: 'input.format' })
     },
     tidy: ({ trim, finalNewline }) => {
       if (editor.state.readOnly) return null
@@ -613,6 +741,10 @@ async function runChecks(view: EditorView, props: Props): Promise<EditorDiagnost
     const word = state.wordAt(from)
     return { from, to: word && word.from === from ? word.to : Math.min(doc.lineAt(from).to, from + 1), severity: item.severity, message: item.message, source: 'compiler' }
   })
+  const fromServer = props.options.errors !== false ? serverDiagnostics(view) : null
+  if (fromServer) found.push(...fromServer)
+  // Still's own checks; where the server already reports a problem at the same spot, its message wins.
+  const add = (item: EditorDiagnostic) => { if (!fromServer?.some(other => other.from === item.from)) found.push(item) }
   if (props.options.errors !== false) {
     if (props.check) {
       try {
@@ -622,10 +754,10 @@ async function runChecks(view: EditorView, props: Props): Promise<EditorDiagnost
           let to = issue.endLine && issue.endColumn ? position(issue.endLine, issue.endColumn) : from
           if (to <= from) { const word = state.wordAt(from); to = word && word.from <= from && word.to > from ? word.to : Math.min(doc.lineAt(from).to, from + 1) }
           if (to <= from) to = Math.min(doc.length, from + 1)
-          found.push({ from, to, severity: issue.severity, message: issue.message, source: 'python' })
+          add({ from, to, severity: issue.severity, message: issue.message, source: 'python' })
         }
       } catch { /* the checker is optional */ }
-    } else found.push(...syntaxErrors(state))
+    } else if (!fromServer) found.push(...syntaxErrors(state))
   }
   if (view.state.doc === doc) props.onIssues?.(found.map(item => {
     const line = doc.lineAt(item.from)
@@ -640,31 +772,44 @@ export default function Editor(props: Props) {
   const callbacks = useRef(props)
   callbacks.current = props
   const split = Boolean(props.diff) && props.options.layout === 'split'
+  // The text this editor last reported; a different `text` prop came from elsewhere (the other pane).
+  const emitted = useRef<string | null>(null)
+  // Which server the editor is plugged into, so it is only swapped when that changes.
+  const serverKey = useRef('')
 
   useLayoutEffect(() => {
     const current = callbacks.current
     if (!host.current) return
     const source = normalize(current.diff?.after ?? current.text)
     const listener = EditorView.updateListener.of(update => {
-      if (update.docChanged && !current.diff) callbacks.current.onEdit(update.state.doc.toString())
+      if (update.docChanged && !current.diff && !update.transactions.every(transaction => transaction.annotation(synced))) {
+        const text = update.state.doc.toString()
+        emitted.current = text
+        callbacks.current.onEdit(text)
+      }
       // Edits above a breakpoint move it; tell the owner where it went.
       if (update.docChanged && update.startState.field(breakpointField, false)?.size) {
         const before = breakpointLines(update.startState).join(), after = breakpointLines(update.state)
         if (before !== after.join()) callbacks.current.onBreakpoints?.(after)
       }
-      if (update.selectionSet || update.docChanged) callbacks.current.onCursor(onCursor(update.view))
+      if (update.focusChanged && update.view.hasFocus) callbacks.current.onFocus?.()
+      if (update.selectionSet || update.docChanged || (update.focusChanged && update.view.hasFocus)) callbacks.current.onCursor(onCursor(update.view))
       if (update.focusChanged && !update.view.hasFocus) callbacks.current.onBlur?.()
     })
     const base = [setup(), configuration.of(configure(current.options, current.path)), lintGutter(),
       EditorView.contentAttributes.of({ 'aria-label': current.diff ? 'File diff' : current.path, spellcheck: 'false', autocorrect: 'off', autocapitalize: 'off' })]
+    serverKey.current = (current.server?.id ?? '') + '|' + (current.serverUri ?? '')
     const live = current.diff ? [] : [
+      serverSlot.of(serverFor(current)),
       breakpointGutter(line => {
         const lines = view.current ? breakpointLines(view.current.state) : []
         callbacks.current.onBreakpoints?.(lines.includes(line) ? lines.filter(item => item !== line) : [...lines, line])
       }),
+      testGutter(id => callbacks.current.onRunTest?.(id)),
       changeGutter,
+      gitLines,
       inlineSuggestions(() => callbacks.current.suggest),
-      linter(view => runChecks(view, callbacks.current), { delay: 650 }),
+      linter(view => runChecks(view, callbacks.current), { delay: 650, needsRefresh }),
       // Alt+click adds a cursor; Ctrl/Cmd+click goes to the definition, as in other editors.
       EditorView.clickAddsSelectionRange.of(event => event.altKey),
       EditorView.domEventHandlers({
@@ -704,7 +849,7 @@ export default function Editor(props: Props) {
     })
     if (current.memory?.state) {
       // Restored states keep their old configuration; bring it up to date.
-      editor.dispatch({ effects: configuration.reconfigure(configure(current.options, current.path)) })
+      editor.dispatch({ effects: [configuration.reconfigure(configure(current.options, current.path)), serverSlot.reconfigure(serverFor(current))] })
       editor.scrollDOM.scrollTop = current.memory.top ?? 0
       editor.scrollDOM.scrollLeft = current.memory.left ?? 0
     } else if (line > 1) {
@@ -726,17 +871,51 @@ export default function Editor(props: Props) {
     }
   }, [props.path, props.diff, props.memory, split])
 
+  // The server starts after the editor opens (and may stop or restart); plug it in when it does.
+  useEffect(() => {
+    const editor = view.current
+    const key = (props.server?.id ?? '') + '|' + (props.serverUri ?? '')
+    if (!editor || props.diff || serverKey.current === key) return
+    serverKey.current = key
+    editor.dispatch({ effects: serverSlot.reconfigure(serverFor(callbacks.current)) })
+  }, [props.server, props.serverUri])
+
+  // Keep in step with the text when it changes elsewhere: the same file in the other pane,
+  // or a restored editor state that is older than the file.
+  useEffect(() => {
+    const editor = view.current
+    if (!editor || props.diff || props.text === emitted.current) return
+    const next = normalize(props.text)
+    const current = editor.state.doc.toString()
+    if (next === current) return
+    const changes = textDiff(current, next).map(change => ({ from: change.fromA, to: change.toA, insert: next.slice(change.fromB, change.toB) }))
+    editor.dispatch({ changes, annotations: [synced.of(true), Transaction.addToHistory.of(false)] })
+  }, [props.text, props.diff, props.path])
+
   const options = props.options
   useEffect(() => {
     view.current?.dispatch({ effects: configuration.reconfigure(configure(props.options, props.path)) })
   }, [options.wrap, options.lineNumbers, options.highlightLine, options.tabSize, options.autocomplete, options.occurrences, options.whitespace,
-    options.indentGuides, options.closeBrackets, options.scrollPastEnd, options.cursorBlink, options.folding])
+    options.indentGuides, options.closeBrackets, options.scrollPastEnd, options.cursorBlink, options.folding, options.blameColumn])
 
   useEffect(() => {
     const editor = view.current
     if (!editor || props.diff) return
     editor.dispatch({ effects: setBase.of(props.options.changes === false ? null : props.base ?? null) })
   }, [props.base, props.diff, props.path, options.changes])
+
+  useEffect(() => {
+    const editor = view.current
+    if (!editor || props.diff) return
+    editor.dispatch({ effects: setBlame.of(props.blame && props.blameMode && props.blameMode !== 'off' ? { lines: props.blame, mode: props.blameMode } : null) })
+  }, [props.blame, props.blameMode, props.diff, props.path])
+
+  const testKey = (props.tests ?? []).map(test => test.line + test.id + (test.status ?? '')).join('|')
+  useEffect(() => {
+    const editor = view.current
+    if (!editor || props.diff) return
+    editor.dispatch({ effects: setTests.of(props.tests ?? []) })
+  }, [testKey, props.diff, props.path])
 
   const breakKey = (props.breakpoints ?? []).join(',')
   useEffect(() => {
@@ -752,7 +931,7 @@ export default function Editor(props: Props) {
   }, [props.debugLine, props.diff, props.path])
 
   // Compiler results and the error setting feed the same checker; re-run it when they change.
-  useEffect(() => { if (view.current && !props.diff) forceLinting(view.current) }, [props.diagnostics, props.diff, props.path, options.errors])
+  useEffect(() => { if (view.current && !props.diff) relint(view.current) }, [props.diagnostics, props.diff, props.path, options.errors])
 
   return <div className={'editor-host' + (split ? ' split-diff' : '')} ref={host} onContextMenu={event => {
     const editor = view.current

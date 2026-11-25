@@ -228,7 +228,7 @@ fn emit(
     );
 }
 
-type Input = Arc<Mutex<Option<ChildStdin>>>;
+pub type Input = Arc<Mutex<Option<ChildStdin>>>;
 type ActiveJob = Option<(String, Arc<AtomicBool>, Input)>;
 
 #[derive(Default, Clone)]
@@ -309,7 +309,7 @@ pub struct Job {
     input: Input,
 }
 
-fn stream(mut reader: impl Read, job: &Job, kind: &'static str, capture: bool) -> String {
+pub fn stream(mut reader: impl Read, job: &Job, kind: &'static str, capture: bool) -> String {
     let mut captured = String::new();
     let mut buffer = [0u8; 8192];
     let mut pending = Vec::new();
@@ -339,6 +339,15 @@ fn stream(mut reader: impl Read, job: &Job, kind: &'static str, capture: bool) -
 }
 
 impl Job {
+    /// Where typed input for the running program goes (a runner that spawns its own process fills it).
+    pub fn input_slot(&self) -> Input {
+        self.input.clone()
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+
     pub fn emit(&self, kind: &'static str, text: String) {
         emit(&self.app, &self.id, kind, text, None, Vec::new());
     }
@@ -419,14 +428,17 @@ fn java_diagnostics(output: &str, cwd: &Path, active: &str) -> Vec<Diagnostic> {
     diagnostics
 }
 
-fn run_java(
-    job: &Job,
-    cwd: &Path,
-    file: &Path,
-    path: &str,
-    build_only: bool,
-    args: &[String],
-) -> Result<(i32, Vec<Diagnostic>)> {
+pub struct CompiledJava {
+    pub code: i32,
+    pub diagnostics: Vec<Diagnostic>,
+    pub class: String,
+    pub source_paths: std::ffi::OsString,
+    pub compiler: PathBuf,
+    pub runtime: PathBuf,
+}
+
+/// Compiles a Java file (and the sources it uses) into `bin`. `debug` keeps local variable names.
+pub fn compile_java(job: &Job, cwd: &Path, file: &Path, path: &str, debug: bool) -> Result<CompiledJava> {
     let (compiler, runtime, _) =
         java(cwd).ok_or("Install a JDK with both javac and java on PATH or set JAVA_HOME.")?;
     let source = std::fs::read_to_string(file).map_err(err)?;
@@ -467,34 +479,45 @@ fn run_java(
         Path::new("."),
     ])
     .map_err(err)?;
-    job.emit("command", format!("$ javac -d bin {path}\n"));
-    let (code, output) = job.run(
-        command(compiler, cwd)
-            .args([
-                "-J-Dfile.encoding=UTF-8",
-                "-J-Duser.language=en",
-                "-encoding",
-                "UTF-8",
-                "-d",
-                "bin",
-                "-classpath",
-                "bin",
-                "-sourcepath",
-            ])
-            .arg(source_paths)
-            .arg(Path::new(".").join(input)),
-        true,
-    )?;
-    let diagnostics = java_diagnostics(&output, cwd, path);
-    if code != 0 || build_only {
-        return Ok((code, diagnostics));
+    job.emit("command", format!("$ javac{} -d bin {path}\n", if debug { " -g" } else { "" }));
+    let mut cmd = command(&compiler, cwd);
+    cmd.args([
+        "-J-Dfile.encoding=UTF-8",
+        "-J-Duser.language=en",
+        "-encoding",
+        "UTF-8",
+        "-d",
+        "bin",
+        "-classpath",
+        "bin",
+    ]);
+    if debug {
+        cmd.arg("-g");
     }
+    let (code, output) = job.run(cmd.arg("-sourcepath").arg(&source_paths).arg(Path::new(".").join(input)), true)?;
+    let diagnostics = java_diagnostics(&output, cwd, path);
+    Ok(CompiledJava { code, diagnostics, class, source_paths, compiler, runtime })
+}
+
+fn run_java(
+    job: &Job,
+    cwd: &Path,
+    file: &Path,
+    path: &str,
+    build_only: bool,
+    args: &[String],
+) -> Result<(i32, Vec<Diagnostic>)> {
+    let compiled = compile_java(job, cwd, file, path, false)?;
+    if compiled.code != 0 || build_only {
+        return Ok((compiled.code, compiled.diagnostics));
+    }
+    let class = compiled.class;
     job.emit("command", format!("$ java -cp bin {class}{}\n", display_args(args)));
     let (code, _) = job.run(
-        command(runtime, cwd).args(["-Dfile.encoding=UTF-8", "-cp", "bin", &class]).args(args),
+        command(compiled.runtime, cwd).args(["-Dfile.encoding=UTF-8", "-cp", "bin", &class]).args(args),
         false,
     )?;
-    Ok((code, diagnostics))
+    Ok((code, compiled.diagnostics))
 }
 
 fn display_args(args: &[String]) -> String {

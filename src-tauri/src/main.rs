@@ -3,6 +3,11 @@
 mod ai;
 mod check;
 mod debug;
+mod history;
+mod jdebug;
+mod lsp;
+mod tests;
+mod tools;
 mod config;
 mod git;
 mod packages;
@@ -31,6 +36,7 @@ fn main() {
         .manage(ssh::Prompts::default())
         .manage(ssh::Relays::default())
         .manage(debug::Debuggers::default())
+        .manage(lsp::Servers::default())
         .manage(ssh::Workers::default())
         .setup(|app| {
             let store = config::Store::load(app.handle());
@@ -43,6 +49,20 @@ fn main() {
             check::check_python,
             debug::debug_start,
             debug::debug_send,
+            tools::format_code,
+            tools::tools_status,
+            tools::install_tool,
+            history::history_save,
+            history::history_list,
+            history::history_read,
+            history::git_blame,
+            history::git_file_log,
+            history::git_show_at,
+            tests::tests_run,
+            lsp::lsp_available,
+            lsp::lsp_start,
+            lsp::lsp_send,
+            lsp::lsp_stop,
             config::settings_set,
             projects::home_state,
             projects::set_projects_root,
@@ -107,6 +127,7 @@ fn main() {
             ssh::ssh_fs,
             ssh::ssh_search,
             ssh::ssh_run,
+            ssh::ssh_debug_start,
             uninstall::uninstall_plan,
             uninstall::uninstall_start,
         ])
@@ -116,6 +137,7 @@ fn main() {
             if let tauri::RunEvent::Exit = event {
                 let _ = app.state::<terminal::TerminalState>().stop(None);
                 let _ = app.state::<process::Jobs>().stop(None);
+                app.state::<lsp::Servers>().stop_all();
             }
         });
 }

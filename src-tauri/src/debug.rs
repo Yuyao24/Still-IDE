@@ -10,24 +10,58 @@ use serde::Deserialize;
 use std::{
     collections::HashMap,
     io::{BufRead, BufReader, Write},
-    net::{TcpListener, TcpStream},
-    sync::{Arc, Mutex},
+    net::TcpListener,
+    sync::{mpsc, Arc, Mutex},
     thread,
-    time::Duration,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 
-const DRIVER: &str = r#"
+pub const DRIVER: &str = r#"
 import bdb, sys, os, json, socket, reprlib, linecache, traceback, types
 root = os.path.realpath(os.environ.get('STILL_DEBUG_ROOT', os.getcwd()))
-sock = socket.create_connection(('127.0.0.1', int(os.environ['STILL_DEBUG_PORT'])))
-reader = sock.makefile('r', encoding='utf-8'); writer = sock.makefile('w', encoding='utf-8')
-def send(message):
-    writer.write(json.dumps(message) + '\n'); writer.flush()
-def receive():
-    line = reader.readline()
-    if not line: raise SystemExit(0)
-    return json.loads(line)
+if os.environ.get('STILL_DEBUG_STDIO'):
+    # Over SSH there is only stdin and stderr: debugger messages are marked lines on stderr, and
+    # commands are marked lines on stdin, set apart from what the program itself reads.
+    import io, queue, threading
+    commands, typed = queue.Queue(), queue.Queue()
+    real_in, real_err = sys.stdin, sys.__stderr__
+    def pump():
+        for line in real_in:
+            if line.startswith('\x1eSTILL '): commands.put(line[7:])
+            else: typed.put(line)
+        commands.put(None); typed.put(None)
+    threading.Thread(target=pump, daemon=True).start()
+    class Typed(io.TextIOBase):
+        ended = False
+        def readable(self): return True
+        def readline(self, size=-1):
+            if self.ended: return ''
+            line = typed.get()
+            if line is None: self.ended = True; return ''
+            return line
+        def read(self, size=-1):
+            out = []
+            while True:
+                line = self.readline()
+                if not line: break
+                out.append(line)
+            return ''.join(out)
+    sys.stdin = Typed()
+    def send(message):
+        real_err.write('\x1eSTILL-DEBUG ' + json.dumps(message) + '\n'); real_err.flush()
+    def receive():
+        line = commands.get()
+        if line is None: raise SystemExit(0)
+        return json.loads(line)
+else:
+    sock = socket.create_connection(('127.0.0.1', int(os.environ['STILL_DEBUG_PORT'])))
+    reader = sock.makefile('r', encoding='utf-8'); writer = sock.makefile('w', encoding='utf-8')
+    def send(message):
+        writer.write(json.dumps(message) + '\n'); writer.flush()
+    def receive():
+        line = reader.readline()
+        if not line: raise SystemExit(0)
+        return json.loads(line)
 short = reprlib.Repr(); short.maxstring = 160; short.maxother = 160; short.maxlist = 12; short.maxdict = 12; short.maxlevel = 3
 def rel(path):
     full = os.path.realpath(path)
@@ -131,8 +165,10 @@ finally:
     except Exception: pass
 "#;
 
+/// Each running debug session takes commands from the panel through a channel: the Python driver
+/// gets them over its socket, the Java session turns them into jdb commands.
 #[derive(Default, Clone)]
-pub struct Debuggers(Arc<Mutex<HashMap<String, TcpStream>>>);
+pub struct Debuggers(pub Arc<Mutex<HashMap<String, mpsc::Sender<serde_json::Value>>>>);
 
 #[derive(Deserialize)]
 pub struct Breakpoint {
@@ -140,7 +176,7 @@ pub struct Breakpoint {
     line: u32,
 }
 
-/// Runs a Python file under the debugger. Output streams to the Output pane like a normal run;
+/// Runs a Python or Java file under the debugger. Output streams to the Output pane like a normal run;
 /// pauses, stacks and variables arrive as `debug-event`s.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
@@ -157,11 +193,28 @@ pub fn debug_start(
 ) -> Result<()> {
     let cwd = root(&root_path)?;
     let file = resolve(&cwd, &path)?;
-    if !path.ends_with(".py") {
-        return Err("The debugger works with Python files.".into());
-    }
     relative(&path)?;
     let args = parse_args(args)?;
+    if path.ends_with(".java") {
+        let (sender, commands) = mpsc::channel();
+        app.state::<Debuggers>().0.lock().map_err(err)?.insert(id.clone(), sender);
+        let setup = serde_json::json!({
+            "breakpoints": breakpoints.iter().map(|item| serde_json::json!({ "file": item.file, "line": item.line })).collect::<Vec<_>>(),
+            "watches": watches,
+            "stopOnEntry": stop_on_entry,
+        });
+        let events = app.clone();
+        let sessions = app.state::<Debuggers>().inner().clone();
+        let session_id = id.clone();
+        return jobs.start(app, id, true, move |job| {
+            let result = crate::jdebug::run(job, events, session_id.clone(), &cwd, &file, &path, setup, &args, commands);
+            if let Ok(mut map) = sessions.0.lock() { map.remove(&session_id); }
+            result
+        });
+    }
+    if !path.ends_with(".py") {
+        return Err("The debugger works with Python and Java files.".into());
+    }
     let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(err)?;
     let port = listener.local_addr().map_err(err)?.port();
     let setup = serde_json::json!({
@@ -178,9 +231,15 @@ pub fn debug_start(
         let Ok((stream, _)) = listener.accept() else { return };
         let Ok(mut writer) = stream.try_clone() else { return };
         let _ = writer.write_all(format!("{setup}\n").as_bytes());
+        let (sender, commands) = mpsc::channel::<serde_json::Value>();
         if let Ok(mut map) = sessions.0.lock() {
-            map.insert(session_id.clone(), writer);
+            map.insert(session_id.clone(), sender);
         }
+        thread::spawn(move || {
+            for command in commands {
+                if writer.write_all(format!("{command}\n").as_bytes()).is_err() { break }
+            }
+        });
         for line in BufReader::new(stream).lines() {
             let Ok(line) = line else { break };
             if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&line) {
@@ -212,10 +271,9 @@ pub fn debug_start(
 /// Sends a command to a paused program: continue, next, step, out, stop, frame, eval, watches, breakpoints.
 #[tauri::command]
 pub fn debug_send(state: State<Debuggers>, id: String, command: serde_json::Value) -> Result<()> {
-    let mut map = state.0.lock().map_err(err)?;
-    if let Some(stream) = map.get_mut(&id) {
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-        stream.write_all(format!("{command}\n").as_bytes()).map_err(err)?;
+    let map = state.0.lock().map_err(err)?;
+    if let Some(sender) = map.get(&id) {
+        let _ = sender.send(command);
     }
     Ok(())
 }
