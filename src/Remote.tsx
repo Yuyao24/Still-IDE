@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent, type MouseEvent } from 'react'
 import { open } from '@tauri-apps/plugin-dialog'
-import { ArrowUp, Ellipsis, File, FileKey, Folder, FolderOpen, Pencil, Plug, Plus, RefreshCw, Server, SquareTerminal, Trash2 } from 'lucide-react'
-import { type RemoteListing, type SshHost, type SshOverview, desktop, hostLabel, nameHost, ssh } from './bridge'
+import { ArrowUp, Ellipsis, ExternalLink, File, FileKey, Folder, FolderOpen, Pencil, Plug, Plus, RefreshCw, Server, SquareTerminal, Trash2, X } from 'lucide-react'
+import { type ForwardedPort, type ListeningPort, type RemoteListing, type SshHost, type SshOverview, desktop, hostLabel, nameHost, ssh } from './bridge'
 import { Icon, IconButton, Modal, type MenuEntry } from './ui'
 
 export const blankHost: SshHost = { id: '', name: '', host: '', user: '', port: null, identityFile: '', jump: '', forwards: [], remotePath: '', source: 'saved' }
@@ -232,6 +232,53 @@ interface PanelProps {
   onMenu: (event: MouseEvent, items: MenuEntry[]) => void
   onDelete: (host: SshHost) => void
   onTest: (host: SshHost) => void
+  /** For a project on a server: the server, so its ports can be forwarded here. */
+  hostId?: string | null
+  onOpenUrl?: (url: string) => void
+  notify?: (message: unknown) => void
+}
+
+/** Ports on the server reachable here: what's listening there, and what's forwarded. */
+function PortsSection({ hostId, onOpenUrl, notify }: { hostId: string; onOpenUrl: (url: string) => void; notify: (message: unknown) => void }) {
+  const [listening, setListening] = useState<ListeningPort[] | null>(null)
+  const [forwards, setForwards] = useState<ForwardedPort[]>([])
+  const [port, setPort] = useState('')
+  const [busy, setBusy] = useState<number | null>(null)
+  async function refresh() {
+    setForwards((await ssh.forwards().catch(() => [] as ForwardedPort[])).filter(item => item.hostId === hostId))
+    setListening(await ssh.listening(hostId).catch(() => []))
+  }
+  useEffect(() => { void refresh() }, [hostId])
+  async function forward(remote: number) {
+    if (!remote || remote < 1 || remote > 65535) { notify('Enter a port number between 1 and 65535.'); return }
+    setBusy(remote)
+    try {
+      const made = await ssh.forward(hostId, remote)
+      notify(made.localPort === remote ? `Port ${remote} on the server is now at localhost:${remote}.` : `Port ${remote} on the server is now at localhost:${made.localPort} (${remote} was taken here).`)
+      setPort('')
+      await refresh()
+    } catch (error) { notify(error) } finally { setBusy(null) }
+  }
+  const forwarded = new Map(forwards.map(item => [item.remotePort, item]))
+  return <section className="panel-group">
+    <h3>Ports<span><IconButton glyph={RefreshCw} label="Refresh ports" size={12} onClick={() => { void refresh() }} /></span></h3>
+    {forwards.map(item => <div key={item.id} className="port-row is-forwarded">
+      <button className="port-link" onClick={() => onOpenUrl('http://localhost:' + item.localPort)} title={'Open http://localhost:' + item.localPort}>
+        <span className="port-number">{item.remotePort}</span><span className="port-arrow">→</span><span>localhost:{item.localPort}</span><Icon glyph={ExternalLink} size={12} />
+      </button>
+      <IconButton glyph={X} label={'Stop forwarding port ' + item.remotePort} size={12} onClick={() => { void ssh.unforward(item.id).then(refresh).catch(notify) }} />
+    </div>)}
+    {listening?.filter(item => !forwarded.has(item.port)).map(item => <div key={item.port} className="port-row">
+      <span className="port-number">{item.port}</span><span className="port-process">{item.process || 'listening'}</span>
+      <button className="text-btn" disabled={busy !== null} onClick={() => { void forward(item.port) }}>{busy === item.port ? 'Forwarding…' : 'Forward'}</button>
+    </div>)}
+    {listening && !listening.length && !forwards.length && <p className="help">Nothing is listening on the server yet. Start a web server there (for example python3 -m http.server 8000), then refresh.</p>}
+    {!listening && <p className="help">Looking for open ports…</p>}
+    <form className="port-form" onSubmit={event => { event.preventDefault(); void forward(Number(port)) }}>
+      <input className="field" inputMode="numeric" placeholder="Port, e.g. 8000" value={port} onChange={event => setPort(event.target.value.replace(/\D/g, '').slice(0, 5))} aria-label="Port on the server to forward" />
+      <button className="text-btn" type="submit" disabled={!port || busy !== null}>Forward</button>
+    </form>
+  </section>
 }
 
 export function hostMenu(host: SshHost, props: Pick<PanelProps, 'onTerminal' | 'onOpenFolder' | 'onEdit' | 'onDelete' | 'onTest'>): MenuEntry[] {
@@ -272,6 +319,7 @@ export function RemotePanel(props: PanelProps) {
     </div>
     <div className="sidebar-content">
       {!desktop && <p className="help">SSH connections are available in the Still desktop app.</p>}
+      {desktop && props.hostId && props.onOpenUrl && props.notify && <PortsSection hostId={props.hostId} onOpenUrl={props.onOpenUrl} notify={props.notify} />}
       {desktop && overview && !overview.client && <p className="help mb-3">The OpenSSH client was not found. Install it (Windows: Settings → Optional features → OpenSSH Client) to connect to servers.</p>}
       <section className="panel-group mt-1">
         <h3>Saved servers<span>{overview?.saved.length ?? 0}</span></h3>

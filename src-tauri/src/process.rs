@@ -428,7 +428,7 @@ impl Job {
     }
 }
 
-fn java_diagnostics(output: &str, cwd: &Path, active: &str) -> Vec<Diagnostic> {
+pub(crate) fn java_diagnostics(output: &str, cwd: &Path, active: &str) -> Vec<Diagnostic> {
     let pattern = Regex::new(r"^(.+\.java):(\d+):\s*(error|warning):\s*(.+)$")
         .expect("valid Java diagnostic pattern");
     let mut diagnostics = Vec::<Diagnostic>::new();

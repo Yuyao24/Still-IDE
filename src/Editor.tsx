@@ -6,7 +6,7 @@ import {
 } from '@codemirror/view'
 import { HighlightStyle, Language, LanguageSupport, StreamLanguage, bracketMatching, ensureSyntaxTree, foldAll, foldGutter, foldKeymap, getIndentUnit, indentOnInput, indentUnit, syntaxHighlighting, syntaxTree, unfoldAll } from '@codemirror/language'
 import { gotoLine, highlightSelectionMatches, openSearchPanel, searchKeymap, selectNextOccurrence, selectSelectionMatches } from '@codemirror/search'
-import { acceptCompletion, autocompletion, closeBrackets, closeBracketsKeymap, closeCompletion, moveCompletionSelection, startCompletion } from '@codemirror/autocomplete'
+import { acceptCompletion, autocompletion, closeBrackets, closeBracketsKeymap, closeCompletion, completionStatus, hasNextSnippetField, moveCompletionSelection, startCompletion } from '@codemirror/autocomplete'
 import { lintGutter, lintKeymap, linter, type Diagnostic as EditorDiagnostic } from '@codemirror/lint'
 import { needsRefresh, relint } from './relint'
 import { Chunk, MergeView, diff as textDiff, unifiedMergeView } from '@codemirror/merge'
@@ -35,7 +35,7 @@ import { dockerFile } from '@codemirror/legacy-modes/mode/dockerfile'
 import { properties } from '@codemirror/legacy-modes/mode/properties'
 import { useEffect, useLayoutEffect, useRef } from 'react'
 import { scopedOccurrences } from './occurrences'
-import { smartCompletions, sourceColumn } from './completion'
+import { expandSnippetBefore, smartCompletions, sourceColumn } from './completion'
 import { smartTyping } from './smart'
 import { stickyScroll } from './sticky'
 import { lspLanguage, quickFixes, serverCommands, serverDiagnostics, serverExtension, withServer, type QuickFix, type Server } from './lsp'
@@ -263,6 +263,12 @@ export interface EditorOptions {
   errors?: boolean; changes?: boolean; cursorBlink?: boolean; folding?: boolean; blameColumn?: boolean
   /** Fill in the constructor when a new class is started. */
   constructors?: boolean
+  /** Docstrings and Javadoc filled in from the signature. */
+  docTemplates?: boolean
+  /** `{name}` in a plain Python string makes it an f-string. */
+  fStrings?: boolean
+  /** Enter inside a line comment continues it. */
+  continueComments?: boolean
   /** Keep the enclosing function or class header at the top while scrolling inside it. */
   sticky?: boolean
   /** Show the language server's inlay hints. */
@@ -280,10 +286,13 @@ const completionKeys = Prec.highest(keymap.of([
   { key: 'PageUp', run: moveCompletionSelection(false, 'page') },
 ]))
 
+const snippetLanguages: Record<string, string> = { Python: 'python', Java: 'java', JavaScript: 'javascript', 'JavaScript JSX': 'javascript', TypeScript: 'javascript', 'TypeScript JSX': 'javascript', LaTeX: 'latex' }
+const snippetLanguage = (path: string) => snippetLanguages[mode(path)?.name ?? ''] ?? ''
+
 /** Ranked word suggestions for code; markup and data languages keep CodeMirror's own (tags, properties). */
 function completionFor(path: string, whileTyping: boolean) {
   const name = mode(path)?.name ?? 'Plain Text'
-  const smart = ({ Python: 'python', Java: 'java', JavaScript: 'javascript', 'JavaScript JSX': 'javascript', TypeScript: 'javascript', 'TypeScript JSX': 'javascript', LaTeX: 'latex' } as Record<string, string>)[name]
+  const smart = snippetLanguages[name]
   const own = smart !== undefined || ['Plain Text', 'Markdown', 'Rust', 'Go', 'C++', 'Kotlin', 'C#', 'Ruby', 'Shell', 'Groovy', 'PowerShell'].includes(name)
   return autocompletion({
     activateOnTyping: whileTyping, defaultKeymap: false, icons: true, maxRenderedOptions: 40,
@@ -305,7 +314,9 @@ function configure(options: EditorOptions, path: string): Extension {
     options.highlightLine ? highlightActiveLine() : [],
     // Off: suggestions only appear with Ctrl+Space. On: they appear while typing.
     completionFor(path, options.autocomplete),
-    smartTyping(mode(path)?.name ?? '', options.constructors !== false),
+    smartTyping(mode(path)?.name ?? '', { constructors: options.constructors !== false, docs: options.docTemplates !== false, fStrings: options.fStrings !== false, comments: options.continueComments === true, closeBrackets: options.closeBrackets !== false }),
+    // A snippet's name then Tab expands it at once, like a live template, even before suggestions show.
+    Prec.highest(keymap.of([{ key: 'Tab', run: view => completionStatus(view.state) === 'active' || hasNextSnippetField(view.state) ? false : expandSnippetBefore(view, snippetLanguage(path)) }])),
     stickyScroll(line => highlightToHtml(line, path.split('.').at(-1) ?? ''), options.sticky !== false),
     EditorState.tabSize.of(options.tabSize),
     indentUnit.of(' '.repeat(options.tabSize)),
@@ -797,7 +808,7 @@ interface Props {
   /** Called when this editor gets focus (the split editor uses it to know which pane is current). */
   onFocus?: () => void
   /** Where the view is in the document (for the minimap): top and height as fractions of the whole. */
-  onViewport?: (view: { top: number; height: number; lines: number }) => void
+  onViewport?: (view: { top: number; height: number; lines: number; topLine: number }) => void
   /** The language server for this file, and the file's URI as the server knows it. */
   server?: Server | null
   serverUri?: string
@@ -1018,7 +1029,9 @@ export default function Editor(props: Props) {
       frame = requestAnimationFrame(() => {
         const scroller = editor.scrollDOM
         const total = Math.max(1, scroller.scrollHeight)
-        callbacks.current.onViewport?.({ top: scroller.scrollTop / total, height: scroller.clientHeight / total, lines: editor.state.doc.lines })
+        const offset = Math.max(0, scroller.getBoundingClientRect().top - editor.documentTop)
+        const topLine = editor.state.doc.lineAt(editor.lineBlockAtHeight(offset + 2).from).number
+        callbacks.current.onViewport?.({ top: scroller.scrollTop / total, height: scroller.clientHeight / total, lines: editor.state.doc.lines, topLine })
       })
     }
     editor.scrollDOM.addEventListener('scroll', report, { passive: true })
@@ -1070,7 +1083,7 @@ export default function Editor(props: Props) {
   useEffect(() => {
     view.current?.dispatch({ effects: configuration.reconfigure(configure(props.options, props.path)) })
   }, [options.wrap, options.lineNumbers, options.highlightLine, options.tabSize, options.autocomplete, options.occurrences, options.whitespace,
-    options.indentGuides, options.closeBrackets, options.scrollPastEnd, options.cursorBlink, options.folding, options.blameColumn, options.constructors, options.sticky])
+    options.indentGuides, options.closeBrackets, options.scrollPastEnd, options.cursorBlink, options.folding, options.blameColumn, options.constructors, options.sticky, options.docTemplates, options.fStrings, options.continueComments])
 
   useEffect(() => {
     const editor = view.current

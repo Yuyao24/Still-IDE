@@ -1170,10 +1170,13 @@ pub fn ssh_run(
     root: String,
     path: String,
     args: Option<String>,
+    env: Option<String>,
+    dotenv: Option<bool>,
 ) -> Result<()> {
     let host = find_host(&store, &host_id)?;
     let full = remote_path(&root, &path)?;
     let args = parse_args(args)?;
+    let prefix = env_prefix(env.as_deref(), dotenv.unwrap_or(false));
     let extension = path.rsplit_once('.').map(|(_, ext)| ext.to_lowercase()).unwrap_or_default();
     let runner = match extension.as_str() {
         "py" => "python3 -u",
@@ -1188,7 +1191,7 @@ pub fn ssh_run(
     ssh_args.push("--".into());
     ssh_args.push(destination(&host));
     let quoted_args: String = args.iter().map(|arg| format!(" {}", quote(arg))).collect();
-    ssh_args.push(format!("cd -- {} && {runner} {}{quoted_args}", quote(&root), quote(&full)));
+    ssh_args.push(format!("cd -- {} && {prefix}{runner} {}{quoted_args}", quote(&root), quote(&full)));
     let label = format!("$ ssh {} {runner} {path}{}\n", host.name, quoted_args);
     let prompts_app = app.clone();
     jobs.start(app, id, true, move |job| {
@@ -1294,21 +1297,36 @@ pub fn ssh_debug_start(
     stop_on_entry: bool,
     args: Option<String>,
     pause_on: Option<String>,
+    env: Option<String>,
+    dotenv: Option<bool>,
 ) -> Result<()> {
     use base64::Engine;
-    if !path.ends_with(".py") {
-        return Err("Debugging on a server works with Python files for now.".into());
+    if !path.ends_with(".py") && !path.ends_with(".java") {
+        return Err("Debugging on a server works with Python and Java files.".into());
     }
     let host = find_host(&store, &host_id)?;
     let full = remote_path(&root, &path)?;
     let args = parse_args(args)?;
+    let prefix = env_prefix(env.as_deref(), dotenv.unwrap_or(false));
+    if path.ends_with(".java") {
+        let setup = serde_json::json!({ "breakpoints": breakpoints, "watches": watches, "stopOnEntry": stop_on_entry, "pauseOn": pause_on.unwrap_or_else(|| "uncaught".into()) });
+        let (sender, commands) = std::sync::mpsc::channel::<serde_json::Value>();
+        app.state::<crate::debug::Debuggers>().0.lock().map_err(err)?.insert(id.clone(), sender);
+        let events = app.clone();
+        let session_id = id.clone();
+        return jobs.start(app, id, true, move |job| {
+            let result = java_debug(job, &events, &host, &root, &path, &args, &prefix, setup, commands, session_id.clone());
+            if let Ok(mut map) = events.state::<crate::debug::Debuggers>().0.lock() { map.remove(&session_id); }
+            result
+        });
+    }
     let driver = base64::engine::general_purpose::STANDARD.encode(crate::debug::DRIVER);
     let quoted_args: String = args.iter().map(|arg| format!(" {}", quote(arg))).collect();
     let mut ssh_args = base_args(&app, &host, true)?;
     ssh_args.push("--".into());
     ssh_args.push(destination(&host));
     ssh_args.push(format!(
-        "cd -- {root} && STILL_DEBUG_STDIO=1 STILL_DEBUG_ROOT={root} PYTHONIOENCODING=utf-8 python3 -u -c {code} {file}{quoted_args}",
+        "cd -- {root} && {prefix}STILL_DEBUG_STDIO=1 STILL_DEBUG_ROOT={root} PYTHONIOENCODING=utf-8 python3 -u -c {code} {file}{quoted_args}",
         root = quote(&root),
         code = quote(&format!("import base64;exec(compile(base64.b64decode('{driver}'),'<still-debug>','exec'))")),
         file = quote(&full),
@@ -1382,6 +1400,85 @@ pub fn ssh_debug_start(
     })
 }
 
+/// Shell lines that set a run's environment on the server: the project's .env file (optional) and
+/// the run configuration's NAME=value lines.
+fn env_prefix(env: Option<&str>, dotenv: bool) -> String {
+    let mut prefix = String::new();
+    if dotenv { prefix.push_str("if [ -f .env ]; then set -a; . ./.env; set +a; fi; "); }
+    let pairs: Vec<String> = env.unwrap_or("").lines().filter_map(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { return None }
+        let (name, value) = line.split_once('=')?;
+        let name = name.trim().trim_start_matches("export ").trim();
+        let valid = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !name.starts_with(|c: char| c.is_ascii_digit());
+        let value = value.trim();
+        let value = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')).or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\''))).unwrap_or(value);
+        valid.then(|| format!("{name}={}", quote(value)))
+    }).collect();
+    if !pairs.is_empty() { prefix.push_str(&format!("export {}; ", pairs.join(" "))); }
+    prefix
+}
+
+/// Debugs a Java file on the server: compile it there with -g, then drive jdb over SSH with the
+/// same code that drives it locally.
+#[allow(clippy::too_many_arguments)]
+fn java_debug(job: &crate::process::Job, app: &AppHandle, host: &SshHost, root: &str, path: &str, args: &[String], prefix: &str, setup: serde_json::Value, commands: std::sync::mpsc::Receiver<serde_json::Value>, id: String) -> Result<(i32, Vec<crate::process::Diagnostic>)> {
+    let full = remote_path(root, path)?;
+    let source = String::from_utf8_lossy(&exec(app, host, &format!("cat -- {}", quote(&full)), None, 30)?).into_owned();
+    let uncommented = regex::Regex::new(r"(?s)/\*.*?\*/|//[^\r\n]*").unwrap().replace_all(&source, "").into_owned();
+    let package = regex::Regex::new(r"(?m)^\s*package\s+([\w$.]+)\s*;").unwrap().captures(&uncommented).map(|found| found[1].to_owned());
+    let stem = path.rsplit('/').next().unwrap_or(path).trim_end_matches(".java").to_owned();
+    let class = package.as_ref().map_or(stem.clone(), |package| format!("{package}.{stem}"));
+    // The source root: the file's folder, up one level per package part.
+    let mut folders: Vec<&str> = path.split('/').collect();
+    folders.pop();
+    for _ in package.as_deref().into_iter().flat_map(|name| name.split('.')) { folders.pop(); }
+    let source_root = if folders.is_empty() { ".".to_owned() } else { folders.join("/") };
+    let source_path = format!("{source_root}:src:src/main/java:.");
+    job.emit("command", format!("$ ssh {} javac -g -d bin {path}\n", host.name));
+    let script = format!(
+        "cd -- {root} && {prefix}mkdir -p bin && javac -J-Duser.language=en -encoding UTF-8 -g -d bin -classpath bin -sourcepath {sp} {file} 2>&1; echo \"STILL-EXIT $?\"",
+        root = quote(root), sp = quote(&source_path), file = quote(path),
+    );
+    let output = String::from_utf8_lossy(&exec(app, host, &script, None, 300)?).into_owned();
+    let (text, code) = match output.trim_end().rsplit_once("STILL-EXIT ") {
+        Some((text, code)) => (text.to_owned(), code.trim().parse().unwrap_or(1)),
+        None => (output.clone(), 1),
+    };
+    if !text.trim().is_empty() { job.emit("stderr", text.clone()); }
+    let diagnostics = crate::process::java_diagnostics(&text, std::path::Path::new(root), path);
+    if code != 0 {
+        if text.contains("javac: command not found") || text.contains("javac: not found") { job.emit("stderr", "javac was not found on the server. Install a JDK there (for example openjdk-17-jdk).\n".to_owned()); }
+        let _ = app.emit("debug-event", serde_json::json!({ "id": id, "event": "ended" }));
+        return Ok((code, diagnostics));
+    }
+    // The project's Java files, for turning classes back into files.
+    let listing = exec(app, host, &format!("cd -- {} && find . -name '*.java' -not -path '*/.*' -not -path './bin/*' -not -path './target/*' -not -path './build/*' -not -path '*/node_modules/*' 2>/dev/null | head -n 20000", quote(root)), None, 60)?;
+    let sources = String::from_utf8_lossy(&listing).lines().map(|line| line.trim().trim_start_matches("./").to_owned()).filter(|line| !line.is_empty()).collect();
+    let cache = std::sync::Mutex::new(std::collections::HashMap::<String, String>::new());
+    let (read_app, read_host, read_root) = (app.clone(), host.clone(), root.to_owned());
+    let read = move |file: &str| -> String {
+        if let Some(text) = cache.lock().ok().and_then(|map| map.get(file).cloned()) { return text }
+        let text = remote_path(&read_root, file).ok().and_then(|full| exec(&read_app, &read_host, &format!("cat -- {}", quote(&full)), None, 30).ok()).map(|bytes| String::from_utf8_lossy(&bytes).into_owned()).unwrap_or_default();
+        if let Ok(mut map) = cache.lock() { map.insert(file.to_owned(), text.clone()); }
+        text
+    };
+    let quoted_args: String = args.iter().map(|arg| format!(" {}", quote(arg))).collect();
+    job.emit("command", format!("$ ssh {} jdb {class}{quoted_args}\n", host.name));
+    let mut ssh_args = base_args(app, host, true)?;
+    ssh_args.push("--".into());
+    ssh_args.push(destination(host));
+    ssh_args.push(format!(
+        "cd -- {root} && {prefix}command -v jdb >/dev/null 2>&1 || {{ echo 'jdb was not found on the server. It comes with the JDK.' >&2; exit 127; }}; exec jdb -J-Dfile.encoding=UTF-8 -J-Duser.language=en -classpath bin -sourcepath {sp} {class}{quoted_args}",
+        root = quote(root), sp = quote(&source_path), class = quote(&class),
+    ));
+    let mut cmd = command(program(), &std::env::temp_dir());
+    cmd.args(&ssh_args);
+    use_prompts(app, &mut cmd, host);
+    let child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(err)?;
+    crate::jdebug::follow(job, app.clone(), id, crate::jdebug::Launch { child, class, sources, read: Box::new(read), diagnostics }, setup, commands)
+}
+
 /// A binary file on the server (a PDF or an image), as base64.
 #[tauri::command]
 pub async fn ssh_read_binary(app: AppHandle, store: State<'_, Store>, id: String, root: String, path: String) -> Result<String> {
@@ -1391,6 +1488,156 @@ pub async fn ssh_read_binary(app: AppHandle, store: State<'_, Store>, id: String
         let script = format!("f={}; s=$(wc -c < \"$f\") || exit 1; if [ \"$s\" -gt 67108864 ]; then echo 'Still shows files up to 64 MB.' >&2; exit 3; fi; base64 < \"$f\" | tr -d '\\n\\r'", quote(&full));
         let out = exec(&app, &host, &script, None, 120)?;
         Ok(String::from_utf8_lossy(&out).trim().to_owned())
+    })
+    .await
+}
+
+// ---- Port forwarding: a port on the server, reachable on this computer ----
+
+struct Forward {
+    child: std::process::Child,
+    host_id: String,
+    host_name: String,
+    remote_port: u16,
+    local_port: u16,
+}
+
+#[derive(Default)]
+pub struct Forwards(std::sync::Mutex<HashMap<String, Forward>>);
+
+impl Forwards {
+    pub fn stop_all(&self) {
+        if let Ok(mut map) = self.0.lock() {
+            for (_, mut forward) in map.drain() { let _ = forward.child.kill(); let _ = forward.child.wait(); }
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForwardInfo {
+    id: String,
+    host_id: String,
+    host_name: String,
+    remote_port: u16,
+    local_port: u16,
+}
+
+fn forward_info(id: &str, forward: &Forward) -> ForwardInfo {
+    ForwardInfo { id: id.to_owned(), host_id: forward.host_id.clone(), host_name: forward.host_name.clone(), remote_port: forward.remote_port, local_port: forward.local_port }
+}
+
+/// The wanted local port if it's free, otherwise any free one.
+fn free_port(wanted: u16) -> Result<u16> {
+    if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", wanted)) { drop(listener); return Ok(wanted) }
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(err)?;
+    Ok(listener.local_addr().map_err(err)?.port())
+}
+
+/// Forwards a port on the server to localhost here (`ssh -L`), on its own connection so it can be
+/// stopped on its own. Returns the local port, which is the same number when that one is free.
+#[tauri::command]
+pub async fn ssh_forward_start(app: AppHandle, store: State<'_, Store>, host_id: String, remote_port: u16, local_port: Option<u16>) -> Result<ForwardInfo> {
+    let host = find_host(&store, &host_id)?;
+    blocking(move || {
+        let forwards = app.state::<Forwards>();
+        {
+            let mut map = forwards.0.lock().map_err(err)?;
+            map.retain(|_, forward| matches!(forward.child.try_wait(), Ok(None)));
+            if let Some((id, forward)) = map.iter().find(|(_, forward)| forward.host_id == host_id && forward.remote_port == remote_port) {
+                return Ok(forward_info(id, forward));
+            }
+        }
+        let local = free_port(local_port.unwrap_or(remote_port))?;
+        // A connection of its own: drop the shared-connection options.
+        let mut args = Vec::new();
+        let mut base = base_args(&app, &host, true)?.into_iter();
+        while let Some(arg) = base.next() {
+            if arg == "-o" {
+                if let Some(value) = base.next() {
+                    if !value.starts_with("ControlMaster=") && !value.starts_with("ControlPath=") && !value.starts_with("ControlPersist=") { args.push(arg); args.push(value); }
+                }
+            } else { args.push(arg) }
+        }
+        let mut cmd = command(program(), &std::env::temp_dir());
+        cmd.args(&args).args(["-N", "-o", "ExitOnForwardFailure=yes", "-L", &format!("127.0.0.1:{local}:127.0.0.1:{remote_port}"), "--"]).arg(destination(&host));
+        use_prompts(&app, &mut cmd, &host);
+        let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().map_err(err)?;
+        // Ready once the local end accepts connections (the login may ask for a password first).
+        let started = std::time::Instant::now();
+        loop {
+            if let Ok(Some(_)) = child.try_wait() {
+                let mut text = String::new();
+                if let Some(mut stderr) = child.stderr.take() { let _ = stderr.read_to_string(&mut text); }
+                let reason = text.lines().filter(|line| !line.trim().is_empty()).last().unwrap_or("the connection closed").trim().to_owned();
+                return Err(format!("Could not forward port {remote_port}: {reason}"));
+            }
+            if std::net::TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], local)), Duration::from_millis(200)).is_ok() { break }
+            if started.elapsed() > Duration::from_secs(90) { let _ = child.kill(); let _ = child.wait(); return Err("The server took too long to answer.".into()) }
+            thread::sleep(Duration::from_millis(150));
+        }
+        let id = format!("{}:{remote_port}", host.id);
+        let forward = Forward { child, host_id: host.id.clone(), host_name: host.name.clone(), remote_port, local_port: local };
+        let info = forward_info(&id, &forward);
+        forwards.0.lock().map_err(err)?.insert(id, forward);
+        Ok(info)
+    })
+    .await
+}
+
+#[tauri::command]
+pub fn ssh_forward_stop(forwards: State<Forwards>, id: String) -> Result<()> {
+    if let Some(mut forward) = forwards.0.lock().map_err(err)?.remove(&id) { let _ = forward.child.kill(); let _ = forward.child.wait(); }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn ssh_forward_list(forwards: State<Forwards>) -> Result<Vec<ForwardInfo>> {
+    let mut map = forwards.0.lock().map_err(err)?;
+    map.retain(|_, forward| matches!(forward.child.try_wait(), Ok(None)));
+    let mut list: Vec<ForwardInfo> = map.iter().map(|(id, forward)| forward_info(id, forward)).collect();
+    list.sort_by_key(|item| item.remote_port);
+    Ok(list)
+}
+
+#[derive(Serialize)]
+pub struct ListeningPort {
+    port: u16,
+    process: String,
+}
+
+/// TCP ports something listens on, on the server (to offer forwarding a dev server's port).
+#[tauri::command]
+pub async fn ssh_listening_ports(app: AppHandle, store: State<'_, Store>, id: String) -> Result<Vec<ListeningPort>> {
+    let host = find_host(&store, &id)?;
+    blocking(move || {
+        // ss on most Linux servers, netstat on older ones, lsof on macOS; /proc/net/tcp when none is installed.
+        let out = exec(&app, &host, "(ss -ltnpH 2>/dev/null || netstat -ltnp 2>/dev/null || lsof -iTCP -sTCP:LISTEN -nP 2>/dev/null) | head -n 300; echo STILL-PROC; cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | head -n 2000; exit 0", None, 20)?;
+        let all = String::from_utf8_lossy(&out).into_owned();
+        let (text, proc_net) = all.split_once("STILL-PROC").unwrap_or((all.as_str(), ""));
+        let port = regex::Regex::new(r"(?:\d+\.\d+\.\d+\.\d+|\*|\[[^\]]*\]|::|0\.0\.0\.0|127\.0\.0\.1|localhost):(\d+)\s").unwrap();
+        let name = regex::Regex::new(r#"\(\("([^"]+)"|\d+/([\w.\-]+)"#).unwrap();
+        let mut found: Vec<ListeningPort> = Vec::new();
+        for line in text.lines() {
+            let Some(number) = port.captures(line).and_then(|found| found[1].parse::<u16>().ok()) else { continue };
+            // SSH itself, and system ports, are not what people forward.
+            if number == 22 || number < 1024 && number != 80 { continue }
+            if found.iter().any(|item| item.port == number) { continue }
+            let process = name.captures(line).and_then(|found| found.get(1).or(found.get(2))).map(|found| found.as_str().to_owned())
+                .or_else(|| line.contains("(LISTEN)").then(|| line.split_whitespace().next().unwrap_or("").to_owned()))
+                .unwrap_or_default();
+            found.push(ListeningPort { port: number, process });
+        }
+        // /proc/net/tcp: "sl local_address rem_address st …", state 0A is LISTEN, the port is hex.
+        for line in proc_net.lines() {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 4 || fields[3] != "0A" { continue }
+            let Some(number) = fields[1].rsplit(':').next().and_then(|hex| u16::from_str_radix(hex, 16).ok()) else { continue };
+            if number == 22 || number < 1024 && number != 80 || found.iter().any(|item| item.port == number) { continue }
+            found.push(ListeningPort { port: number, process: String::new() });
+        }
+        found.sort_by_key(|item| item.port);
+        Ok(found)
     })
     .await
 }

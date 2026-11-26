@@ -1,7 +1,8 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import {
   Check, Code2, Copy, FileDown, FolderOpen, FolderSearch, Import, Info, Keyboard, Palette, Pencil, Plus, Search, Server, SquareTerminal, Trash2, X, Sparkles } from 'lucide-react'
-import { type AppPaths, type PlanItem, type ShellOption, type SshOverview, desktop, editorSupport, home, hostLabel, mod, pickFolder, ssh } from './bridge'
+import { type AppPaths, type PlanItem, type ShellOption, type SshOverview, desktop, editorSupport, home, hostLabel, launcher, mod, pickFolder, ssh } from './bridge'
+import { open, save } from '@tauri-apps/plugin-dialog'
 import { listen } from '@tauri-apps/api/event'
 import { blankHost, HostDialog } from './Remote'
 import { editorFonts, useSettings } from './settings'
@@ -89,7 +90,7 @@ export default function SettingsView({ section, onSection, onClose, notify }: {
             {item.id === 'editor' && <EditorSettings />}
             {item.id === 'ai' && <AiSettingsView />}
             {item.id === 'terminal' && <TerminalSettings />}
-            {item.id === 'projects' && <ProjectSettings notify={notify} />}
+            {item.id === 'projects' && <><ProjectSettings notify={notify} /><LaunchSettings notify={notify} /></>}
             {item.id === 'remote' && <ServerSettings notify={notify} />}
             {item.id === 'shortcuts' && <><KeySettings /><Shortcuts /></>}
             {item.id === 'about' && <About notify={notify} />}
@@ -383,7 +384,10 @@ function EditorSettings() {
       <Toggle label="Show errors while typing" description="Underlines syntax errors as you type. Python files are also checked for undefined names (and, with pyflakes installed, unused imports and more)." checked={settings.errors} onChange={value => update({ errors: value })} />
       <Toggle label="Inline hints from language servers" description="Parameter names and inferred types shown faintly in the code, when the language server offers them." checked={settings.inlayHints} onChange={value => update({ inlayHints: value })} />
       <Toggle label="Sticky scroll" description="While you're inside a function, class or block whose first line has scrolled away, that line stays at the top of the editor. Click it to go there." checked={settings.stickyScroll} onChange={value => update({ stickyScroll: value })} />
-      <Toggle label="Fill in constructors" description="Enter after starting a class (class Shop: in Python, class Shop { in Java, JavaScript and C#) adds __init__ or the constructor. Comments and docstrings close themselves either way." checked={settings.fillConstructors} onChange={value => update({ fillConstructors: value })} />
+      <Toggle label="Fill in constructors and self" description="Enter after starting a class (class Shop: in Python, class Shop { in Java, JavaScript and C#) adds __init__ or the constructor. Enter after def __init__(self, name): writes self.name = name, and ( after def inside a class adds self. Comments and docstrings close themselves either way." checked={settings.fillConstructors} onChange={value => update({ fillConstructors: value })} />
+      <Toggle label="Fill in docstrings and Javadoc" description={'Enter between """ and """ under a function lists its Args and Returns; /** above a method lists @param and @return.'} checked={settings.docTemplates} onChange={value => update({ docTemplates: value })} />
+      <Toggle label="Make f-strings as you type" description={'Typing {name} inside a plain Python string adds the f in front.'} checked={settings.autoFString} onChange={value => update({ autoFString: value })} />
+      <Toggle label="Continue line comments" description="Enter inside a // or # comment starts the next line as a comment too. Enter on an empty comment line ends it." checked={settings.continueComments} onChange={value => update({ continueComments: value })} />
       <Toggle label="Show who last changed the current line" description="At the end of the line you're on: the author, when, and the commit message (Git blame). Still menu → Git → Blame for every line shows it for the whole file." checked={settings.inlineBlame} onChange={value => update({ inlineBlame: value })} />
       <Toggle label="Mark lines changed since the last commit" description="A green bar for added lines, amber for changed lines and a red mark where lines were removed." checked={settings.gitGutter} onChange={value => update({ gitGutter: value })} />
     </section>
@@ -530,10 +534,44 @@ function ProjectSettings({ notify }: { notify: (message: unknown) => void }) {
     <section className="settings-group">
       <h3>Startup</h3>
       <Toggle label="Reopen the last project when Still starts" description="Off: Still opens on Home." checked={settings.openLastProject} onChange={value => update({ openLastProject: value })} />
+      <Toggle label="Keep unsaved changes when closing" description="Closing Still (or a crash) keeps edits you haven't saved; they come back as unsaved tabs when you open the project again. Off: Still asks before closing." checked={settings.hotExit} onChange={value => update({ hotExit: value })} />
       <div className="setting-row"><span className="setting-text"><span>When a project opens, show</span><small>The files you had open last time (where you left off), or the project's README.</small></span>
         <Segmented label="When a project opens" value={settings.openOnStart} onChange={value => update({ openOnStart: value })} options={[{ value: 'last', label: 'Last open files' }, { value: 'readme', label: 'README' }]} /></div>
     </section>
   </>
+}
+
+/** The `still` command, Open with Still in Explorer, and settings as a file. */
+function LaunchSettings({ notify }: { notify: (message: unknown) => void }) {
+  const { settings, update } = useSettings()
+  const windows = navigator.userAgent.includes('Windows')
+  async function exportSettings() {
+    const path = await save({ title: 'Export settings', defaultPath: 'still-settings.json', filters: [{ name: 'Still settings', extensions: ['json'] }] })
+    if (!path) return
+    await launcher.writeText(path, JSON.stringify({ still: 'settings', version: 1, settings }, null, 2))
+    notify('Saved your settings, themes, snippets and shortcuts. API keys are not included.')
+  }
+  async function importSettings() {
+    const path = await open({ title: 'Import settings', multiple: false, directory: false, filters: [{ name: 'Still settings', extensions: ['json'] }] })
+    if (typeof path !== 'string') return
+    const parsed = JSON.parse(await launcher.readText(path)) as { still?: string; settings?: Record<string, unknown> }
+    const incoming = parsed?.still === 'settings' && parsed.settings && typeof parsed.settings === 'object' ? parsed.settings : null
+    if (!incoming) throw new Error("That file isn't a Still settings export.")
+    // Only known settings with the same kind of value; anything else in the file is ignored.
+    const known = settings as unknown as Record<string, unknown>
+    const change = Object.fromEntries(Object.entries(incoming).filter(([key, value]) => key in known && typeof value === typeof known[key] && Array.isArray(value) === Array.isArray(known[key])))
+    update(change as Partial<typeof settings>)
+    notify('Imported ' + Object.keys(change).length + ' settings.')
+  }
+  return <section className="settings-group">
+    <h3>Command line and backups</h3>
+    <div className="setting-row"><span className="setting-text"><span>The still command</span><small>Type still . in a terminal to open the folder you're in, or still notes.md to open a file.</small></span>
+      <button className="text-btn" disabled={!desktop} onClick={() => { void launcher.installCli().then(notify).catch(notify) }}>Add command</button></div>
+    {windows && <div className="setting-row"><span className="setting-text"><span>Open with Still in File Explorer</span><small>Right-click a folder or file in Explorer to open it here.</small></span>
+      <span className="setting-actions"><button className="text-btn" onClick={() => { void launcher.explorerMenu(true).then(notify).catch(notify) }}>Add</button><button className="text-btn" onClick={() => { void launcher.explorerMenu(false).then(notify).catch(notify) }}>Remove</button></span></div>}
+    <div className="setting-row"><span className="setting-text"><span>Settings file</span><small>Your settings, themes, snippets and shortcuts in one file, to move them to another computer or keep a copy.</small></span>
+      <span className="setting-actions"><button className="text-btn" disabled={!desktop} onClick={() => { void exportSettings().catch(notify) }}>Export…</button><button className="text-btn" disabled={!desktop} onClick={() => { void importSettings().catch(notify) }}>Import…</button></span></div>
+  </section>
 }
 
 function ServerSettings({ notify }: { notify: (message: unknown) => void }) {

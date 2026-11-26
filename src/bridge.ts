@@ -48,6 +48,31 @@ export const mod = /Mac|iPhone|iPad/.test(navigator.platform) ? '⌘' : 'Ctrl'
 export const fileName = (path: string) => path.split('/').at(-1) || path
 export const parentPath = (path: string) => path.split('/').slice(0, -1).join('/')
 export const normalize = (text: string) => text.replace(/\r\n?/g, '\n')
+/** A short fingerprint of a text (FNV-1a), to notice when a file changed. */
+export function textHash(text: string) {
+  let hash = 0x811c9dc5
+  for (let index = 0; index < text.length; index++) { hash ^= text.charCodeAt(index); hash = Math.imul(hash, 0x01000193) }
+  return (hash >>> 0).toString(16) + ':' + text.length
+}
+
+/** Unsaved edits kept outside the project, so closing Still or a crash loses nothing. */
+export interface BackupEntry { path: string; contents: string; base: string; time: number }
+export const backups = {
+  write: (key: string, entries: BackupEntry[]) => desktop ? invoke<void>('backup_write', { key, entries: JSON.stringify(entries) }) : Promise.resolve(),
+  read: async (key: string): Promise<BackupEntry[]> => {
+    if (!desktop) return []
+    try { const list = JSON.parse(await invoke<string>('backup_read', { key })); return Array.isArray(list) ? list.filter(item => item && typeof item.path === 'string' && typeof item.contents === 'string') : [] } catch { return [] }
+  },
+}
+
+/** The folder or file Still was started with (`still .`, Open with Still), once. */
+export const launcher = {
+  target: () => desktop ? invoke<{ path: string; directory: boolean } | null>('launch_target').catch(() => null) : Promise.resolve(null),
+  installCli: () => invoke<string>('install_cli'),
+  explorerMenu: (enable: boolean) => invoke<string>('explorer_menu', { enable }),
+  writeText: (path: string, contents: string) => invoke<void>('write_text_file', { path, contents }),
+  readText: (path: string) => invoke<string>('read_text_file', { path }),
+}
 export const demo: Workspace = { root: 'orbit-lab', name: 'Orbit Lab', sample: true }
 
 /** Forgets what Still remembered for a project folder (breakpoints, watches, run settings, open
@@ -168,12 +193,19 @@ export async function withPassword<T>(id: string, call: () => Promise<T>): Promi
 }
 
 export interface RemoteListing { path: string; home: string; entries: Entry[] }
+export interface ForwardedPort { id: string; hostId: string; hostName: string; remotePort: number; localPort: number }
+export interface ListeningPort { port: number; process: string }
 
 export const ssh = {
   hosts: async (): Promise<SshOverview> => desktop ? invoke('ssh_hosts') : { saved: [], imported: [], client: null },
   save: (host: SshHost) => invoke<SshHost>('ssh_save_host', { host }),
   remove: (id: string) => invoke<void>('ssh_delete_host', { id }),
   test: (id: string) => withPassword(id, () => invoke<string>('ssh_test', { id })),
+  /** Forwards a port on the server to localhost here; the local port is the same when it's free. */
+  forward: (hostId: string, remotePort: number, localPort?: number) => withPassword(hostId, () => invoke<ForwardedPort>('ssh_forward_start', { hostId, remotePort, localPort: localPort ?? null })),
+  unforward: (id: string) => invoke<void>('ssh_forward_stop', { id }),
+  forwards: () => desktop ? invoke<ForwardedPort[]>('ssh_forward_list') : Promise.resolve([] as ForwardedPort[]),
+  listening: (id: string) => withPassword(id, () => invoke<ListeningPort[]>('ssh_listening_ports', { id })),
   resolve: (id: string, path: string) => withPassword(id, () => invoke<string>('ssh_resolve', { id, path })),
   browse: (id: string, path: string) => withPassword(id, () => invoke<RemoteListing>('ssh_browse', { id, path })),
 }
@@ -382,4 +414,6 @@ export const history = {
   blame: async (rootPath: string, path: string, contents?: string): Promise<BlameLine[]> => desktop ? invoke('git_blame', { rootPath, path, contents: contents ?? null }) : [],
   fileLog: async (rootPath: string, path: string): Promise<FileCommit[]> => desktop ? invoke('git_file_log', { rootPath, path }) : [],
   showAt: (rootPath: string, rev: string, path: string) => invoke<string>('git_show_at', { rootPath, rev, path }),
+  graph: (rootPath: string, limit?: number) => invoke<import('./GitGraph').GraphCommit[]>('git_graph', { rootPath, limit: limit ?? null }),
+  commitDetail: (rootPath: string, hash: string) => invoke<{ message: string; author: string; date: string; parent: string | null; files: { path: string; oldPath: string | null; status: string; additions: number | null; deletions: number | null }[] }>('git_commit_detail', { rootPath, hash }),
 }

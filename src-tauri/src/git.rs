@@ -3,7 +3,7 @@ use crate::{
     workspace::{err, relative, resolve, root, Result},
 };
 use serde::Serialize;
-use std::{path::Path, process::Command};
+use std::{collections::HashMap, path::Path, process::Command};
 use tauri::{AppHandle, State};
 
 fn git(cwd: &Path) -> Command {
@@ -517,6 +517,101 @@ pub async fn git_checkout_pr(root_path: String, number: u32) -> Result<String> {
         check(git(&cwd).args(["fetch", "origin", &format!("pull/{number}/head:{branch}"), "--force"]).output().map_err(err)?)?;
         check(git(&cwd).args(["checkout", &branch]).output().map_err(err)?)?;
         Ok(branch)
+    })
+    .await
+    .map_err(err)?
+}
+
+// ---- Commit graph: every branch's commits with their parents, and what a commit changed ----
+
+#[derive(Serialize)]
+pub struct GraphCommit {
+    hash: String,
+    short: String,
+    parents: Vec<String>,
+    subject: String,
+    author: String,
+    when: String,
+    refs: Vec<String>,
+}
+
+/// Commits on all branches, newest first (by date), for drawing the graph.
+#[tauri::command]
+pub async fn git_graph(root_path: String, limit: Option<u32>) -> Result<Vec<GraphCommit>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let cwd = root(&root_path)?;
+        let count = limit.unwrap_or(400).clamp(20, 5000).to_string();
+        let output = git(&cwd).args(["log", "--all", "--date-order", "-n", &count, "--format=%H%x1f%h%x1f%P%x1f%s%x1f%an%x1f%ar%x1f%D"]).output().map_err(err)?;
+        if !output.status.success() { return Ok(Vec::new()) }
+        Ok(String::from_utf8_lossy(&output.stdout).lines().filter_map(|line| {
+            let mut parts = line.split('\x1f');
+            Some(GraphCommit {
+                hash: parts.next()?.into(),
+                short: parts.next()?.into(),
+                parents: parts.next()?.split_whitespace().map(str::to_owned).collect(),
+                subject: parts.next()?.into(),
+                author: parts.next()?.into(),
+                when: parts.next()?.into(),
+                refs: parts.next().unwrap_or("").split(", ").map(str::trim).filter(|item| !item.is_empty()).map(str::to_owned).collect(),
+            })
+        }).collect())
+    })
+    .await
+    .map_err(err)?
+}
+
+#[derive(Serialize)]
+pub struct CommitFile {
+    path: String,
+    #[serde(rename = "oldPath")]
+    old_path: Option<String>,
+    status: String,
+    additions: Option<u32>,
+    deletions: Option<u32>,
+}
+
+#[derive(Serialize)]
+pub struct CommitDetail {
+    message: String,
+    author: String,
+    date: String,
+    parent: Option<String>,
+    files: Vec<CommitFile>,
+}
+
+/// A commit's message and the files it changed (against its first parent).
+#[tauri::command]
+pub async fn git_commit_detail(root_path: String, hash: String) -> Result<CommitDetail> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let cwd = root(&root_path)?;
+        if hash.len() < 4 || hash.len() > 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) { return Err("Unknown commit.".into()) }
+        let head = git(&cwd).args(["show", "--no-patch", "--format=%B%x1e%an <%ae>%x1e%ad%x1e%P", "--date=format:%Y-%m-%d %H:%M", &hash]).output().map_err(err)?;
+        if !head.status.success() { return Err("Unknown commit.".into()) }
+        let text = String::from_utf8_lossy(&head.stdout).into_owned();
+        let mut parts = text.split('\x1e');
+        let message = parts.next().unwrap_or("").trim().to_owned();
+        let author = parts.next().unwrap_or("").trim().to_owned();
+        let date = parts.next().unwrap_or("").trim().to_owned();
+        let parent = parts.next().unwrap_or("").split_whitespace().next().map(str::to_owned);
+        let range: Vec<String> = match &parent { Some(parent) => vec!["diff".into(), "-M".into(), parent.clone(), hash.clone()], None => vec!["show".into(), "-M".into(), "--format=".into(), hash.clone()] };
+        let names = git(&cwd).args(&range).arg("--name-status").output().map_err(err)?;
+        let numbers = git(&cwd).args(&range).arg("--numstat").output().map_err(err)?;
+        let mut counts = HashMap::new();
+        for line in String::from_utf8_lossy(&numbers.stdout).lines() {
+            let mut fields = line.split('\t');
+            let (Some(added), Some(removed)) = (fields.next(), fields.next()) else { continue };
+            let path = fields.last().unwrap_or("").to_owned();
+            counts.insert(path, (added.parse().ok(), removed.parse().ok()));
+        }
+        let files = String::from_utf8_lossy(&names.stdout).lines().filter_map(|line| {
+            let fields: Vec<&str> = line.split('\t').collect();
+            let status = fields.first()?.chars().next()?.to_string();
+            let (old_path, path) = if fields.len() >= 3 { (Some(fields[1].to_owned()), fields[2].to_owned()) } else { (None, fields.get(1)?.to_string()) };
+            // numstat names a rename as "old => new" or "{a => b}/c"; match on the new name's end.
+            let (additions, deletions) = counts.iter().find(|(key, _)| *key == &path || key.ends_with(&path) || key.contains(" => ") && key.rsplit(" => ").next().map(|end| end.trim_end_matches('}')).is_some_and(|end| path.ends_with(end))).map(|(_, value)| *value).unwrap_or((None, None));
+            Some(CommitFile { path, old_path, status, additions, deletions })
+        }).collect();
+        Ok(CommitDetail { message, author, date, parent, files })
     })
     .await
     .map_err(err)?

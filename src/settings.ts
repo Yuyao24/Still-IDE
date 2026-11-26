@@ -65,6 +65,10 @@ export interface Settings {
   inlineBlame: boolean
   /** Fill in __init__ / the constructor when a new class is started. */
   fillConstructors: boolean
+  docTemplates: boolean
+  autoFString: boolean
+  continueComments: boolean
+  hotExit: boolean
   /** Keep the header of the function or class you're in pinned at the top of the editor. */
   stickyScroll: boolean
   /** Load the project's .env file into runs, debugging and tests. */
@@ -155,6 +159,10 @@ export const defaults: Settings = {
   formatOnSave: false,
   inlineBlame: true,
   fillConstructors: true,
+  docTemplates: true,
+  autoFString: true,
+  continueComments: false,
+  hotExit: true,
   stickyScroll: true,
   loadDotEnv: true,
   pauseOnExceptions: 'uncaught',
@@ -256,6 +264,7 @@ export function applySettings(settings: Settings, systemDark: boolean) {
   classes.toggle('surface-frosted', settings.surfaceStyle === 'frosted')
   classes.toggle('surface-liquid', settings.surfaceStyle === 'liquid')
   const resolved = resolveTheme(theme).colors
+  classes.toggle('theme-dark', theme.kind === 'dark')
   const solid = resolved.editor
   root.setProperty('--editor-solid', solid)
   root.setProperty('--backdrop-image', settings.backgroundImage ? `url("${settings.backgroundImage}")` : 'none')

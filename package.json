@@ -55,6 +55,7 @@
     "katex": "0.19.1",
     "lucide-react": "^0.468.0",
     "marked": "^15.0.12",
+    "mermaid": "^11.17.2",
     "pdfjs-dist": "6.5.438",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"

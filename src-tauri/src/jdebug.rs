@@ -60,6 +60,8 @@ struct Session<'a> {
     out: Receiver<Out>,
     /// Project-relative paths of the Java sources, for turning classes into files.
     sources: Vec<String>,
+    /// Reads a project file (from disk, or from the server over SSH).
+    read: Box<dyn Fn(&str) -> String + 'a>,
     /// The frame jdb has selected (1 is the innermost).
     jdb_frame: usize,
     stack: Vec<(String, String, u32)>,
@@ -104,8 +106,8 @@ impl Session<'_> {
         }
     }
 
-    fn class_for(&self, path: &str, root: &Path) -> String {
-        let source = std::fs::read_to_string(root.join(path)).unwrap_or_default();
+    fn class_for(&self, path: &str) -> String {
+        let source = (self.read)(path);
         let package = Regex::new(r"(?m)^\s*package\s+([\w$.]+)\s*;").unwrap().captures(&source).map(|found| found[1].to_owned());
         let stem = Path::new(path).file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default();
         package.map_or(stem.clone(), |package| format!("{package}.{stem}"))
@@ -228,14 +230,14 @@ impl Session<'_> {
         Ok(())
     }
 
-    fn set_breakpoints(&mut self, wanted: Vec<(String, u32)>, root: &Path, paused: bool) -> Result<()> {
+    fn set_breakpoints(&mut self, wanted: Vec<(String, u32)>, paused: bool) -> Result<()> {
         let old = std::mem::take(&mut self.breakpoints);
         for (path, line) in old.iter().filter(|item| !wanted.contains(item)) {
-            let command = format!("clear {}:{line}", self.class_for(path, root));
+            let command = format!("clear {}:{line}", self.class_for(path));
             if paused { self.ask(&command)?; } else { self.send(&command)?; }
         }
         for (path, line) in wanted.iter().filter(|item| !old.contains(item)) {
-            let command = format!("stop at {}:{line}", self.class_for(path, root));
+            let command = format!("stop at {}:{line}", self.class_for(path));
             if paused { self.ask(&command)?; } else { self.send(&command)?; }
         }
         self.breakpoints = wanted;
@@ -273,6 +275,15 @@ fn java_sources(root: &Path) -> Vec<String> {
     found
 }
 
+/// A started jdb (on this computer, or on a server over SSH) and what's needed to follow it.
+pub struct Launch<'a> {
+    pub child: std::process::Child,
+    pub class: String,
+    pub sources: Vec<String>,
+    pub read: Box<dyn Fn(&str) -> String + 'a>,
+    pub diagnostics: Vec<crate::process::Diagnostic>,
+}
+
 /// Runs inside the debug job: compile, start jdb, then follow it until the program ends.
 #[allow(clippy::too_many_arguments)]
 pub fn run(job: &Job, app: AppHandle, id: String, cwd: &Path, file: &Path, path: &str, setup: Value, args: &[String], commands: Receiver<Value>) -> Result<(i32, Vec<crate::process::Diagnostic>)> {
@@ -283,11 +294,18 @@ pub fn run(job: &Job, app: AppHandle, id: String, cwd: &Path, file: &Path, path:
     let jdb = compiled.compiler.with_file_name(if cfg!(windows) { "jdb.exe" } else { "jdb" });
     let jdb = if jdb.is_file() { jdb } else { "jdb".into() };
     job.emit("command", format!("$ jdb {}{}\n", compiled.class, if args.is_empty() { String::new() } else { format!(" {}", shell_words::join(args)) }));
-    let mut child = crate::process::command(&jdb, cwd)
+    let child = crate::process::command(&jdb, cwd)
         .args(["-J-Dfile.encoding=UTF-8", "-J-Duser.language=en", "-classpath", "bin", "-sourcepath"]).arg(&compiled.source_paths)
         .arg(&compiled.class).args(args).envs(job.env_vars())
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
         .spawn().map_err(|error| if error.kind() == std::io::ErrorKind::NotFound { "jdb was not found. It comes with the JDK; check that JAVA_HOME points at a JDK.".to_owned() } else { err(error) })?;
+    let root = cwd.to_path_buf();
+    follow(job, app, id, Launch { child, class: compiled.class, sources: java_sources(cwd), read: Box::new(move |path| std::fs::read_to_string(root.join(path)).unwrap_or_default()), diagnostics: compiled.diagnostics }, setup, commands)
+}
+
+/// Follows a started jdb until the program ends, turning its text into debugger events.
+pub fn follow(job: &Job, app: AppHandle, id: String, launch: Launch, setup: Value, commands: Receiver<Value>) -> Result<(i32, Vec<crate::process::Diagnostic>)> {
+    let Launch { mut child, class, sources, read, diagnostics } = launch;
     let stdin = child.stdin.take().ok_or("jdb takes no input.")?;
     let out = reader(child.stdout.take().ok_or("jdb has no output.")?);
     // jdb's own errors (the program's stderr arrives on stdout, mixed with jdb's).
@@ -300,19 +318,19 @@ pub fn run(job: &Job, app: AppHandle, id: String, cwd: &Path, file: &Path, path:
         });
     }
     let mut session = Session {
-        job, app: app.clone(), id: id.clone(), stdin, out, sources: java_sources(cwd), jdb_frame: 1, stack: Vec::new(),
+        job, app: app.clone(), id: id.clone(), stdin, out, sources, read, jdb_frame: 1, stack: Vec::new(),
         watches: setup["watches"].as_array().into_iter().flatten().filter_map(|item| item.as_str().map(str::to_owned)).collect(),
         breakpoints: Vec::new(), options: breakpoint_options(&setup["breakpoints"]), reason: String::new(), detail: String::new(), ended: false,
     };
     // jdb's first prompt, then breakpoints (deferred until the class loads) and run.
     let _ = session.ask("");
-    session.set_breakpoints(breakpoint_list(&setup["breakpoints"]), cwd, true)?;
+    session.set_breakpoints(breakpoint_list(&setup["breakpoints"]), true)?;
     match setup["pauseOn"].as_str().unwrap_or("uncaught") {
         "all" => { session.ask("catch all java.lang.Throwable")?; }
         "none" => {}
         _ => { session.ask("catch uncaught java.lang.Throwable")?; }
     }
-    if setup["stopOnEntry"].as_bool().unwrap_or(false) { session.ask(&format!("stop in {}.main", compiled.class))?; }
+    if setup["stopOnEntry"].as_bool().unwrap_or(false) { session.ask(&format!("stop in {class}.main"))?; }
     let _ = app.emit("debug-event", json!({ "id": id, "event": "started" }));
     session.send("run")?;
     let event = Regex::new(r#"^(?:> )?(Breakpoint hit|Step completed|Exception occurred|Method entered): (?:(.+?) \((?:un)?caught\))?"thread=[^"]*", ([\w$.<>]+)\(\), line=([\d,]+)"#).unwrap();
@@ -383,7 +401,7 @@ pub fn run(job: &Job, app: AppHandle, id: String, cwd: &Path, file: &Path, path:
             while let Ok(command) = commands.try_recv() {
                 match command["op"].as_str().unwrap_or("") {
                     "stop" => break 'outer,
-                    "breakpoints" => { session.options = breakpoint_options(&command["items"]); session.set_breakpoints(breakpoint_list(&command["items"]), cwd, false)? }
+                    "breakpoints" => { session.options = breakpoint_options(&command["items"]); session.set_breakpoints(breakpoint_list(&command["items"]), false)? }
                     "watches" => session.watches = command["items"].as_array().into_iter().flatten().filter_map(|item| item.as_str().map(str::to_owned)).collect(),
                     _ => {}
                 }
@@ -409,7 +427,7 @@ pub fn run(job: &Job, app: AppHandle, id: String, cwd: &Path, file: &Path, path:
                 let index = session.stack.len().saturating_sub(session.jdb_frame);
                 session.report(index)?;
             }
-            "breakpoints" => { session.options = breakpoint_options(&command["items"]); session.set_breakpoints(breakpoint_list(&command["items"]), cwd, true)? }
+            "breakpoints" => { session.options = breakpoint_options(&command["items"]); session.set_breakpoints(breakpoint_list(&command["items"]), true)? }
             "eval" => {
                 let expression = command["expression"].as_str().unwrap_or("").to_owned();
                 let (value, ok) = session.evaluate(&expression);
@@ -429,5 +447,5 @@ pub fn run(job: &Job, app: AppHandle, id: String, cwd: &Path, file: &Path, path:
     };
     let _ = app.emit("debug-event", json!({ "id": id, "event": "ended" }));
     while let Ok(line) = errors.try_recv() { job.emit("stderr", format!("{line}\n")); }
-    Ok((code, compiled.diagnostics))
+    Ok((code, diagnostics))
 }

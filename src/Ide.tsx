@@ -10,7 +10,7 @@ import {
   Camera, Eye, PenLine, LayoutGrid, Maximize2, Minimize2, Network, BookOpen, Sparkles, Bug, FlaskConical, ArrowLeftRight, AlignLeft,
 } from 'lucide-react'
 import {
-  api, clipboard, desktop, editorSupport, fileName, fileTemplate, history, type BlameLine, type FileCommit, fileSystem, home, mod, parentPath, pickFolder, ssh,
+  api, backups, clipboard, desktop, editorSupport, fileName, fileTemplate, history, type BlameLine, type FileCommit, fileSystem, home, mod, normalize, parentPath, pickFolder, ssh, textHash,
   type Branches, type Change, type Commit, type Diagnostic, type Diff, type Entry, type GitStatus, type JobEvent, type Packages, type Runtimes,
   type SshHost, type SshOverview, type Workspace,
   tex, type TexResult,
@@ -23,6 +23,8 @@ import { Minimap } from './Minimap'
 import { RunConfigDialog } from './RunConfig'
 import { Notebook } from './Notebook'
 import { PullRequests } from './PullRequests'
+import { GitGraph } from './GitGraph'
+import { MergeEditor, conflictCount } from './MergeEditor'
 import { bindings, comboOf } from './keymap'
 import { Chunk } from '@codemirror/merge'
 import { Text } from '@codemirror/state'
@@ -102,6 +104,8 @@ interface Props {
 
 export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, onToggleTheme, notify: toast }: Props) {
   const { settings, theme, update } = useSettings()
+  const settingsRef = useRef(settings)
+  settingsRef.current = settings
   const fs = useMemo(() => fileSystem(workspace), [workspace])
   const remote = Boolean(workspace.remote)
   const [tabs, setTabs] = useState<Tab[]>([])
@@ -172,6 +176,8 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const [rightWidth, setRightWidth] = useState(() => Number(localStorage.getItem('still.island.rightWidth')) || 320)
   const [chatEverOpen, setChatEverOpen] = useState(false)
   const [viewport, setViewport] = useState<{ top: number; height: number; lines: number } | null>(null)
+  // The top line each pane's editor shows (a side-by-side preview follows it).
+  const [topLines, setTopLines] = useState<Record<string, number>>({})
   const graphOpen = rightOpen && rightView === 'canvas'
   const [focusMode, setFocusMode] = useState(false)
   const [focusOutput, setFocusOutput] = useState(false)
@@ -190,7 +196,8 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const [overview, setOverview] = useState(false)
   const [graphView, setGraphView] = useState(false)
   // Fullscreen Files and Git (opened from the overview, like the journal and the canvas).
-  const [fullView, setFullView] = useState<'files' | 'git' | 'history' | 'pulls' | null>(null)
+  const [fullView, setFullView] = useState<'files' | 'git' | 'history' | 'pulls' | 'graph' | 'merge' | null>(null)
+  const [mergeFor, setMergeFor] = useState<string | null>(null)
   // History of one file: versions kept on each save (local) and the commits that changed it.
   const [historyFor, setHistoryFor] = useState<{ path: string; tab: 'local' | 'commits' } | null>(null)
   const [historyItems, setHistoryItems] = useState<{ local: { id: string; time: number; size: number }[]; commits: FileCommit[] }>({ local: [], commits: [] })
@@ -267,7 +274,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const editorOptions: EditorOptions = {
     wrap: settings.wordWrap, lineNumbers: settings.lineNumbers, highlightLine: settings.highlightLine, tabSize, layout: settings.diffLayout, autocomplete: settings.autocomplete,
     occurrences: settings.occurrences, whitespace: settings.whitespace, indentGuides: settings.indentGuides, closeBrackets: settings.closeBrackets, scrollPastEnd: settings.scrollPastEnd,
-    errors: settings.errors, changes: settings.gitGutter, cursorBlink: settings.cursorBlink, folding: settings.folding, blameColumn, constructors: settings.fillConstructors, sticky: settings.stickyScroll, inlayHints: settings.inlayHints,
+    errors: settings.errors, changes: settings.gitGutter, cursorBlink: settings.cursorBlink, folding: settings.folding, blameColumn, constructors: settings.fillConstructors, docTemplates: settings.docTemplates, fStrings: settings.autoFString, continueComments: settings.continueComments, sticky: settings.stickyScroll, inlayHints: settings.inlayHints,
   }
   // Prose (Markdown, text) wraps and skips indent guides and error checks.
   const optionsFor = (tab: Tab): EditorOptions => {
@@ -466,9 +473,41 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       const preferred = resume && available.some(tab => tab.id === resume) ? resume : available.some(tab => tab.id === 'src/app.py') ? 'src/app.py' : available[0]?.id ?? ''
       setSelected(previous => previous || preferred)
       if (resume) expandParents(resume)
+      await restoreBackups(id)
     })()
     return () => { generation.current++ }
   }, [])
+
+  // ---- Hot exit: unsaved edits are kept outside the project and come back next time ----
+  const backupKey = (workspace.remote ?? '') + '|' + workspace.root
+  const backupEntries = () => latest.current.tabs.filter(tab => !tab.diff && !tab.binary && dirty(tab))
+    .map(tab => ({ path: tab.path, contents: tab.contents, base: textHash(normalize(tab.saved)), time: Date.now() }))
+  const backupsReady = useRef(false)
+  async function restoreBackups(id: number) {
+    const entries = workspace.sample ? [] : await backups.read(backupKey)
+    if (generation.current !== id) return
+    backupsReady.current = true
+    if (!entries.length) return
+    const restored: Tab[] = []
+    let changed = 0
+    for (const entry of entries) {
+      const disk = await fs.read(entry.path).catch(() => '')
+      if (normalize(disk) === normalize(entry.contents)) continue
+      if (textHash(normalize(disk)) !== entry.base) changed++
+      restored.push({ ...fileTab(entry.path, disk), contents: entry.contents })
+    }
+    if (generation.current !== id || !restored.length) return
+    // Restored files keep their place among the open tabs; the others are added at the end.
+    setTabs(previous => [...previous.map(tab => restored.find(item => item.id === tab.id) ?? tab), ...restored.filter(item => !previous.some(tab => tab.id === item.id))])
+    setSelected(previous => previous && !restored.some(item => item.id === previous) ? previous : restored[0].id)
+    notify('Brought back unsaved changes in ' + (restored.length === 1 ? fileName(restored[0].path) : restored.length + ' files') + '.'
+      + (changed ? ' ' + (changed === 1 ? 'One file' : changed + ' files') + ' changed on disk since; compare before saving.' : ''))
+  }
+  useEffect(() => {
+    if (!desktop || workspace.sample || !backupsReady.current) return
+    const timer = setTimeout(() => { void backups.write(backupKey, backupEntries()).catch(() => {}) }, 700)
+    return () => clearTimeout(timer)
+  }, [tabs])
 
   useEffect(() => {
     if (sidebar === 'git') { void refreshGit(); void refreshLog() }
@@ -492,7 +531,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
 
   function leave(action: () => void, title: string) {
     if (busyGuard()) return
-    if (latest.current.tabs.some(dirty)) askDiscard(title, 'Open files have unsaved changes.', action)
+    if (latest.current.tabs.some(dirty)) askDiscard(title, 'Open files have unsaved changes.', () => { void backups.write(backupKey, []).catch(() => {}); action() })
     else action()
   }
 
@@ -515,10 +554,14 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     if (!desktop) return
     let unlisten: UnlistenFn | undefined
     let closed = false
-    void getCurrentWindow().onCloseRequested(event => {
+    void getCurrentWindow().onCloseRequested(async event => {
       if (!windowCloseApproved.current && latest.current.tabs.some(dirty)) {
         event.preventDefault()
-        askDiscard('Close Still?', 'Open files have unsaved changes.', approvalAndClose)
+        if (settingsRef.current.hotExit && !workspace.sample) {
+          // Keep the unsaved edits for next time, then close without asking.
+          await backups.write(backupKey, backupEntries()).catch(() => {})
+          approvalAndClose()
+        } else askDiscard('Close Still?', 'Open files have unsaved changes.', () => { void backups.write(backupKey, []).catch(() => {}); approvalAndClose() })
       }
     }).then(stop => { if (closed) stop(); else unlisten = stop }).catch(notify)
     return () => { closed = true; unlisten?.() }
@@ -827,6 +870,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       if (!remote && !workspace.sample) void history.save(workspace.root, current.path, current.contents).catch(() => {})
       tellServers([{ path: current.path, type: 'changed' }])
       if (docKind(current.path) === 'tex') compileTex(current.path)
+      testsAfterSave(current.path)
       const markSaved = (items: Tab[]) => items.map(item => item.id === current.id ? { ...item, saved: current.contents } : item)
       latest.current.tabs = markSaved(latest.current.tabs)
       setTabs(markSaved)
@@ -1527,15 +1571,25 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
 
   const testLanguage = mode === 'Java' || (!mode && files.some(file => file.path === 'pom.xml' || file.path.startsWith('build.gradle'))) ? 'java' : 'python'
   const testsWhy = !desktop ? 'Tests run in the Still desktop app.' : remote && testLanguage !== 'python' ? 'On a server, Still runs Python tests (pytest) for now.' : undefined
-  async function runTests(target: string | null, language = testLanguage) {
+  // Watch mode: the last tests you ran run again after each save.
+  const [testWatch, setTestWatch] = useState(false)
+  const lastTests = useRef<{ target: string | null; language: string }>({ target: null, language: testLanguage })
+  const watchTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  function testsAfterSave(path: string) {
+    if (!testWatch || !/\.(py|java)$/.test(path)) return
+    clearTimeout(watchTimer.current)
+    watchTimer.current = setTimeout(() => { if (!activeJob.current) void runTests(lastTests.current.target, lastTests.current.language as 'java' | 'python', true) }, 500)
+  }
+  async function runTests(target: string | null, language = testLanguage, quiet = false) {
     if (testsWhy) { notify(testsWhy); return }
+    lastTests.current = { target, language }
     if (activeJob.current) { notify('Wait for the current process to finish.'); return }
     if (active && dirty(active)) await store(active).catch(notify)
     await storeAll()
     setTestsRunning(true)
     if (remote) await launch('run', 'test', 'ssh_tests_run', { hostId: workspace.remote, root: workspace.root, target })
     else await launch('run', 'test', 'tests_run', { rootPath: workspace.root, target, language, dotenv: settings.loadDotEnv, coverage: settings.testCoverage && language === 'python' })
-    setDrawer('tests'); setDrawerOpen(true)
+    if (!quiet || drawerOpen) { setDrawer('tests'); setDrawerOpen(true) }
     if (!activeJob.current) setTestsRunning(false)
   }
   function runTestsFrom(which: 'all' | 'failed' | 'file') {
@@ -1559,7 +1613,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     if (byFile) jumpTo({ path: byFile, line: Number(failureLine ?? result.line ?? 1) })
   }
 
-  const debugWhy = !desktop ? 'Debugging runs in the Still desktop app.' : remote ? (mode !== 'Python' ? 'Debugging on a server works with Python files for now.' : undefined) : mode !== 'Python' && mode !== 'Java' ? 'The debugger works with Python and Java files for now.' : undefined
+  const debugWhy = !desktop ? 'Debugging runs in the Still desktop app.' : mode !== 'Python' && mode !== 'Java' ? 'The debugger works with Python and Java files for now.' : undefined
   async function startDebug() {
     if (!active || debugWhy || activeJob.current) { if (debugWhy) notify(debugWhy); return }
     await store(active)
@@ -1659,7 +1713,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       setDiagnostics([])
       const args = (config ? config.args : runArgs[active.path]) || null
       const env = (config ? config.env : runEnv[active.path]) || null
-      if (remote) await launch('run', 'run', 'ssh_run', { hostId: workspace.remote, root: workspace.root, path: active.path, args }, { path: active.path })
+      if (remote) await launch('run', 'run', 'ssh_run', { hostId: workspace.remote, root: workspace.root, path: active.path, args, env, dotenv: settings.loadDotEnv }, { path: active.path })
       else await launch('run', buildOnly ? 'build' : 'run', 'run_file', { rootPath: workspace.root, path: active.path, buildOnly, args, env, dotenv: settings.loadDotEnv }, { path: active.path })
     } catch (error) { notify(error) }
     finally { setRunningRequest(false) }
@@ -2015,8 +2069,15 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       { id: 'stash-pop', label: 'Git: bring back the latest stash', icon: GitBranch, action: () => { void runStash('pop') } },
       { id: 'stashes', label: 'Git: stashes…', icon: GitBranch, action: () => { void showStashes() } },
       { id: 'pulls', label: 'Git: pull requests', icon: GitBranch, action: () => setFullView('pulls') },
+      { id: 'graph', label: 'Git: commit graph', icon: GitBranch, action: () => setFullView('graph') },
+      ...(active && !active.diff && conflictCount(active.contents) ? [{ id: 'merge', label: 'Git: resolve conflicts in the merge editor', icon: GitBranch, action: () => { setMergeFor(active.id); setFullView('merge') } }] : []),
     ] : []),
     { id: 'run-config', label: 'Run configuration…', icon: Play, action: askArguments },
+    ...(!testsWhy ? [
+      { id: 'tests-all', label: 'Run all tests', icon: FlaskConical, action: () => runTestsFrom('all') },
+      { id: 'tests-file', label: 'Run the tests in this file', icon: FlaskConical, action: () => runTestsFrom('file') },
+      ...(testReport?.results.some(result => result.status === 'failed' || result.status === 'error') ? [{ id: 'tests-failed', label: 'Run failed tests', icon: FlaskConical, action: () => runTestsFrom('failed') }] : []),
+    ] : []),
     { id: 'overview', label: 'Overview of everything', shortcut: mod + '+↑', icon: LayoutGrid, action: openOverview },
     { id: 'focus', label: focusMode ? 'Leave focus mode' : 'Focus mode', shortcut: mod + '+.', icon: Maximize2, action: toggleFocus },
     ...(active ? [{ id: 'split', label: 'Split editor right', shortcut: mod + '+\\', icon: Columns2, action: () => splitRight() }, { id: 'split-down', label: 'Split editor down', icon: Rows2, action: () => splitRight(active, 'bottom') }] : []),
@@ -2104,7 +2165,10 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       options: focusMode ? { ...optionsFor(tab), lineNumbers: false, highlightLine: true } : optionsFor(tab), diagnostics,
       handle: (handle: EditorHandle | null) => paneHandle(pane, handle),
       onFocus: () => focusPane(pane),
-      onViewport: (next: { top: number; height: number; lines: number }) => { if (focusedRef.current === pane) setViewport(next) },
+      onViewport: (next: { top: number; height: number; lines: number; topLine: number }) => {
+        if (focusedRef.current === pane) setViewport(next)
+        setTopLines(previous => previous[pane] === next.topLine ? previous : { ...previous, [pane]: next.topLine })
+      },
       onCursor: (next: Cursor) => { if (focusedRef.current === pane) setCursor(next) },
       onBlur: () => { if (settings.autoSave === 'blur') void store(latest.current.tabs.find(item => item.id === tab.id)).catch(notify) },
       onEdit: (contents: string) => edited(tab, contents),
@@ -2139,11 +2203,12 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     }
   }
   const editorProps = active && !active.binary ? paneProps(active, focused) : null
-  function previewFor(kind: DocKind, tab: Tab, pane: string) {
+  function previewFor(kind: DocKind, tab: Tab, pane: string, split = false) {
     if (kind === 'tex') return <TexPreview text={tab.contents} result={texResults[tab.path] ?? null} compiling={texBusy.includes(tab.path)}
       onJump={line => { focusPane(pane); requestAnimationFrame(() => handles.current[pane]?.jump(line)) }} />
     if (kind === 'svg') return <SvgView text={tab.contents} />
-    return <Preview text={tab.contents} kind={kind} onLink={openLink} />
+    return <Preview text={tab.contents} kind={kind} onLink={openLink} syncLine={split ? topLines[pane] ?? 1 : undefined}
+      onJumpLine={split ? line => { focusPane(pane); requestAnimationFrame(() => handles.current[pane]?.jump(line)) } : undefined} />
   }
   function paneContent(tab: Tab, pane: string) {
     if (tab.binary === 'pdf') return <PdfView data={binaries[tab.path] ?? null} label={fileName(tab.path)} />
@@ -2156,7 +2221,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       why={!desktop ? 'Running cells works in the Still desktop app.' : 'Running cells works for local projects for now.'} onChange={text => edited(tab, text)} />
     return <div className={'doc-split' + (view === 'preview' ? ' preview-only' : '')}>
       {view === 'split' && <div className="doc-pane"><Editor {...props} /></div>}
-      <div className="doc-pane doc-pane-preview">{previewFor(kind, tab, pane)}</div>
+      <div className="doc-pane doc-pane-preview">{previewFor(kind, tab, pane, view === 'split')}</div>
     </div>
   }
   function renderPane(pane: string) {
@@ -2192,7 +2257,8 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const drawerMounted = usePresence(drawerOpen)
   const idleShown = usePresence(idle, 520)
   const marks = active ? edits[active.path] ?? [] : []
-  const tabSlider = useSlider(selected + tabs.length + sidebar + graphOpen + focusMode)
+  // Re-measured when the order changes too (a restored or dragged tab moves the active one).
+  const tabSlider = useSlider(selected + '|' + tabs.map(tab => tab.id).join('|') + sidebar + graphOpen + focusMode)
   const drawerSlider = useSlider(drawer + drawerOpen + sidebar)
   const projectEntries = journalEntries.filter(entry => entry.root === workspace.root).slice(-5).reverse()
   const codeOf = (path: string, text: string) => highlightToHtml(text.split('\n').slice(0, 34).join('\n'), path.split('.').at(-1) ?? '')
@@ -2318,10 +2384,11 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
         {shownSide === 'git' && <SourceControl status={status} busy={Boolean(job) || gitBusy} error={gitError} commit={commit} log={log} onCommitText={setCommit}
           onDiff={(change, index) => { void openDiff(change, index) }} onStage={(change, index) => { void updateStage(change, index) }} onAction={gitAction}
           onStageAll={unstage => { void stageAll(unstage) }} onDiscard={discard} onBranch={event => { void branchMenu(event) }}
-          onInit={() => { void api.gitInit(workspace.root).then(() => refreshGit()).catch(notify) }} onRefresh={() => { void refreshGit(); void refreshLog() }} />}
+          onInit={() => { void api.gitInit(workspace.root).then(() => refreshGit()).catch(notify) }} onRefresh={() => { void refreshGit(); void refreshLog() }} onGraph={() => setFullView('graph')} />}
         {shownSide === 'packages' && <PackagesPanel key={workspace.root} state={packageState} busy={Boolean(job)} onOpen={path => { void openFile(path) }}
           onSearch={api.search} onAction={packageAction} onRefresh={() => { void refreshPackages() }} />}
         {shownSide === 'remote' && <RemotePanel overview={servers} onRefresh={() => { void refreshServers() }} {...remoteActions}
+          hostId={workspace.remote ?? null} onOpenUrl={openLink} notify={notify}
           onMenu={(event, items) => setMenu({ x: event.clientX, y: event.clientY, items })} />}
         </div>
         <SplitGrip vertical value={workspaceWidth} min={180} max={sideMax} change={setSideWidth} onActive={setResizing} />
@@ -2362,6 +2429,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
             <IconButton glyph={Plus} className="tab-add" label="Find and open a file" onClick={() => openPalette('')} />
           </div>
           {active && <div className="tab-tools">
+            {!active.diff && conflictCount(active.contents) > 0 && <button className="text-btn merge-open" onClick={() => { setMergeFor(active.id); setFullView('merge') }} title="Resolve the conflicts side by side: yours, the result, and the incoming version">Merge editor</button>}
             {remote && <span className="crumb-host" title={workspace.hostName + ':' + workspace.root + '/' + active.path}><Icon glyph={Server} size={12} />{workspace.hostName}</span>}
             {currentSymbol && !active.diff && <button className="crumb-symbol" onClick={() => editor.current?.jump(currentSymbol.line)} title="Jump to the start of this symbol">{currentSymbol.name}</button>}
             {active.diff && <span className="crumb-symbol">{active.staged ? 'Staged changes' : 'Working tree'}</span>}
@@ -2466,7 +2534,9 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
           {drawer === 'output' && <Output entries={output} sample={sampleRun}
             onInput={job?.kind === 'run' ? text => { void invoke('job_input', { id: job.id, text }).catch(notify) } : undefined} />}
           {drawer === 'problems' && <Problems items={problems} jump={jumpTo} />}
-          {drawer === 'tests' && <TestsPanel report={testReport} running={testsRunning} canRun={!testsWhy && !job} why={testsWhy} onRun={runTestsFrom} onJump={jumpToTest} coverage={settings.testCoverage} onCoverage={value => update({ testCoverage: value })} />}
+          {drawer === 'tests' && <TestsPanel report={testReport} running={testsRunning} canRun={!testsWhy && !job} why={testsWhy} onRun={runTestsFrom} onJump={jumpToTest} coverage={settings.testCoverage} onCoverage={value => update({ testCoverage: value })}
+            onRunId={id => { void runTests(id, id.includes('#') || id.endsWith('.java') || !/\.py(::|$)/.test(id) && testLanguage === 'java' ? 'java' : 'python') }}
+            watch={testWatch} onWatch={value => { setTestWatch(value); if (value) notify('Watching: the tests run again each time you save.') }} />}
           {drawer === 'debug' && <DebugPanel session={debug} canDebug={!debugWhy && Boolean(active) && !job} why={debugWhy} breakpointCount={Object.values(breakpoints).reduce((sum, lines) => sum + lines.length, 0)}
             watches={watches} onStart={() => { void startDebug() }} onCommand={debugCommand} onFrame={index => debugSend({ op: 'frame', index })}
             onEval={expression => debugSend({ op: 'eval', expression })} onWatches={changeWatches} onJump={(file, line) => jumpTo({ path: file, line })}
@@ -2566,13 +2636,30 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
         </> : <p className="full-empty">Choose a file to preview it here. Open it in the editor when you want to change it.</p>}
       </div>
     </FullView>}
+    {fullView === 'graph' && <FullView title="Commit graph" project={workspace.name} onClose={() => { setFullView(null); requestAnimationFrame(() => editor.current?.focus()) }}>
+      <GitGraph rootPath={workspace.root} notify={notify} editorOptions={editorOptions} onOpenFile={path => { setFullView(null); void openFile(path) }} />
+    </FullView>}
+    {fullView === 'merge' && mergeFor && (() => {
+      const tab = tabs.find(item => item.id === mergeFor)
+      if (!tab) return null
+      return <FullView title={'Merge · ' + fileName(tab.path)} project={workspace.name} onClose={() => { setFullView(null); requestAnimationFrame(() => editor.current?.focus()) }}>
+        <MergeEditor rootPath={workspace.root} path={tab.path} text={tab.contents} editorOptions={editorOptions} onChange={text => edited(tab, text)}
+          onResolved={() => { void (async () => {
+            await store(latest.current.tabs.find(item => item.id === tab.id))
+            await api.stage(workspace.root, { path: tab.path, index: 'U', worktree: 'U' }, false)
+            await refreshGit()
+            notify(fileName(tab.path) + ' is resolved and staged.')
+            setFullView(null)
+          })().catch(notify) }} />
+      </FullView>
+    })()}
     {fullView === 'git' && <FullView title="Git" project={workspace.name} onClose={() => { setFullView(null); requestAnimationFrame(() => editor.current?.focus()) }}>
       <div className="full-side island side">
         <SourceControl status={status} busy={Boolean(job) || gitBusy} error={gitError} commit={commit} log={log} onCommitText={setCommit}
           onDiff={(change, index) => { void api.diff(workspace.root, change, index).then(diff => setGitPreview({ path: change.path, diff, staged: index })).catch(notify) }}
           onStage={(change, index) => { void updateStage(change, index) }} onAction={gitAction}
           onStageAll={unstage => { void stageAll(unstage) }} onDiscard={discard} onBranch={event => { void branchMenu(event) }}
-          onInit={() => { void api.gitInit(workspace.root).then(() => refreshGit()).catch(notify) }} onRefresh={() => { void refreshGit(); void refreshLog() }} />
+          onInit={() => { void api.gitInit(workspace.root).then(() => refreshGit()).catch(notify) }} onRefresh={() => { void refreshGit(); void refreshLog() }} onGraph={() => setFullView('graph')} />
       </div>
       <div className="full-main">
         {gitPreview ? <>

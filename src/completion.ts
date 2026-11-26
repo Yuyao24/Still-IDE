@@ -2,7 +2,8 @@
 // your own names and the most common built-ins first, each with its signature and where
 // it comes from ("builtins", "this file", "keyword"). Replaces CodeMirror's fuzzy lists,
 // which offer `property` and `PermissionError` when you type "pri".
-import { type Completion, type CompletionContext, type CompletionResult, type CompletionSource, snippetCompletion } from '@codemirror/autocomplete'
+import { type Completion, type CompletionContext, type CompletionResult, type CompletionSource, closeCompletion, snippet, snippetCompletion } from '@codemirror/autocomplete'
+import type { EditorView } from '@codemirror/view'
 import { syntaxTree } from '@codemirror/language'
 
 type Entry = [name: string, signature?: string]
@@ -149,6 +150,9 @@ const builtinSnippets: Snippet[] = [
   { language: 'java', prefix: 'psvm', description: 'public static void main', body: 'public static void main(String[] args) {\n\t${}\n}' },
   { language: 'java', prefix: 'main', description: 'public static void main', body: 'public static void main(String[] args) {\n\t${}\n}' },
   { language: 'java', prefix: 'sout', description: 'System.out.println', body: 'System.out.println(${});' },
+  { language: 'java', prefix: 'serr', description: 'System.err.println', body: 'System.err.println(${});' },
+  { language: 'java', prefix: 'souf', description: 'System.out.printf', body: 'System.out.printf("${}%n"${});' },
+  { language: 'java', prefix: 'soutv', description: 'Print a variable with its name', body: 'System.out.println("${1:value} = " + ${1:value});' },
   { language: 'java', prefix: 'fori', description: 'for (int i …)', body: 'for (int ${i} = 0; ${i} < ${n}; ${i}++) {\n\t${}\n}' },
   { language: 'java', prefix: 'foreach', description: 'for (Type item : items)', body: 'for (${String} ${item} : ${items}) {\n\t${}\n}' },
   { language: 'java', prefix: 'if', description: 'if / else', body: 'if (${condition}) {\n\t${}\n} else {\n\t${}\n}' },
@@ -178,6 +182,27 @@ let customSnippets: Snippet[] = []
 export function setCustomSnippets(list: Snippet[]) { customSnippets = Array.isArray(list) ? list.filter(item => item && item.prefix && item.body) : [] }
 export function snippetsFor(languageName: string) {
   return [...customSnippets, ...builtinSnippets].filter(item => item.language === languageName || item.language === 'any' || !item.language)
+}
+
+/** Expands the snippet whose name is right before the caret (`sout`, `ifmain`…). False when there's none. */
+export function expandSnippetBefore(view: EditorView, languageName: string): boolean {
+  const { state } = view
+  const range = state.selection.main
+  if (!range.empty || state.selection.ranges.length > 1) return false
+  const line = state.doc.lineAt(range.head)
+  const before = state.sliceDoc(line.from, range.head)
+  const word = /[A-Za-z_][\w]*$/.exec(before)
+  if (!word) return false
+  const from = range.head - word[0].length
+  const previous = state.sliceDoc(from - 1, from)
+  // Not a member (obj.log), and not inside strings or comments.
+  if (previous === '.' || /String|Comment|Docstring/.test(syntaxTree(state).resolveInner(range.head, -1).name)) return false
+  const found = snippetsFor(languageName).find(item => item.prefix === word[0])
+  if (!found) return false
+  const body = found.body.startsWith('\\') && previous === '\\' ? found.body.slice(1) : found.body
+  closeCompletion(view)
+  snippet(body)(view, null, from, range.head)
+  return true
 }
 
 export function smartCompletions(languageName: string): CompletionSource {

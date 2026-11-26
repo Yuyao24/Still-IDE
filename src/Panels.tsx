@@ -126,6 +126,8 @@ interface GitProps {
   onBranch: (event: MouseEvent) => void
   onInit: () => void
   onRefresh: () => void
+  /** Opens the commit graph (all branches). */
+  onGraph?: () => void
 }
 
 const statusLabel: Record<string, string> = { M: 'Modified', A: 'Added', D: 'Deleted', R: 'Renamed', C: 'Copied', U: 'Conflict', '?': 'Untracked' }
@@ -179,9 +181,12 @@ export function SourceControl(props: GitProps) {
         {group('Staged changes', indexed, true)}
         {group('Changes', changed, false)}
         <section className="panel-group">
-          <button className="outline-head px-0" onClick={() => setHistory(value => !value)} aria-expanded={history}>
-            <Icon glyph={history ? ChevronDown : ChevronRight} size={12} /><Icon glyph={History} size={13} /><span className="section-label">History</span>
-          </button>
+          <div className="history-head">
+            <button className="outline-head px-0" onClick={() => setHistory(value => !value)} aria-expanded={history}>
+              <Icon glyph={history ? ChevronDown : ChevronRight} size={12} /><Icon glyph={History} size={13} /><span className="section-label">History</span>
+            </button>
+            {props.onGraph && <button className="quiet-link history-graph" onClick={props.onGraph} title="Every branch's commits, with the lines between them">Graph</button>}
+          </div>
           {history && (props.log.length ? props.log.map(commit => <div key={commit.hash} className="commit-row" title={commit.subject + '\n' + commit.author + ' · ' + commit.when}>
             <span className="truncate">{commit.subject}</span>
             <span className="help">{commit.hash} · {commit.author} · {commit.when}</span>

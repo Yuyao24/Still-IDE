@@ -3,7 +3,7 @@ import { invoke, isTauri } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { CircleAlert, X } from 'lucide-react'
-import { type SshHost, type Workspace, home, nameHost, setPasswordPrompt, ssh } from './bridge'
+import { type SshHost, type Workspace, home, launcher, nameHost, setPasswordPrompt, ssh } from './bridge'
 import Home, { type OpenOptions } from './Home'
 import Ide from './Ide'
 import SettingsView, { type SettingsSection } from './SettingsView'
@@ -71,6 +71,16 @@ export default function App() {
   useEffect(() => {
     void loadSettings().then(async loaded => {
       setSettings(loaded); saveSettings(loaded)
+      // Started with a folder or file (still ., Open with Still): open that.
+      const target = await launcher.target()
+      if (target) {
+        try {
+          const folder = target.directory ? target.path : target.path.split('/').slice(0, -1).join('/') || '/'
+          const workspace = await home.open(folder)
+          setView({ kind: 'workspace', workspace, options: target.directory ? undefined : { file: target.path.split('/').at(-1) } })
+          return
+        } catch { /* fall through to the usual start */ }
+      }
       // Optionally pick up where you left off: the most recently opened local project.
       if (!loaded.openLastProject || !isTauri()) return
       try {

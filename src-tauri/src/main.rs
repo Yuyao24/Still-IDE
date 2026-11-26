@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod backup;
 mod ai;
 mod check;
 mod debug;
@@ -41,6 +42,8 @@ fn main() {
         .manage(lsp::Servers::default())
         .manage(notebook::Kernels::default())
         .manage(ssh::Workers::default())
+        .manage(ssh::Forwards::default())
+        .manage(backup::LaunchTarget(std::sync::Mutex::new(backup::target_from_args())))
         .setup(|app| {
             let store = config::Store::load(app.handle());
             app.manage(store);
@@ -149,6 +152,19 @@ fn main() {
             ssh::ssh_search,
             ssh::ssh_run,
             ssh::ssh_debug_start,
+            backup::backup_write,
+            backup::backup_read,
+            backup::launch_target,
+            backup::write_text_file,
+            backup::read_text_file,
+            backup::install_cli,
+            backup::explorer_menu,
+            git::git_graph,
+            git::git_commit_detail,
+            ssh::ssh_forward_start,
+            ssh::ssh_forward_stop,
+            ssh::ssh_forward_list,
+            ssh::ssh_listening_ports,
             ssh::ssh_read_binary,
             ssh::ssh_lsp_start,
             ssh::ssh_tests_run,
@@ -165,6 +181,7 @@ fn main() {
                 let _ = app.state::<process::Jobs>().stop(None);
                 app.state::<lsp::Servers>().stop_all();
                 app.state::<notebook::Kernels>().stop_all();
+                app.state::<ssh::Forwards>().stop_all();
             }
         });
 }

@@ -1,5 +1,5 @@
-import { useState } from 'react'
-import { Check, CircleDashed, FlaskConical, Play, X } from 'lucide-react'
+import { useMemo, useState, type ReactNode } from 'react'
+import { Check, ChevronDown, ChevronRight, CircleDashed, FlaskConical, Play, X } from 'lucide-react'
 import { Icon } from './ui'
 
 export interface TestResult { name: string; group: string; file: string | null; line: number | null; status: 'passed' | 'failed' | 'error' | 'skipped'; message: string; seconds: number }
@@ -52,20 +52,87 @@ export function resultFor(report: TestReport | null, path: string, test: FoundTe
   return 'passed'
 }
 
-export function TestsPanel({ report, running, onRun, onJump, canRun, why, coverage, onCoverage }: {
+interface TestNode { key: string; label: string; id: string | null; results: TestResult[]; children: TestNode[] }
+
+/** The class part of a result's group: TestShop in tests.test_shop.TestShop, CartTest in shop.CartTest. */
+function classOf(result: TestResult) {
+  const parts = result.group.split('.')
+  const last = parts.at(-1) ?? ''
+  return /^Test|Test$|Tests$/.test(last) && !/^test_/.test(last) ? last : null
+}
+/** What to pass to the runner to run just this node (pytest node id, or Class#method for JUnit). */
+function idFor(result: TestResult, level: 'file' | 'class' | 'test') {
+  if (result.file?.endsWith('.py') || (!result.file && !result.group.includes('#') && /\.py$|^test_/.test(result.group))) {
+    const file = result.file ?? result.group.replace(/\./g, '/') + '.py'
+    const klass = classOf(result)
+    if (level === 'file') return file
+    if (level === 'class') return klass ? file + '::' + klass : file
+    return file + '::' + (klass ? klass + '::' : '') + result.name.replace(/\[.*$/, '')
+  }
+  if (level === 'test') return result.group + '#' + result.name.replace(/\(.*$/, '')
+  return result.group
+}
+function tree(results: TestResult[]): TestNode[] {
+  const files = new Map<string, TestNode>()
+  for (const result of results) {
+    const fileKey = result.file ?? result.group.split('.').filter(part => !/^Test|Test$|Tests$/.test(part)).join('.') ?? result.group
+    let file = files.get(fileKey)
+    if (!file) { file = { key: fileKey, label: fileKey || result.group, id: idFor(result, 'file'), results: [], children: [] }; files.set(fileKey, file) }
+    file.results.push(result)
+    const klass = classOf(result)
+    let parent = file
+    if (klass) {
+      let node = file.children.find(child => child.key === fileKey + '::' + klass)
+      if (!node) { node = { key: fileKey + '::' + klass, label: klass, id: idFor(result, 'class'), results: [], children: [] }; file.children.push(node) }
+      node.results.push(result)
+      parent = node
+    }
+    parent.children.push({ key: parent.key + '::' + result.name + '::' + parent.children.length, label: result.name, id: idFor(result, 'test'), results: [result], children: [] })
+  }
+  return [...files.values()]
+}
+const failedResult = (result: TestResult) => result.status === 'failed' || result.status === 'error'
+function statusOf(node: TestNode): TestResult['status'] {
+  if (node.results.some(failedResult)) return 'failed'
+  if (node.results.every(result => result.status === 'skipped')) return 'skipped'
+  return 'passed'
+}
+
+export function TestsPanel({ report, running, onRun, onRunId, onJump, canRun, why, coverage, onCoverage, watch, onWatch }: {
   report: TestReport | null; running: boolean; canRun: boolean; why?: string
-  onRun: (target: 'all' | 'failed' | 'file') => void; onJump: (result: TestResult) => void
+  onRun: (target: 'all' | 'failed' | 'file') => void; onRunId: (id: string) => void; onJump: (result: TestResult) => void
   coverage: boolean; onCoverage: (value: boolean) => void
+  watch: boolean; onWatch: (value: boolean) => void
 }) {
   const [onlyFailed, setOnlyFailed] = useState(false)
+  const [closed, setClosed] = useState<Set<string>>(new Set())
   const results = report?.results ?? []
-  const failed = results.filter(result => result.status === 'failed' || result.status === 'error')
+  const failed = results.filter(failedResult)
   const passed = results.filter(result => result.status === 'passed').length
   const skipped = results.filter(result => result.status === 'skipped').length
   const seconds = results.reduce((sum, result) => sum + result.seconds, 0)
-  const shown = onlyFailed ? failed : results
-  const groups = new Map<string, TestResult[]>()
-  for (const result of shown) groups.set(result.file ?? result.group, [...(groups.get(result.file ?? result.group) ?? []), result])
+  const nodes = useMemo(() => tree(onlyFailed ? failed : results), [report, onlyFailed])
+  const toggle = (key: string) => setClosed(previous => { const next = new Set(previous); if (next.has(key)) next.delete(key); else next.add(key); return next })
+  const row = (node: TestNode, depth: number): ReactNode => {
+    const status = statusOf(node)
+    const leaf = !node.children.length
+    const result = leaf ? node.results[0] : null
+    const open = !closed.has(node.key)
+    const glyph = status === 'passed' ? Check : status === 'skipped' ? CircleDashed : X
+    const count = leaf ? '' : `${node.results.filter(item => item.status === 'passed').length}/${node.results.length}`
+    return <div key={node.key} className={'test-node is-' + status + (leaf ? ' is-leaf' : '')}>
+      <div className="test-row" style={{ paddingLeft: 8 + depth * 14 }}>
+        {leaf ? <span className="test-twisty" /> : <button className="test-twisty" onClick={() => toggle(node.key)} aria-label={open ? 'Collapse' : 'Expand'} aria-expanded={open}><Icon glyph={open ? ChevronDown : ChevronRight} size={12} /></button>}
+        <button className="test-label" onClick={() => result ? onJump(result) : toggle(node.key)} title={result ? (result.file ? result.file + (result.line ? ':' + result.line : '') : result.group) : node.label}>
+          <Icon glyph={glyph} size={12} /><span className={leaf ? '' : 'test-group'}>{node.label}</span>
+          <span className="dbg-type">{result ? (result.seconds ? result.seconds.toFixed(2) + ' s' : '') : count}</span>
+        </button>
+        {node.id && <button className="test-run" disabled={!canRun || running} onClick={() => onRunId(node.id!)} title={'Run ' + node.label} aria-label={'Run ' + node.label}><Icon glyph={Play} size={11} /></button>}
+      </div>
+      {result?.message && result.status !== 'passed' && <pre style={{ marginLeft: 30 + depth * 14 }}>{result.message}</pre>}
+      {!leaf && open && node.children.map(child => row(child, depth + 1))}
+    </div>
+  }
   return <div className="tests">
     <div className="dbg-bar tests-bar">
       <button className="text-btn primary" disabled={!canRun || running} onClick={() => onRun('all')}><Icon glyph={Play} size={12} />Run all tests</button>
@@ -75,19 +142,11 @@ export function TestsPanel({ report, running, onRun, onJump, canRun, why, covera
         {running ? 'Running tests…' : !report ? (canRun ? 'Run the tests to see results here. ▶ beside a test runs just that one.' : why) : `${passed} passed · ${failed.length} failed${skipped ? ' · ' + skipped + ' skipped' : ''} · ${seconds.toFixed(2)} s · ${report.tool}`}
       </span>
       {report && failed.length > 0 && <label className="tests-filter"><input type="checkbox" checked={onlyFailed} onChange={event => setOnlyFailed(event.target.checked)} /> Only failures</label>}
-      <label className={'tests-filter' + (report && failed.length > 0 ? ' is-next' : '')} title="Measure which lines the tests run (needs pytest-cov) and mark them in the editor"><input type="checkbox" checked={coverage} onChange={event => onCoverage(event.target.checked)} /> Coverage{report?.coverage ? ' · ' + coveragePercent(report.coverage) + '%' : ''}</label>
+      <label className={'tests-filter' + (report && failed.length > 0 ? ' is-next' : '')} title="Run the tests again each time you save a file"><input type="checkbox" checked={watch} disabled={!canRun && !watch} onChange={event => onWatch(event.target.checked)} /> Watch</label>
+      <label className="tests-filter is-next" title="Measure which lines the tests run (needs pytest-cov) and mark them in the editor"><input type="checkbox" checked={coverage} onChange={event => onCoverage(event.target.checked)} /> Coverage{report?.coverage ? ' · ' + coveragePercent(report.coverage) + '%' : ''}</label>
     </div>
     <div className="tests-list">
-      {[...groups].map(([group, items]) => <section key={group}>
-        <h3>{group}</h3>
-        {items.map((result, index) => <div key={index} className={'test-row is-' + result.status}>
-          <button onClick={() => onJump(result)} title={result.file ? result.file + (result.line ? ':' + result.line : '') : result.group}>
-            <Icon glyph={result.status === 'passed' ? Check : result.status === 'skipped' ? CircleDashed : X} size={12} />
-            <span>{result.name}</span><span className="dbg-type">{result.seconds ? result.seconds.toFixed(2) + ' s' : ''}</span>
-          </button>
-          {result.message && result.status !== 'passed' && <pre>{result.message}</pre>}
-        </div>)}
-      </section>)}
+      {nodes.map(node => row(node, 0))}
       {report && !results.length && <p className="dbg-empty tests-empty"><Icon glyph={FlaskConical} size={13} /> No tests were found. Python test files are named test_*.py; Java tests need Maven or Gradle.</p>}
     </div>
   </div>
