@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useState } from 'react'
 import { invoke, isTauri } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import { CircleAlert, X } from 'lucide-react'
 import { type SshHost, type Workspace, home, nameHost, setPasswordPrompt, ssh } from './bridge'
 import Home, { type OpenOptions } from './Home'
@@ -52,6 +53,21 @@ export default function App() {
   const theme = useMemo(() => activeTheme(settings, systemDark), [settings, systemDark])
 
   useLayoutEffect(() => { applySettings(settings, systemDark) }, [settings, systemDark])
+  // The window opens hidden; show it after the first frame in the theme's colours, and keep the
+  // native background matching so resizing never flashes white.
+  useEffect(() => {
+    if (!isTauri()) return
+    const window = getCurrentWindow()
+    const color = getComputedStyle(document.documentElement).getPropertyValue('--editor').trim()
+    const match = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(color)
+    if (match) void window.setBackgroundColor([parseInt(match[1], 16), parseInt(match[2], 16), parseInt(match[3], 16), 255]).catch(() => {})
+  }, [theme])
+  useEffect(() => {
+    if (!isTauri()) return
+    // Not requestAnimationFrame: a hidden page gets no frames, so it would never fire.
+    const timer = setTimeout(() => { void getCurrentWindow().show().catch(() => {}) }, 30)
+    return () => clearTimeout(timer)
+  }, [])
   useEffect(() => {
     void loadSettings().then(async loaded => {
       setSettings(loaded); saveSettings(loaded)
@@ -129,6 +145,7 @@ export default function App() {
   const openSettings = (section?: SettingsSection) => setSettingsSection(section ?? settingsSection ?? 'appearance')
 
   return <SettingsContext.Provider value={context}>
+    {(settings.backgroundImage || settings.translucency > 0 || settings.surfaceStyle !== 'paper') && <div className="backdrop" aria-hidden="true" />}
     {view.kind === 'home'
       ? <Home onOpen={(workspace, options) => setView({ kind: 'workspace', workspace, options })} onOpenRemote={openRemote}
           onSettings={section => openSettings(section as SettingsSection | undefined)} onToggleTheme={toggleTheme} notify={notify} />

@@ -26,27 +26,48 @@ export function describeBlame(line: BlameLine) {
   return uncommitted(line) ? 'Not committed yet' : `${line.author}, ${ago(line.time)} · ${line.summary}`
 }
 
-class BlameWidget extends WidgetType {
-  constructor(readonly text: string, readonly title: string) { super() }
-  eq(other: BlameWidget) { return other.text === this.text }
-  toDOM() { const node = document.createElement('span'); node.className = 'cm-blame'; node.textContent = this.text; node.title = this.title; return node }
-  ignoreEvent() { return true }
-}
-
+// The note for the caret's line is drawn after the text with CSS (not a widget in the line), so it
+// never moves the caret or catches a click. It appears once the caret rests on a line with text,
+// and stays away from the line being typed in until the caret moves to another line.
+const showBlame = StateEffect.define<number | null>()
 const currentLineBlame = ViewPlugin.fromClass(class {
   decorations: DecorationSet = Decoration.none
-  constructor(view: EditorView) { this.decorations = this.build(view.state) }
+  shown: number | null = null
+  edited: number | null = null
+  timer: ReturnType<typeof setTimeout> | undefined
+  constructor(readonly view: EditorView) { this.schedule() }
   update(update: ViewUpdate) {
-    if (update.selectionSet || update.docChanged || update.startState.field(blameField, false) !== update.state.field(blameField, false)) this.decorations = this.build(update.state)
+    let changed = false
+    for (const transaction of update.transactions) for (const effect of transaction.effects) if (effect.is(showBlame)) { this.shown = effect.value; changed = true }
+    if (update.docChanged) { this.edited = update.state.doc.lineAt(update.state.selection.main.head).number; this.shown = null; changed = true }
+    if (update.selectionSet && !changed) {
+      const line = update.state.doc.lineAt(update.state.selection.main.head).number
+      if (line !== this.shown) { this.shown = null; changed = true }
+      if (line !== this.edited) this.edited = null
+    }
+    if (update.selectionSet || update.docChanged) this.schedule()
+    if (changed || update.startState.field(blameField, false) !== update.state.field(blameField, false)) this.decorations = this.build(update.state)
+  }
+  schedule() {
+    clearTimeout(this.timer)
+    this.timer = setTimeout(() => {
+      const state = this.view.state
+      const blame = state.field(blameField, false)
+      if (!blame || blame.mode !== 'line' || !state.selection.main.empty) return
+      const line = state.doc.lineAt(state.selection.main.head)
+      if (line.number === this.edited || !line.text.trim() || !blame.byLine.has(line.number) || this.shown === line.number) return
+      this.view.dispatch({ effects: showBlame.of(line.number) })
+    }, 650)
   }
   build(state: EditorState) {
     const blame = state.field(blameField, false)
-    if (!blame || blame.mode !== 'line' || !state.selection.main.empty) return Decoration.none
-    const line = state.doc.lineAt(state.selection.main.head)
-    const info = blame.byLine.get(line.number)
+    if (!blame || blame.mode !== 'line' || this.shown === null || this.shown > state.doc.lines) return Decoration.none
+    const info = blame.byLine.get(this.shown)
     if (!info) return Decoration.none
-    return Decoration.set([Decoration.widget({ widget: new BlameWidget(describeBlame(info), info.hash.slice(0, 8)), side: 1 }).range(line.to)])
+    const line = state.doc.line(this.shown)
+    return Decoration.set([Decoration.line({ class: 'cm-blame-line', attributes: { 'data-blame': describeBlame(info), title: info.hash.slice(0, 8) } }).range(line.from)])
   }
+  destroy() { clearTimeout(this.timer) }
 }, { decorations: plugin => plugin.decorations })
 
 class BlameMarker extends GutterMarker {

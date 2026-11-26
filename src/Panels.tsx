@@ -300,18 +300,28 @@ function score(term: string, candidate: string) {
   return 100 + offset
 }
 
-export function Palette({ commands, files, start, onClose }: { commands: PaletteItem[]; files: PaletteItem[]; start: string; onClose: () => void }) {
+export function Palette({ commands, files, start, onClose, symbols }: { commands: PaletteItem[]; files: PaletteItem[]; start: string; onClose: () => void; symbols?: (query: string) => Promise<PaletteItem[]> }) {
   const [query, setQuery] = useState(start)
   const [index, setIndex] = useState(0)
   const active = useRef<HTMLButtonElement>(null)
   const search = query.trim().toLowerCase()
   const onlyCommands = search.startsWith('>')
-  const term = onlyCommands ? search.slice(1).trim() : search
+  const onlySymbols = search.startsWith('#')
+  const term = onlyCommands || onlySymbols ? search.slice(1).trim() : search
+  // Symbols (# or Ctrl+T) come from the language server or a search of the project, as you type.
+  const [found, setFound] = useState<{ query: string; items: PaletteItem[] } | null>(null)
+  useEffect(() => {
+    if (!onlySymbols || !symbols) return
+    let current = true
+    const timer = setTimeout(() => { void symbols(term).then(items => { if (current) setFound({ query: term, items }) }).catch(() => { if (current) setFound({ query: term, items: [] }) }) }, 140)
+    return () => { current = false; clearTimeout(timer) }
+  }, [onlySymbols, term])
   const filtered = (items: PaletteItem[]) => items.map(item => ({ item, score: Math.min(score(term, item.label), item.detail ? score(term, item.detail) + 15 : Infinity) }))
     .filter(item => item.score < Infinity).sort((a, b) => a.score - b.score).slice(0, 70).map(({ item }) => item)
-  const commandMatches = filtered(commands)
-  const fileMatches = onlyCommands ? [] : filtered(files)
-  const items = onlyCommands ? commandMatches : fileMatches.concat(commandMatches)
+  const symbolMatches = onlySymbols ? found?.items ?? [] : []
+  const commandMatches = onlySymbols ? [] : filtered(commands)
+  const fileMatches = onlyCommands || onlySymbols ? [] : filtered(files)
+  const items = onlySymbols ? symbolMatches : onlyCommands ? commandMatches : fileMatches.concat(commandMatches)
   useEffect(() => { active.current?.scrollIntoView({ block: 'nearest' }) }, [index])
   function choose(item: PaletteItem) {
     onClose()
@@ -350,11 +360,12 @@ export function Palette({ commands, files, start, onClose }: { commands: Palette
         <button onClick={onClose} title="Close palette" tabIndex={-1}><kbd>Esc</kbd></button>
       </div>
       <div id="palette-results" className="palette-results" role="listbox">
+        {rows(symbolMatches, 'Symbols', 0)}
         {rows(fileMatches, 'Files', 0)}
         {rows(commandMatches, 'Commands', fileMatches.length)}
-        {!items.length && <p className="help p-3">No matching files or commands.</p>}
+        {!items.length && <p className="help p-3">{onlySymbols ? (!term ? 'Type the name of a function, class or variable.' : found?.query === term ? 'No symbols match.' : 'Searching…') : 'No matching files or commands.'}</p>}
       </div>
-      <div className="palette-footer"><span><kbd>↑</kbd> <kbd>↓</kbd> Navigate <kbd className="ml-2">↵</kbd> Open</span><span><kbd>&gt;</kbd> Commands</span></div>
+      <div className="palette-footer"><span><kbd>↑</kbd> <kbd>↓</kbd> Navigate <kbd className="ml-2">↵</kbd> Open</span><span><kbd>&gt;</kbd> Commands <kbd className="ml-2">#</kbd> Symbols</span></div>
     </section>
   </div>
 }

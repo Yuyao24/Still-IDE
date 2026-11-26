@@ -27,6 +27,7 @@ import { sql } from '@codemirror/lang-sql'
 import { toml } from '@codemirror/legacy-modes/mode/toml'
 import { shell } from '@codemirror/legacy-modes/mode/shell'
 import { powerShell } from '@codemirror/legacy-modes/mode/powershell'
+import { stex } from '@codemirror/legacy-modes/mode/stex'
 import { ruby } from '@codemirror/legacy-modes/mode/ruby'
 import { kotlin, csharp } from '@codemirror/legacy-modes/mode/clike'
 import { groovy } from '@codemirror/legacy-modes/mode/groovy'
@@ -35,7 +36,9 @@ import { properties } from '@codemirror/legacy-modes/mode/properties'
 import { useEffect, useLayoutEffect, useRef } from 'react'
 import { scopedOccurrences } from './occurrences'
 import { smartCompletions, sourceColumn } from './completion'
-import { lspLanguage, serverCommands, serverDiagnostics, serverExtension, withServer, type Server } from './lsp'
+import { smartTyping } from './smart'
+import { stickyScroll } from './sticky'
+import { lspLanguage, quickFixes, serverCommands, serverDiagnostics, serverExtension, withServer, type QuickFix, type Server } from './lsp'
 import { inlineSuggestions, type Suggest } from './ghost'
 import { blameGutter, gitLines, setBlame } from './gitlines'
 import type { BlameLine } from './bridge'
@@ -95,7 +98,8 @@ const look = EditorView.theme({
   '.cm-test-marker.is-failed': { color: 'var(--red)', fontWeight: '700' },
   '.cm-test-marker.is-skipped': { color: 'var(--muted)' },
   '.cm-test-marker:hover': { color: 'var(--ink)' },
-  '.cm-blame': { marginLeft: '3em', color: 'var(--muted)', opacity: '.75', fontFamily: 'var(--font-sans)', fontSize: '11.5px', fontStyle: 'normal', whiteSpace: 'pre', pointerEvents: 'none' },
+  '.cm-line.cm-blame-line::after': { content: 'attr(data-blame)', marginLeft: '3em', color: 'var(--muted)', opacity: '.7', fontFamily: 'var(--font-sans)', fontSize: '11.5px', fontStyle: 'normal', whiteSpace: 'pre', pointerEvents: 'none', animation: 'cm-blame-in 160ms ease' },
+  '@keyframes cm-blame-in': { from: { opacity: '0' }, to: { opacity: '.7' } },
   '.cm-blame-gutter .cm-gutterElement': { padding: '0 12px 0 10px', color: 'var(--muted)', fontFamily: 'var(--font-sans)', fontSize: '11px', whiteSpace: 'pre', opacity: '.8' },
   '.cm-blame-gutter .is-fresh': { color: 'var(--ink)' },
   '.cm-conflict-bar': { display: 'flex', gap: '14px', padding: '3px 14px 3px 14px', fontFamily: 'var(--font-sans)', fontSize: '11.5px' },
@@ -109,6 +113,12 @@ const look = EditorView.theme({
   '.cm-breakpoints .cm-gutterElement': { display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '0' },
   '.cm-breakpoints .cm-gutterElement:hover::after': { content: '""', width: '8px', height: '8px', borderRadius: '50%', background: 'color-mix(in srgb, var(--red) 35%, transparent)' },
   '.cm-breakpoint': { width: '8px', height: '8px', borderRadius: '50%', background: 'var(--red)' },
+  '.cm-breakpoint.is-condition': { background: 'transparent', boxShadow: 'inset 0 0 0 2px var(--red)' },
+  '.cm-breakpoint.is-log': { borderRadius: '0', transform: 'rotate(45deg) scale(.85)', background: 'var(--amber)' },
+  '.cm-coverage .cm-gutterElement': { padding: '0' },
+  '.cm-covered, .cm-missed': { width: '3px', height: '100%', minHeight: '1em' },
+  '.cm-covered': { background: 'color-mix(in srgb, var(--green) 55%, transparent)' },
+  '.cm-missed': { background: 'color-mix(in srgb, var(--red) 60%, transparent)' },
   '.cm-breakpoints .cm-gutterElement:has(.cm-breakpoint):hover::after': { content: 'none' },
   '.cm-debug-line': { background: 'color-mix(in srgb, var(--amber) 18%, transparent) !important', boxShadow: 'inset 2px 0 0 var(--amber)' },
   '.cm-ghost': { color: 'var(--muted)', opacity: '.75', whiteSpace: 'pre', pointerEvents: 'none' },
@@ -127,12 +137,17 @@ const look = EditorView.theme({
   '.cm-lint-marker-error': { content: 'none', background: 'var(--red)' },
   '.cm-lint-marker-warning': { content: 'none', background: 'var(--amber)' },
   '.cm-gutter-changes': { width: '3px', marginLeft: '4px' },
-  '.cm-gutter-changes .cm-gutterElement': { padding: '0' },
+  '.cm-gutter-changes .cm-gutterElement': { padding: '0', cursor: 'pointer' },
   '.cm-change': { width: '3px', height: '100%' },
   '.cm-change-add': { background: 'var(--green)' },
   '.cm-change-mod': { background: 'var(--amber)' },
   '.cm-change-del': { width: '0', height: '0', borderTop: '4px solid transparent', borderBottom: '4px solid transparent', borderLeft: '5px solid var(--red)', marginTop: '-4px' },
-  '.cm-indent-guide': { boxShadow: 'inset 1px 0 0 var(--indent-guide)' },
+  '.cm-line.cm-guided': { backgroundRepeat: 'no-repeat' },
+  '.cm-sticky': { position: 'absolute', top: '0', left: '0', right: '0', zIndex: '6', background: 'var(--editor-solid, var(--editor))', boxShadow: '0 1px 0 var(--line), 0 6px 12px -10px var(--shadow)', fontFamily: 'var(--font-mono)', lineHeight: 'var(--editor-line-height)' },
+  '.cm-sticky-line': { display: 'flex', alignItems: 'center', cursor: 'pointer', whiteSpace: 'pre', overflow: 'hidden' },
+  '.cm-sticky-line:hover': { background: 'var(--hover)' },
+  '.cm-sticky-number': { flex: 'none', boxSizing: 'border-box', width: 'var(--sticky-left)', paddingRight: '26px', textAlign: 'right', color: 'var(--muted)', fontSize: '0.86em' },
+  '.cm-sticky-code': { paddingLeft: '14px', overflow: 'hidden', textOverflow: 'ellipsis' },
   '.cm-highlightSpace': { backgroundImage: 'radial-gradient(circle at 50% 55%, var(--muted) 12%, transparent 13%)', opacity: '.5' },
   '.cm-highlightTab': { opacity: '.5' },
   '.cm-trailingSpace': { backgroundColor: 'color-mix(in srgb, var(--red) 18%, transparent)' },
@@ -225,6 +240,7 @@ const modes: { name: string; extensions: string[]; files?: string[]; indent?: nu
   { name: 'Shell', extensions: ['sh', 'bash', 'zsh', 'fish'], files: ['.bashrc', '.zshrc', '.profile', 'gradlew', 'mvnw'], load: () => StreamLanguage.define(shell) },
   { name: 'PowerShell', extensions: ['ps1', 'psm1'], indent: 4, load: () => StreamLanguage.define(powerShell) },
   { name: 'Ruby', extensions: ['rb'], load: () => StreamLanguage.define(ruby) },
+  { name: 'LaTeX', extensions: ['tex', 'latex', 'ltx', 'sty', 'cls', 'bib'], indent: 2, load: () => StreamLanguage.define(stex) },
   { name: 'Kotlin', extensions: ['kt', 'kts'], indent: 4, load: () => StreamLanguage.define(kotlin) },
   { name: 'C#', extensions: ['cs'], indent: 4, load: () => StreamLanguage.define(csharp) },
   { name: 'Groovy', extensions: ['gradle', 'groovy'], indent: 4, load: () => StreamLanguage.define(groovy) },
@@ -245,6 +261,12 @@ export interface EditorOptions {
   wrap: boolean; lineNumbers: boolean; highlightLine: boolean; tabSize: number; layout: 'inline' | 'split'; autocomplete: boolean
   occurrences?: boolean; whitespace?: 'none' | 'trailing' | 'all'; indentGuides?: boolean; closeBrackets?: boolean; scrollPastEnd?: boolean
   errors?: boolean; changes?: boolean; cursorBlink?: boolean; folding?: boolean; blameColumn?: boolean
+  /** Fill in the constructor when a new class is started. */
+  constructors?: boolean
+  /** Keep the enclosing function or class header at the top while scrolling inside it. */
+  sticky?: boolean
+  /** Show the language server's inlay hints. */
+  inlayHints?: boolean
 }
 
 // Suggestions are accepted with Tab, never Enter, so Enter always makes a new line.
@@ -261,7 +283,7 @@ const completionKeys = Prec.highest(keymap.of([
 /** Ranked word suggestions for code; markup and data languages keep CodeMirror's own (tags, properties). */
 function completionFor(path: string, whileTyping: boolean) {
   const name = mode(path)?.name ?? 'Plain Text'
-  const smart = ({ Python: 'python', Java: 'java', JavaScript: 'javascript', 'JavaScript JSX': 'javascript', TypeScript: 'javascript', 'TypeScript JSX': 'javascript' } as Record<string, string>)[name]
+  const smart = ({ Python: 'python', Java: 'java', JavaScript: 'javascript', 'JavaScript JSX': 'javascript', TypeScript: 'javascript', 'TypeScript JSX': 'javascript', LaTeX: 'latex' } as Record<string, string>)[name]
   const own = smart !== undefined || ['Plain Text', 'Markdown', 'Rust', 'Go', 'C++', 'Kotlin', 'C#', 'Ruby', 'Shell', 'Groovy', 'PowerShell'].includes(name)
   return autocompletion({
     activateOnTyping: whileTyping, defaultKeymap: false, icons: true, maxRenderedOptions: 40,
@@ -274,7 +296,7 @@ const configuration = new Compartment()
 const serverSlot = new Compartment()
 function serverFor(props: Props): Extension {
   const language = lspLanguage(props.path)
-  return props.server && props.serverUri && language && !props.diff && !props.readOnly ? serverExtension(props.server, props.serverUri, language.id) : []
+  return props.server && props.serverUri && language && !props.diff && !props.readOnly ? serverExtension(props.server, props.serverUri, language.id, props.options.inlayHints !== false) : []
 }
 function configure(options: EditorOptions, path: string): Extension {
   return [
@@ -283,6 +305,8 @@ function configure(options: EditorOptions, path: string): Extension {
     options.highlightLine ? highlightActiveLine() : [],
     // Off: suggestions only appear with Ctrl+Space. On: they appear while typing.
     completionFor(path, options.autocomplete),
+    smartTyping(mode(path)?.name ?? '', options.constructors !== false),
+    stickyScroll(line => highlightToHtml(line, path.split('.').at(-1) ?? ''), options.sticky !== false),
     EditorState.tabSize.of(options.tabSize),
     indentUnit.of(' '.repeat(options.tabSize)),
     // Other uses of the word under the caret (or of the selected text) are marked.
@@ -302,24 +326,78 @@ function configure(options: EditorOptions, path: string): Extension {
   ]
 }
 
-/** Thin vertical lines at each indentation level, like other editors. */
+/** Scrollbars show while scrolling or when the pointer is near them, then fade away. */
+const fadingScrollbars = ViewPlugin.fromClass(class {
+  timer: ReturnType<typeof setTimeout> | undefined
+  near = false
+  constructor(readonly view: EditorView) {
+    view.scrollDOM.addEventListener('scroll', this.scrolled, { passive: true })
+    view.scrollDOM.addEventListener('pointermove', this.moved, { passive: true })
+    view.scrollDOM.addEventListener('pointerleave', this.left)
+  }
+  scrolled = () => {
+    this.view.scrollDOM.classList.add('is-scrolling')
+    clearTimeout(this.timer)
+    this.timer = setTimeout(() => this.view.scrollDOM.classList.remove('is-scrolling'), 900)
+  }
+  moved = (event: PointerEvent) => {
+    const box = this.view.scrollDOM.getBoundingClientRect()
+    const near = box.right - event.clientX < 16 || box.bottom - event.clientY < 16
+    if (near !== this.near) { this.near = near; this.view.scrollDOM.classList.toggle('is-near-bar', near) }
+  }
+  left = () => { if (this.near) { this.near = false; this.view.scrollDOM.classList.remove('is-near-bar') } }
+  destroy() {
+    clearTimeout(this.timer)
+    this.view.scrollDOM.removeEventListener('scroll', this.scrolled)
+    this.view.scrollDOM.removeEventListener('pointermove', this.moved)
+    this.view.scrollDOM.removeEventListener('pointerleave', this.left)
+  }
+})
+
+/** Vertical lines at each indentation level. Drawn as part of each line's background, so they
+ *  run unbroken from line to line, and blank lines inside a block carry them across. */
+function indentColumns(text: string, unit: number) {
+  let column = 0
+  for (let index = 0; index < text.length; index++) {
+    const char = text.charCodeAt(index)
+    if (char === 9) column += unit - (column % unit)
+    else if (char === 32) column++
+    else return { column, blank: false }
+  }
+  return { column, blank: true }
+}
 const indentGuides = ViewPlugin.fromClass(class {
   decorations: DecorationSet
   constructor(view: EditorView) { this.decorations = this.build(view) }
-  update(update: ViewUpdate) { if (update.docChanged || update.viewportChanged) this.decorations = this.build(update.view) }
+  update(update: ViewUpdate) { if (update.docChanged || update.viewportChanged || update.geometryChanged) this.decorations = this.build(update.view) }
   build(view: EditorView) {
     const builder = new RangeSetBuilder<Decoration>()
+    const doc = view.state.doc
     const unit = Math.max(1, getIndentUnit(view.state))
-    const guide = Decoration.mark({ class: 'cm-indent-guide' })
+    const charWidth = view.defaultCharacterWidth
+    // The indentation a blank line takes: the smaller of the lines around it (looking a little way).
+    const around = (number: number, step: 1 | -1) => {
+      for (let at = number + step, seen = 0; at >= 1 && at <= doc.lines && seen < 200; at += step, seen++) {
+        const found = indentColumns(doc.line(at).text, unit)
+        if (!found.blank) return found.column
+      }
+      return 0
+    }
+    const cache = new Map<number, Decoration>()
     for (const { from, to } of view.visibleRanges) {
       for (let position = from; position <= to;) {
-        const line = view.state.doc.lineAt(position)
-        let column = 0
-        for (let index = 0; index < line.length; index++) {
-          const char = line.text.charCodeAt(index)
-          if (char === 9) { if (column > 0) builder.add(line.from + index, line.from + index + 1, guide); column += unit - (column % unit) }
-          else if (char === 32) { if (column > 0 && column % unit === 0) builder.add(line.from + index, line.from + index + 1, guide); column++ }
-          else break
+        const line = doc.lineAt(position)
+        const measured = indentColumns(line.text, unit)
+        const column = measured.blank ? Math.min(around(line.number, -1), around(line.number, 1)) : measured.column
+        const levels = Math.ceil(column / unit) - 1
+        if (levels > 0) {
+          let decoration = cache.get(levels)
+          if (!decoration) {
+            const xs = Array.from({ length: levels }, (_, index) => `calc(14px + ${((index + 1) * unit * charWidth).toFixed(2)}px)`)
+            decoration = Decoration.line({ attributes: { class: 'cm-guided', style: `background-image: ${xs.map(() => 'linear-gradient(var(--indent-guide), var(--indent-guide))').join(', ')}; background-size: ${xs.map(() => '1.5px 100%').join(', ')}; background-position: ${xs.map(x => x + ' 0').join(', ')}` } })
+            cache.set(levels, decoration)
+          }
+          builder.add(line.from, line.from, decoration)
         }
         position = line.to + 1
       }
@@ -395,15 +473,38 @@ const changeTracker = ViewPlugin.fromClass(class {
   }
   destroy() { clearTimeout(this.timer) }
 })
-const changeGutter = [baseText, changeMarks, changeTracker, gutter({ class: 'cm-gutter-changes', markers: view => view.state.field(changeMarks, false) ?? RangeSet.empty })]
+// Clicking a change marker offers to stage or revert that change (handled by the IDE).
+const changeHandlers = new WeakMap<EditorView, (line: number, event: MouseEvent) => void>()
+const changeGutter = [baseText, changeMarks, changeTracker, gutter({
+  class: 'cm-gutter-changes', markers: view => view.state.field(changeMarks, false) ?? RangeSet.empty,
+  domEventHandlers: {
+    mousedown: (view, line, event) => {
+      let marked = false
+      view.state.field(changeMarks, false)?.between(line.from, line.to, () => { marked = true })
+      const handler = changeHandlers.get(view)
+      if (!marked || !handler) return false
+      event.preventDefault()
+      handler(view.state.doc.lineAt(line.from).number, event as MouseEvent)
+      return true
+    },
+  },
+})]
 
 // ---- Breakpoints and the paused line (debugger) ----
-const setBreakpoints = StateEffect.define<number[]>()
+const setBreakpoints = StateEffect.define<{ line: number; kind?: 'condition' | 'log' }[]>()
 const setDebugLine = StateEffect.define<number | null>()
 class BreakpointMarker extends GutterMarker {
-  toDOM() { const node = document.createElement('div'); node.className = 'cm-breakpoint'; return node }
+  constructor(readonly kind?: 'condition' | 'log') { super() }
+  eq(other: BreakpointMarker) { return other.kind === this.kind }
+  toDOM() {
+    const node = document.createElement('div')
+    node.className = 'cm-breakpoint' + (this.kind ? ' is-' + this.kind : '')
+    node.title = this.kind === 'condition' ? 'Conditional breakpoint (right-click to edit)' : this.kind === 'log' ? 'Logpoint: prints a message and carries on (right-click to edit)' : 'Breakpoint (right-click for options)'
+    return node
+  }
 }
 const breakpointMarker = new BreakpointMarker()
+const breakpointMarkers = { condition: new BreakpointMarker('condition'), log: new BreakpointMarker('log') }
 const breakpointField = StateField.define<RangeSet<GutterMarker>>({
   create: () => RangeSet.empty,
   update(value, transaction) {
@@ -411,7 +512,12 @@ const breakpointField = StateField.define<RangeSet<GutterMarker>>({
     for (const effect of transaction.effects) if (effect.is(setBreakpoints)) {
       const doc = transaction.state.doc
       const builder = new RangeSetBuilder<GutterMarker>()
-      for (const line of [...new Set(effect.value)].filter(line => line >= 1 && line <= doc.lines).sort((a, b) => a - b)) builder.add(doc.line(line).from, doc.line(line).from, breakpointMarker)
+      const seen = new Set<number>()
+      for (const { line, kind } of [...effect.value].filter(item => item.line >= 1 && item.line <= doc.lines).sort((a, b) => a.line - b.line)) {
+        if (seen.has(line)) continue
+        seen.add(line)
+        builder.add(doc.line(line).from, doc.line(line).from, kind ? breakpointMarkers[kind] : breakpointMarker)
+      }
       value = builder.finish()
     }
     return value
@@ -434,17 +540,46 @@ const debugLine = StateField.define<DecorationSet>({
   },
   provide: field => EditorView.decorations.from(field),
 })
-function breakpointGutter(toggle: (line: number) => void) {
+function breakpointGutter(toggle: (line: number) => void, menu: (line: number, event: MouseEvent) => void) {
   return [breakpointField, debugLine, gutter({
     class: 'cm-breakpoints', renderEmptyElements: true,
     markers: view => view.state.field(breakpointField, false) ?? RangeSet.empty,
     initialSpacer: () => breakpointMarker,
-    domEventHandlers: { mousedown: (view, line) => { toggle(view.state.doc.lineAt(line.from).number); return true } },
+    domEventHandlers: {
+      mousedown: (view, line, event) => { if ((event as MouseEvent).button !== 0) return false; toggle(view.state.doc.lineAt(line.from).number); return true },
+      contextmenu: (view, line, event) => { event.preventDefault(); menu(view.state.doc.lineAt(line.from).number, event as MouseEvent); return true },
+    },
   })]
 }
 
 /** Marks a change copied in from the same file open in another pane. */
 const synced = Annotation.define<boolean>()
+
+// ---- Coverage: a thin bar beside lines the tests ran (green) and didn't (red) ----
+const setCoverage = StateEffect.define<{ covered: number[]; missed: number[] } | null>()
+class CoverageMarker extends GutterMarker {
+  constructor(readonly covered: boolean) { super() }
+  eq(other: CoverageMarker) { return other.covered === this.covered }
+  toDOM() { const node = document.createElement('div'); node.className = this.covered ? 'cm-covered' : 'cm-missed'; node.title = this.covered ? 'Run by the tests' : 'Not run by the tests'; return node }
+}
+const coverageMarkers = { yes: new CoverageMarker(true), no: new CoverageMarker(false) }
+const coverageField = StateField.define<RangeSet<GutterMarker>>({
+  create: () => RangeSet.empty,
+  update(value, transaction) {
+    value = value.map(transaction.changes)
+    for (const effect of transaction.effects) if (effect.is(setCoverage)) {
+      const doc = transaction.state.doc
+      const lines = new Map<number, boolean>()
+      for (const line of effect.value?.covered ?? []) lines.set(line, true)
+      for (const line of effect.value?.missed ?? []) lines.set(line, false)
+      const builder = new RangeSetBuilder<GutterMarker>()
+      for (const [line, covered] of [...lines].sort((a, b) => a[0] - b[0])) if (line >= 1 && line <= doc.lines) builder.add(doc.line(line).from, doc.line(line).from, covered ? coverageMarkers.yes : coverageMarkers.no)
+      value = builder.finish()
+    }
+    return value
+  },
+})
+const coverageGutter = [coverageField, gutter({ class: 'cm-coverage', markers: view => view.state.field(coverageField, false) ?? RangeSet.empty })]
 
 // ---- Tests: ▶ beside each test, ✓ or ✗ after a run ----
 const setTests = StateEffect.define<{ line: number; id: string; status?: string }[]>()
@@ -509,7 +644,7 @@ function setup(): Extension {
   return [
     highlightSpecialChars(), history(), dropCursor(), EditorState.allowMultipleSelections.of(true),
     indentOnInput(), syntaxHighlighting(syntax), bracketMatching(), completionKeys, rectangularSelection(),
-    crosshairCursor(), look,
+    crosshairCursor(), look, fadingScrollbars,
     keymap.of([
       { key: 'F2', run: view => serverCommands.rename(view) || renameOccurrences(view) },
       { key: 'F12', run: view => { const handler = definitionHandlers.get(view); if (!handler) return false; handler(); return true } },
@@ -610,6 +745,12 @@ export interface EditorHandle {
   command: (name: EditorCommand) => boolean; insert: (text: string) => void; word: () => { text: string; line: number } | null
   /** Replaces the text with `next` as a minimal, undoable change (the caret stays put). */
   replaceAll: (next: string) => void
+  /** Scrolls so `fraction` (0–1) of the document is at the top of the view, without moving the caret. */
+  scrollTo: (fraction: number) => void
+  /** The language server's fixes for the caret's line (null when there's no server). */
+  quickFixes: () => Promise<QuickFix[] | null>
+  /** Where the caret is on screen, for a menu beside it. */
+  caretPoint: () => { x: number; y: number } | null
   text: () => string
   /** Trims trailing spaces and/or ensures a final newline, in the editor (undoable); returns the new text. */
   tidy: (options: { trim: boolean; finalNewline: boolean }) => string | null
@@ -640,6 +781,13 @@ interface Props {
   breakpoints?: number[]
   /** Called with the new list when a breakpoint is toggled or edits move breakpoints. */
   onBreakpoints?: (lines: number[]) => void
+  /** Breakpoints with a condition or a log message, by line. */
+  breakpointKinds?: Record<number, 'condition' | 'log'>
+  onBreakpointMenu?: (line: number, event: MouseEvent) => void
+  /** A change marker in the gutter was clicked (stage or revert that change). */
+  onChangeMarker?: (line: number, event: MouseEvent) => void
+  /** Lines the last test run covered and missed (pytest-cov). */
+  coverage?: { covered: number[]; missed: number[] } | null
   /** The line the debugger is paused on in this file. */
   debugLine?: number | null
   blame?: BlameLine[] | null
@@ -648,6 +796,8 @@ interface Props {
   onRunTest?: (id: string) => void
   /** Called when this editor gets focus (the split editor uses it to know which pane is current). */
   onFocus?: () => void
+  /** Where the view is in the document (for the minimap): top and height as fractions of the whole. */
+  onViewport?: (view: { top: number; height: number; lines: number }) => void
   /** The language server for this file, and the file's URI as the server knows it. */
   server?: Server | null
   serverUri?: string
@@ -720,6 +870,9 @@ function handleFor(editor: EditorView, path: string): EditorHandle {
     find: () => { editor.focus(); openSearchPanel(editor) },
     selection: () => { const range = editor.state.selection.main; return range.empty ? '' : editor.state.sliceDoc(range.from, range.to) },
     reveal: () => editor.dispatch({ effects: EditorView.scrollIntoView(editor.state.selection.main.head, { y: 'center' }) }),
+    quickFixes: () => quickFixes(editor),
+    caretPoint: () => { const box = editor.coordsAtPos(editor.state.selection.main.head); return box ? { x: box.left, y: box.bottom + 4 } : null },
+    scrollTo: fraction => { const scroller = editor.scrollDOM; scroller.scrollTop = fraction * (scroller.scrollHeight - scroller.clientHeight) },
     jump: (line, column = 1, length = 0) => {
       const row = editor.state.doc.line(Math.max(1, Math.min(line, editor.state.doc.lines)))
       const anchor = Math.min(row.to, row.from + Math.max(0, column - 1))
@@ -798,14 +951,15 @@ export default function Editor(props: Props) {
     })
     const base = [setup(), configuration.of(configure(current.options, current.path)), lintGutter(),
       EditorView.contentAttributes.of({ 'aria-label': current.diff ? 'File diff' : current.path, spellcheck: 'false', autocorrect: 'off', autocapitalize: 'off' })]
-    serverKey.current = (current.server?.id ?? '') + '|' + (current.serverUri ?? '')
+    serverKey.current = (current.server?.id ?? '') + '|' + (current.serverUri ?? '') + '|' + (current.options.inlayHints !== false)
     const live = current.diff ? [] : [
       serverSlot.of(serverFor(current)),
       breakpointGutter(line => {
         const lines = view.current ? breakpointLines(view.current.state) : []
         callbacks.current.onBreakpoints?.(lines.includes(line) ? lines.filter(item => item !== line) : [...lines, line])
-      }),
+      }, (line, event) => callbacks.current.onBreakpointMenu?.(line, event)),
       testGutter(id => callbacks.current.onRunTest?.(id)),
+      coverageGutter,
       changeGutter,
       gitLines,
       inlineSuggestions(() => callbacks.current.suggest),
@@ -857,9 +1011,26 @@ export default function Editor(props: Props) {
     }
     view.current = editor
     definitionHandlers.set(editor, () => callbacks.current.onDefinition?.())
+    changeHandlers.set(editor, (line, event) => callbacks.current.onChangeMarker?.(line, event))
+    let frame = 0
+    const report = () => {
+      cancelAnimationFrame(frame)
+      frame = requestAnimationFrame(() => {
+        const scroller = editor.scrollDOM
+        const total = Math.max(1, scroller.scrollHeight)
+        callbacks.current.onViewport?.({ top: scroller.scrollTop / total, height: scroller.clientHeight / total, lines: editor.state.doc.lines })
+      })
+    }
+    editor.scrollDOM.addEventListener('scroll', report, { passive: true })
+    const resized = new ResizeObserver(report)
+    resized.observe(editor.scrollDOM)
+    report()
     current.onCursor(onCursor(editor))
     current.handle(handleFor(editor, current.path))
     return () => {
+      cancelAnimationFrame(frame)
+      resized.disconnect()
+      editor.scrollDOM.removeEventListener('scroll', report)
       if (current.memory) {
         current.memory.state = editor.state
         current.memory.top = editor.scrollDOM.scrollTop
@@ -874,17 +1045,20 @@ export default function Editor(props: Props) {
   // The server starts after the editor opens (and may stop or restart); plug it in when it does.
   useEffect(() => {
     const editor = view.current
-    const key = (props.server?.id ?? '') + '|' + (props.serverUri ?? '')
+    const key = (props.server?.id ?? '') + '|' + (props.serverUri ?? '') + '|' + (props.options.inlayHints !== false)
     if (!editor || props.diff || serverKey.current === key) return
     serverKey.current = key
     editor.dispatch({ effects: serverSlot.reconfigure(serverFor(callbacks.current)) })
-  }, [props.server, props.serverUri])
+  }, [props.server, props.serverUri, props.options.inlayHints])
 
   // Keep in step with the text when it changes elsewhere: the same file in the other pane,
   // or a restored editor state that is older than the file.
   useEffect(() => {
     const editor = view.current
     if (!editor || props.diff || props.text === emitted.current) return
+    // Remember it as the text in step, so the same text coming back later (a stash brought back,
+    // an undo elsewhere) is applied rather than mistaken for this editor's own last edit.
+    emitted.current = props.text
     const next = normalize(props.text)
     const current = editor.state.doc.toString()
     if (next === current) return
@@ -896,7 +1070,7 @@ export default function Editor(props: Props) {
   useEffect(() => {
     view.current?.dispatch({ effects: configuration.reconfigure(configure(props.options, props.path)) })
   }, [options.wrap, options.lineNumbers, options.highlightLine, options.tabSize, options.autocomplete, options.occurrences, options.whitespace,
-    options.indentGuides, options.closeBrackets, options.scrollPastEnd, options.cursorBlink, options.folding, options.blameColumn])
+    options.indentGuides, options.closeBrackets, options.scrollPastEnd, options.cursorBlink, options.folding, options.blameColumn, options.constructors, options.sticky])
 
   useEffect(() => {
     const editor = view.current
@@ -917,11 +1091,18 @@ export default function Editor(props: Props) {
     editor.dispatch({ effects: setTests.of(props.tests ?? []) })
   }, [testKey, props.diff, props.path])
 
-  const breakKey = (props.breakpoints ?? []).join(',')
+  const coverageKey = props.coverage ? props.coverage.covered.length + ':' + props.coverage.missed.join(',') : ''
   useEffect(() => {
     const editor = view.current
     if (!editor || props.diff) return
-    if (breakpointLines(editor.state).join(',') !== breakKey) editor.dispatch({ effects: setBreakpoints.of(props.breakpoints ?? []) })
+    editor.dispatch({ effects: setCoverage.of(props.coverage ?? null) })
+  }, [coverageKey, props.diff, props.path])
+
+  const breakKey = (props.breakpoints ?? []).map(line => line + (props.breakpointKinds?.[line] ?? '')).join(',')
+  useEffect(() => {
+    const editor = view.current
+    if (!editor || props.diff) return
+    editor.dispatch({ effects: setBreakpoints.of((props.breakpoints ?? []).map(line => ({ line, kind: props.breakpointKinds?.[line] }))) })
   }, [breakKey, props.diff, props.path])
   useEffect(() => {
     const editor = view.current
@@ -935,7 +1116,8 @@ export default function Editor(props: Props) {
 
   return <div className={'editor-host' + (split ? ' split-diff' : '')} ref={host} onContextMenu={event => {
     const editor = view.current
-    if (!editor || !props.onContextMenu || !(event.target as Element).closest('.cm-content, .cm-gutters')) return
+    // A gutter that has its own menu (breakpoints) has already handled the click.
+    if (!editor || !props.onContextMenu || event.defaultPrevented || (event.target as Element).closest('.cm-breakpoints') || !(event.target as Element).closest('.cm-content, .cm-gutters')) return
     event.preventDefault()
     // Right-clicking outside the selection moves the caret there first.
     const position = editor.posAtCoords({ x: event.clientX, y: event.clientY })
@@ -943,6 +1125,41 @@ export default function Editor(props: Props) {
     editor.focus()
     props.onContextMenu(event)
   }} />
+}
+
+/** A small editor for one notebook cell: the language, Still's look and suggestions, wrapping,
+ *  and keys of its own (Shift+Enter to run, and so on). */
+export function cellExtensions(path: string, onChange: (text: string) => void, keys: { key: string; run: (view: EditorView) => boolean }[], onFocus?: () => void): Extension[] {
+  return [
+    Prec.highest(keymap.of(keys)), setup(), mode(path)?.load() ?? [], completionFor(path, true), EditorView.lineWrapping,
+    indentUnit.of('    '), EditorState.tabSize.of(4),
+    EditorView.updateListener.of(update => {
+      if (update.docChanged) onChange(update.state.doc.toString())
+      if (update.focusChanged && update.view.hasFocus) onFocus?.()
+    }),
+    EditorView.contentAttributes.of({ spellcheck: 'false', autocorrect: 'off', autocapitalize: 'off' }),
+  ]
+}
+
+/** Coloured runs per line for the minimap: [line index, start column, end column, token class]. */
+export function minimapTokens(code: string, path: string, maxLines = 6000): [number, number, number, string][] {
+  const runs: [number, number, number, string][] = []
+  const text = code.split('\n').slice(0, maxLines).join('\n')
+  const found = mode(path)
+  const loaded = found?.load()
+  const parser = loaded instanceof LanguageSupport ? loaded.language.parser : loaded instanceof Language ? loaded.parser : null
+  let line = 0, column = 0
+  const push = (piece: string, cls: string) => {
+    // Runs of non-space characters only; spaces stay empty, as in other editors' minimaps.
+    for (const match of piece.matchAll(/\S+/g)) runs.push([line, column + (match.index ?? 0), column + (match.index ?? 0) + match[0].length, cls])
+    column += piece.length
+  }
+  if (!parser) {
+    for (const row of text.split('\n')) { push(row, ''); line++; column = 0 }
+    return runs
+  }
+  highlightCode(text, parser.parse(text), tokenNames, (piece, classes) => push(piece, classes.split(' ')[0] ?? ''), () => { line++; column = 0 })
+  return runs
 }
 
 /** Highlighted HTML for a code block (used by the Markdown preview). Unknown languages come back escaped and plain. */

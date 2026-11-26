@@ -130,11 +130,11 @@ export const presets: Theme[] = [
   {
     id: 'still-dark', name: 'Still Dark', kind: 'dark',
     colors: {
-      editor: '#0f0f10', panel: '#0f0f10', rail: '#0f0f10', bar: '#0f0f10', drawer: '#0f0f10', line: '#26262a', hover: '#1a1a1c',
-      selection: '#26262b', ink: '#ececee', secondary: '#b4b4ba', muted: '#8e8e96', icon: '#8e8e96', accent: '#ececee',
-      accentFill: '#202023', accentBorder: '#3a3a40', green: '#8fbf8f', amber: '#d4a24c', red: '#e08a8a', currentLine: '#151517',
-      keyword: '#c9a0c9', string: '#b5c48e', number: '#e0a96d', type: '#d6c095', function: '#9fc1b4', comment: '#85858e',
-      operator: '#a3a3ab', property: '#a9bad0', variable: '#e2e2e6',
+      editor: '#1c1d20', panel: '#1c1d20', rail: '#1c1d20', bar: '#1c1d20', drawer: '#1c1d20', line: '#2f3034', hover: '#25262a',
+      selection: '#33353b', ink: '#d2d2d6', secondary: '#a9a9b0', muted: '#86868e', icon: '#86868e', accent: '#d2d2d6',
+      accentFill: '#2a2b30', accentBorder: '#43444b', green: '#93bd93', amber: '#d0a352', red: '#dc8d8d', currentLine: '#222327',
+      keyword: '#c49ec4', string: '#b2c08f', number: '#d9a873', type: '#d0bc95', function: '#9dbdb1', comment: '#7e7f88',
+      operator: '#a0a0a8', property: '#a7b7cb', variable: '#cfcfd4',
     },
     terminal: { black: '#3a3a40', blue: '#9fb3c8', magenta: '#c9a0c9', cyan: '#9fc1b4' },
   },

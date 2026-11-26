@@ -1,6 +1,6 @@
 import { createContext, useContext } from 'react'
 import { invoke } from '@tauri-apps/api/core'
-import { type Theme, applySyntax, applyTheme, findTheme, presets } from './themes'
+import { type Theme, applySyntax, applyTheme, findTheme, presets , resolve as resolveTheme } from './themes'
 import { desktop } from './bridge'
 import { type Snippet, setCustomSnippets } from './completion'
 
@@ -63,6 +63,29 @@ export interface Settings {
   openOnStart: 'last' | 'readme'
   formatOnSave: boolean
   inlineBlame: boolean
+  /** Fill in __init__ / the constructor when a new class is started. */
+  fillConstructors: boolean
+  /** Keep the header of the function or class you're in pinned at the top of the editor. */
+  stickyScroll: boolean
+  /** Load the project's .env file into runs, debugging and tests. */
+  loadDotEnv: boolean
+  /** When the debugger stops for an exception. */
+  pauseOnExceptions: 'uncaught' | 'all' | 'none'
+  /** Measure which lines the tests run (pytest-cov) and mark them in the editor. */
+  testCoverage: boolean
+  /** Show the language server's hints (parameter names, inferred types) in the code. */
+  inlayHints: boolean
+  /** Shortcut preset and your own keys (action id → key, '' to turn a preset key off). */
+  keymap: 'still' | 'vscode' | 'jetbrains'
+  keybindings: Record<string, string>
+  /** Experimental: a picture behind the window (a data URL), how faded it is, and a tint over it. */
+  backgroundImage: string
+  backgroundFade: number
+  backgroundTint: string
+  backgroundTintStrength: number
+  /** Experimental: how surfaces are drawn, and how much of the background shows through them. */
+  surfaceStyle: 'paper' | 'frosted' | 'liquid'
+  translucency: number
   lintWithRuff: boolean
   /** Start Pyright, jdtls, typescript-language-server and others when they're installed. */
   languageServers: boolean
@@ -131,6 +154,20 @@ export const defaults: Settings = {
   openOnStart: 'last',
   formatOnSave: false,
   inlineBlame: true,
+  fillConstructors: true,
+  stickyScroll: true,
+  loadDotEnv: true,
+  pauseOnExceptions: 'uncaught',
+  testCoverage: false,
+  inlayHints: true,
+  keymap: 'still',
+  keybindings: {},
+  backgroundImage: '',
+  backgroundFade: 55,
+  backgroundTint: '#7c6f64',
+  backgroundTintStrength: 0,
+  surfaceStyle: 'paper',
+  translucency: 0,
   lintWithRuff: true,
   languageServers: true,
   customSnippets: [],
@@ -213,6 +250,24 @@ export function applySettings(settings: Settings, systemDark: boolean) {
   root.setProperty('--ligatures', settings.ligatures ? 'contextual common-ligatures' : 'none')
   root.setProperty('--font-features', settings.ligatures ? '"liga" 1, "calt" 1' : '"liga" 0, "calt" 0')
   const classes = document.documentElement.classList
+  // Experimental surfaces: a background picture, glass, and see-through panels.
+  const backdrop = Boolean(settings.backgroundImage) || settings.translucency > 0 || settings.surfaceStyle !== 'paper'
+  classes.toggle('has-backdrop', backdrop)
+  classes.toggle('surface-frosted', settings.surfaceStyle === 'frosted')
+  classes.toggle('surface-liquid', settings.surfaceStyle === 'liquid')
+  const resolved = resolveTheme(theme).colors
+  const solid = resolved.editor
+  root.setProperty('--editor-solid', solid)
+  root.setProperty('--backdrop-image', settings.backgroundImage ? `url("${settings.backgroundImage}")` : 'none')
+  root.setProperty('--backdrop-fade', String(Math.max(0, Math.min(100, settings.backgroundFade)) / 100))
+  root.setProperty('--backdrop-tint', settings.backgroundTint || '#000000')
+  root.setProperty('--backdrop-tint-strength', String(Math.max(0, Math.min(100, settings.backgroundTintStrength)) / 100))
+  if (backdrop) {
+    // Panels let the background through: glass needs a little even at no translucency.
+    const glass = settings.surfaceStyle === 'paper' ? 0 : 18
+    const alpha = Math.max(18, 100 - Math.max(settings.translucency, glass))
+    for (const key of ['editor', 'panel', 'rail', 'bar', 'drawer'] as const) root.setProperty('--' + key, `color-mix(in srgb, ${resolved[key] ?? solid} ${alpha}%, transparent)`)
+  }
   classes.toggle('smooth-caret', settings.smoothCaret)
   classes.toggle('cursor-block', settings.cursorStyle === 'block')
   classes.toggle('cursor-underline', settings.cursorStyle === 'underline')

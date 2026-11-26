@@ -5,6 +5,7 @@ import { type AppPaths, type PlanItem, type ShellOption, type SshOverview, deskt
 import { listen } from '@tauri-apps/api/event'
 import { blankHost, HostDialog } from './Remote'
 import { editorFonts, useSettings } from './settings'
+import { bindings, comboOf, describeCombo, keyActions, keyPresets, type KeyPreset } from './keymap'
 import { findUpdate } from './updates'
 import { type GithubModel, claudeModels, githubFallbackModels, githubModels, keys, ollamaModels } from './ai'
 import { type Theme, type ThemeColors, editableColors, exportTheme, isHex, parseTheme, presets, resolve } from './themes'
@@ -90,7 +91,7 @@ export default function SettingsView({ section, onSection, onClose, notify }: {
             {item.id === 'terminal' && <TerminalSettings />}
             {item.id === 'projects' && <ProjectSettings notify={notify} />}
             {item.id === 'remote' && <ServerSettings notify={notify} />}
-            {item.id === 'shortcuts' && <Shortcuts />}
+            {item.id === 'shortcuts' && <><KeySettings /><Shortcuts /></>}
             {item.id === 'about' && <About notify={notify} />}
           </div>)}
           {term && matches === 0 && <p className="help settings-none">Nothing matches “{query.trim()}”. Try a shorter word, like “font”, “tab” or “theme”.</p>}
@@ -116,6 +117,60 @@ function ThemeSwatch({ theme, active, onClick }: { theme: Theme; active: boolean
     </span>
     <span className="theme-name">{active && <Icon glyph={Check} size={12} />}{theme.name}</span>
   </button>
+}
+
+function Slider({ label, description, value, onChange, unit = '%' }: { label: string; description?: string; value: number; onChange: (value: number) => void; unit?: string }) {
+  return <label className="setting-row">
+    <span className="setting-text"><span>{label}</span>{description && <small>{description}</small>}</span>
+    <span className="setting-slider"><input type="range" min={0} max={100} value={value} onChange={event => onChange(Number(event.target.value))} /><output>{value}{unit}</output></span>
+  </label>
+}
+
+/** Pictures are scaled down (longest side 1920px) and stored as JPEG, so settings stay small. */
+async function pictureFrom(file: File): Promise<string> {
+  const url = URL.createObjectURL(file)
+  try {
+    const image = new Image()
+    await new Promise((resolve, reject) => { image.onload = resolve; image.onerror = () => reject(new Error("That file isn't a picture Still can read.")); image.src = url })
+    const scale = Math.min(1, 1920 / Math.max(image.naturalWidth, image.naturalHeight))
+    const canvas = document.createElement('canvas')
+    canvas.width = Math.round(image.naturalWidth * scale)
+    canvas.height = Math.round(image.naturalHeight * scale)
+    canvas.getContext('2d')?.drawImage(image, 0, 0, canvas.width, canvas.height)
+    return canvas.toDataURL('image/jpeg', 0.84)
+  } finally { URL.revokeObjectURL(url) }
+}
+
+function Experimental({ notify }: { notify: (message: unknown) => void }) {
+  const { settings, update } = useSettings()
+  const input = useRef<HTMLInputElement>(null)
+  return <section className="settings-group">
+    <h3>Experimental</h3>
+    <div className="setting-row">
+      <span className="setting-text"><span>Background picture</span><small>A picture behind the whole window. Panels let it show through when they're see-through or glass.</small></span>
+      <span className="setting-actions">
+        {settings.backgroundImage && <span className="setting-thumb" style={{ backgroundImage: `url("${settings.backgroundImage}")` }} />}
+        <button className="text-btn" onClick={() => input.current?.click()}>{settings.backgroundImage ? 'Change…' : 'Choose…'}</button>
+        {settings.backgroundImage && <button className="text-btn" onClick={() => update({ backgroundImage: '' })}>Remove</button>}
+        <input ref={input} type="file" accept="image/*" hidden onChange={event => {
+          const file = event.target.files?.[0]
+          event.target.value = ''
+          if (file) void pictureFrom(file).then(picture => update({ backgroundImage: picture })).catch(notify)
+        }} />
+      </span>
+    </div>
+    {settings.backgroundImage && <>
+      <Slider label="Fade" description="How much the theme's colour covers the picture: 0 shows it clearly, 100 hides it." value={settings.backgroundFade} onChange={value => update({ backgroundFade: value })} />
+      <div className="setting-row">
+        <span className="setting-text"><span>Tint</span><small>A colour washed over the picture.</small></span>
+        <span className="setting-actions"><input type="color" className="setting-color" value={settings.backgroundTint} onChange={event => update({ backgroundTint: event.target.value })} aria-label="Tint colour" /></span>
+      </div>
+      <Slider label="Tint strength" value={settings.backgroundTintStrength} onChange={value => update({ backgroundTintStrength: value })} />
+    </>}
+    <div className="setting-row"><span className="setting-text"><span>Surfaces</span><small>Paper is flat and calm. Frosted glass blurs what's behind panels; liquid glass adds a bright rim and rounder corners.</small></span>
+      <Segmented label="Surfaces" value={settings.surfaceStyle} onChange={value => update({ surfaceStyle: value })} options={[{ value: 'paper', label: 'Paper' }, { value: 'frosted', label: 'Frosted' }, { value: 'liquid', label: 'Liquid' }]} /></div>
+    <Slider label="See-through panels" description="Lets the background show through the editor and panels, like a translucent browser." value={settings.translucency} onChange={value => update({ translucency: value })} />
+  </section>
 }
 
 function Appearance({ notify }: { notify: (message: unknown) => void }) {
@@ -240,6 +295,8 @@ function Appearance({ notify }: { notify: (message: unknown) => void }) {
       <Toggle label="Hide the top bar until the pointer reaches it" description="Gives the editor the whole window. Move the pointer to the top edge to show the bar." checked={settings.autoHideTopBar} onChange={value => update({ autoHideTopBar: value })} />
     </section>
 
+    <Experimental notify={notify} />
+
     <section className="settings-group">
       <h3>Motion</h3>
       <Toggle label="Reduce motion" description="Islands, menus and the canvas appear without sliding or fading." checked={settings.reduceMotion} onChange={value => update({ reduceMotion: value })} />
@@ -324,6 +381,9 @@ function EditorSettings() {
     <section className="settings-group">
       <h3>Checks and changes</h3>
       <Toggle label="Show errors while typing" description="Underlines syntax errors as you type. Python files are also checked for undefined names (and, with pyflakes installed, unused imports and more)." checked={settings.errors} onChange={value => update({ errors: value })} />
+      <Toggle label="Inline hints from language servers" description="Parameter names and inferred types shown faintly in the code, when the language server offers them." checked={settings.inlayHints} onChange={value => update({ inlayHints: value })} />
+      <Toggle label="Sticky scroll" description="While you're inside a function, class or block whose first line has scrolled away, that line stays at the top of the editor. Click it to go there." checked={settings.stickyScroll} onChange={value => update({ stickyScroll: value })} />
+      <Toggle label="Fill in constructors" description="Enter after starting a class (class Shop: in Python, class Shop { in Java, JavaScript and C#) adds __init__ or the constructor. Comments and docstrings close themselves either way." checked={settings.fillConstructors} onChange={value => update({ fillConstructors: value })} />
       <Toggle label="Show who last changed the current line" description="At the end of the line you're on: the author, when, and the commit message (Git blame). Still menu → Git → Blame for every line shows it for the whole file." checked={settings.inlineBlame} onChange={value => update({ inlineBlame: value })} />
       <Toggle label="Mark lines changed since the last commit" description="A green bar for added lines, amber for changed lines and a red mark where lines were removed." checked={settings.gitGutter} onChange={value => update({ gitGutter: value })} />
     </section>
@@ -461,6 +521,13 @@ function ProjectSettings({ notify }: { notify: (message: unknown) => void }) {
       <Toggle label="Add requirements.txt to Python projects" checked={settings.newProjectRequirements} onChange={value => update({ newProjectRequirements: value })} />
     </section>
     <section className="settings-group">
+      <h3>Running and debugging</h3>
+      <Toggle label="Load the project's .env file" description="Variables in .env at the project's root are set when you run, debug or test. A file's run configuration (Run → Run configuration…) can add more." checked={settings.loadDotEnv} onChange={value => update({ loadDotEnv: value })} />
+      <div className="setting-row"><span className="setting-text"><span>Pause on exceptions</span><small>Uncaught: stop where an error ends the program. All: stop wherever one is raised, even if it's handled.</small></span>
+        <Segmented label="Pause on exceptions" value={settings.pauseOnExceptions} onChange={value => update({ pauseOnExceptions: value })} options={[{ value: 'uncaught', label: 'Uncaught' }, { value: 'all', label: 'All' }, { value: 'none', label: 'Never' }]} /></div>
+      <Toggle label="Measure test coverage" description="After Python tests run (with pytest-cov installed), lines the tests ran get a green mark and lines they missed a red one." checked={settings.testCoverage} onChange={value => update({ testCoverage: value })} />
+    </section>
+    <section className="settings-group">
       <h3>Startup</h3>
       <Toggle label="Reopen the last project when Still starts" description="Off: Still opens on Home." checked={settings.openLastProject} onChange={value => update({ openLastProject: value })} />
       <div className="setting-row"><span className="setting-text"><span>When a project opens, show</span><small>The files you had open last time (where you left off), or the project's README.</small></span>
@@ -500,6 +567,47 @@ const shortcutGroups: { title: string; items: [string, string][] }[] = [
   { title: 'Run', items: [['Run active file', 'Enter'], ['Check or compile only', 'Shift+Enter']] },
   { title: 'Layout', items: [['Overview of everything', '↑'], ['Focus mode', '.'], ['Show or hide the sidebar', 'B'], ['Files', 'Shift+E'], ['Search', 'Shift+F'], ['Git', 'Shift+G'], ['Packages', 'Shift+U'], ['Servers', 'Shift+R'], ['Canvas', 'Shift+D'], ['Chat', 'Shift+A'], ['Terminal', 'J'], ['New terminal', 'Shift+`'], ['Fullscreen the focused island', 'Shift+M']] },
 ]
+
+function KeySettings() {
+  const { settings, update } = useSettings()
+  const [recording, setRecording] = useState<string | null>(null)
+  const current = bindings(settings.keymap, settings.keybindings)
+  useEffect(() => {
+    if (!recording) return
+    const record = (event: KeyboardEvent) => {
+      event.preventDefault(); event.stopPropagation()
+      if (event.key === 'Escape') { setRecording(null); return }
+      const combo = comboOf(event)
+      if (!combo) return
+      update({ keybindings: { ...settings.keybindings, [recording]: combo } })
+      setRecording(null)
+    }
+    window.addEventListener('keydown', record, true)
+    return () => window.removeEventListener('keydown', record, true)
+  }, [recording, settings.keybindings])
+  const taken = (action: string, combo: string) => Object.entries(current).find(([other, key]) => other !== action && key === combo)?.[0]
+  return <section className="settings-group key-recorder">
+    <h3>Your keys</h3>
+    <div className="setting-row"><span className="setting-text"><span>Preset</span><small>Add the shortcuts you know from another IDE. Keys set below win over the preset; the built-in keys listed further down keep working unless a key here uses them.</small></span>
+      <Segmented label="Shortcut preset" value={settings.keymap} onChange={value => update({ keymap: value })} options={(Object.keys(keyPresets) as KeyPreset[]).map(value => ({ value, label: keyPresets[value].label }))} /></div>
+    <div className="key-table">
+      {keyActions.map(action => {
+        const combo = current[action.id]
+        const custom = action.id in settings.keybindings
+        const clash = combo ? taken(action.id, combo) : undefined
+        return <div key={action.id} className={'key-row' + (recording === action.id ? ' is-recording' : '')}>
+          <span>{action.label}</span>
+          <span className="key-combo">{recording === action.id ? 'Press keys… (Esc to cancel)' : combo ? <kbd>{describeCombo(combo)}</kbd> : <span className="muted">—</span>}{clash && <small className="key-clash">also {keyActions.find(item => item.id === clash)?.label}</small>}</span>
+          <span className="key-actions">
+            <button className="text-btn" onClick={() => setRecording(action.id)}>{combo ? 'Change' : 'Set'}</button>
+            {custom && <button className="text-btn" onClick={() => { const next = { ...settings.keybindings }; delete next[action.id]; update({ keybindings: next }) }}>Reset</button>}
+            {combo && <button className="text-btn" onClick={() => update({ keybindings: { ...settings.keybindings, [action.id]: '' } })}>Remove</button>}
+          </span>
+        </div>
+      })}
+    </div>
+  </section>
+}
 
 function Shortcuts() {
   return <>{shortcutGroups.map(group => <section key={group.title} className="settings-group">

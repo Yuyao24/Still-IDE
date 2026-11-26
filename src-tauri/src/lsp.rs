@@ -119,7 +119,24 @@ pub fn lsp_start(app: AppHandle, servers: State<Servers>, root_path: String, lan
     let Some((program, args, name)) = candidates(&app, &language, &cwd).into_iter().find_map(|(program, args, name)| find(&cwd, program).map(|path| (path, args, name))) else {
         return Ok(None);
     };
-    let mut child = command(&program, &cwd).args(&args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(err)?;
+    let mut cmd = command(&program, &cwd);
+    cmd.args(&args);
+    spawn(&app, &servers, id, name, cmd).map(Some)
+}
+
+/// Is a server with this id still running? (Then it is reused.)
+pub fn running(servers: &Servers, id: &str) -> Option<Started> {
+    let mut map = servers.0.lock().ok()?;
+    let server = map.get_mut(id)?;
+    if matches!(server.child.try_wait(), Ok(None)) { return Some(Started { id: id.to_owned(), name: server.name.clone() }) }
+    map.remove(id);
+    None
+}
+
+/// Starts a server process (local, or `ssh … server` for a project on a server) and relays its messages.
+pub fn spawn(app: &AppHandle, servers: &Servers, id: String, name: &str, mut cmd: std::process::Command) -> Result<Started> {
+    let app = app.clone();
+    let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(err)?;
     let stdout = child.stdout.take().ok_or("The language server has no output.")?;
     let stderr = child.stderr.take();
     let stdin = Arc::new(Mutex::new(child.stdin.take().ok_or("The language server takes no input.")?));
@@ -170,7 +187,7 @@ pub fn lsp_start(app: AppHandle, servers: State<Servers>, root_path: String, lan
         }
     });
     servers.0.lock().map_err(err)?.insert(id.clone(), Server { stdin, child, name: name.to_owned() });
-    Ok(Some(Started { id, name: name.to_owned() }))
+    Ok(Started { id, name: name.to_owned() })
 }
 
 #[tauri::command]

@@ -17,7 +17,7 @@ use std::{
 use tauri::{AppHandle, Emitter, Manager, State};
 
 pub const DRIVER: &str = r#"
-import bdb, sys, os, json, socket, reprlib, linecache, traceback, types
+import bdb, sys, os, json, socket, reprlib, linecache, traceback, types, re
 root = os.path.realpath(os.environ.get('STILL_DEBUG_ROOT', os.getcwd()))
 if os.environ.get('STILL_DEBUG_STDIO'):
     # Over SSH there is only stdin and stderr: debugger messages are marked lines on stderr, and
@@ -83,15 +83,27 @@ def interesting(name, value):
 class Driver(bdb.Bdb):
     def __init__(self):
         bdb.Bdb.__init__(self)
-        self.started = False; self.watches = []; self.frames = []
+        self.started = False; self.watches = []; self.frames = []; self.logs = {}; self.pause_on = 'uncaught'
     def user_line(self, frame):
         if not self.started:
             self.started = True
             if not self.entry: self.set_continue(); return
         if not mine(frame.f_code.co_filename): self.set_step(); return
-        self.pause(frame, 'breakpoint' if self.get_breaks(self.canonic(frame.f_code.co_filename), frame.f_lineno) else 'step')
+        where = (self.canonic(frame.f_code.co_filename), frame.f_lineno)
+        hit = self.get_breaks(*where)
+        # A logpoint prints its message (with {expressions} filled in) and carries on.
+        if hit and where in self.logs:
+            def fill(match):
+                try: return describe('', eval(match.group(1), frame.f_globals, frame.f_locals))['value'].strip("'")
+                except Exception as error: return '<%s>' % type(error).__name__
+            sys.stdout.write(re.sub(r'\{([^{}]+)\}', fill, self.logs[where]) + '\n'); sys.stdout.flush()
+            # Only stop here if you were stepping onto this line anyway.
+            if not self.stop_here(frame): return
+            self.pause(frame, 'step'); return
+        self.pause(frame, 'breakpoint' if hit else 'step')
     def user_exception(self, frame, info):
-        if not mine(frame.f_code.co_filename): return
+        # 'all' pauses where any exception is raised; 'uncaught' waits to see if it escapes (see the end).
+        if self.pause_on != 'all' or not mine(frame.f_code.co_filename): return
         kind, value, _ = info
         if kind in (StopIteration, GeneratorExit, KeyboardInterrupt, SystemExit): return
         self.pause(frame, 'exception', '%s: %s' % (kind.__name__, value))
@@ -135,13 +147,36 @@ class Driver(bdb.Bdb):
               'stack': [{'name': entry[0].f_code.co_name if entry[0].f_code.co_name != '<module>' else '(module)', 'file': rel(entry[0].f_code.co_filename), 'line': entry[1]} for entry in self.frames],
               'locals': local[:300], 'globals': globs[:300], 'watches': watched})
     def breakpoints(self, items):
-        self.clear_all_breaks()
+        self.clear_all_breaks(); self.logs = {}
         for item in items:
-            path = os.path.join(root, item['file']) if not os.path.isabs(item['file']) else item['file']
-            if self.set_break(self.canonic(path), int(item['line'])): pass
+            path = self.canonic(os.path.join(root, item['file']) if not os.path.isabs(item['file']) else item['file'])
+            line = int(item['line'])
+            self.set_break(path, line, cond=(item.get('condition') or None))
+            if item.get('log'): self.logs[(path, line)] = item['log']
+    def post_mortem(self, tb, detail):
+        # The program stopped with an uncaught exception: show where, and let the frames be explored.
+        stack, _ = self.get_stack(None, tb)
+        self.frames = [entry for entry in stack if mine(entry[0].f_code.co_filename)]
+        if not self.frames: return
+        self.report(len(self.frames) - 1, 'exception', detail)
+        while True:
+            command = receive()
+            op = command.get('op')
+            if op in ('continue', 'next', 'step', 'out', 'stop'): return
+            if op == 'frame': self.report(int(command.get('index', 0)), 'exception', detail)
+            elif op == 'watches': self.watches = list(command.get('items', [])); self.report(self.selected, 'exception', detail)
+            elif op == 'eval':
+                target = self.frames[self.selected][0]
+                try:
+                    try: value = describe('', eval(command.get('expression', ''), target.f_globals, target.f_locals))['value']
+                    except SyntaxError: exec(command.get('expression', ''), target.f_globals, target.f_locals); value = ''
+                    send({'event': 'eval', 'expression': command.get('expression', ''), 'value': value, 'ok': True})
+                except Exception as error:
+                    send({'event': 'eval', 'expression': command.get('expression', ''), 'value': '%s: %s' % (type(error).__name__, error), 'ok': False})
 setup = receive()
 driver = Driver()
 driver.entry = bool(setup.get('stopOnEntry'))
+driver.pause_on = setup.get('pauseOn') or 'uncaught'
 driver.breakpoints(setup.get('breakpoints', []))
 driver.watches = list(setup.get('watches', []))
 target = os.path.abspath(sys.argv[1])
@@ -157,8 +192,11 @@ except bdb.BdbQuit:
     pass
 except SystemExit:
     raise
-except BaseException:
+except BaseException as error:
     traceback.print_exc()
+    if driver.pause_on == 'uncaught':
+        try: driver.post_mortem(sys.exc_info()[2], '%s: %s (uncaught)' % (type(error).__name__, error))
+        except SystemExit: pass
     sys.exit(1)
 finally:
     try: send({'event': 'ended'})
@@ -174,6 +212,10 @@ pub struct Debuggers(pub Arc<Mutex<HashMap<String, mpsc::Sender<serde_json::Valu
 pub struct Breakpoint {
     file: String,
     line: u32,
+    #[serde(default)]
+    condition: Option<String>,
+    #[serde(default)]
+    log: Option<String>,
 }
 
 /// Runs a Python or Java file under the debugger. Output streams to the Output pane like a normal run;
@@ -190,23 +232,30 @@ pub fn debug_start(
     watches: Vec<String>,
     stop_on_entry: bool,
     args: Option<String>,
+    env: Option<String>,
+    dotenv: Option<bool>,
+    pause_on: Option<String>,
 ) -> Result<()> {
     let cwd = root(&root_path)?;
     let file = resolve(&cwd, &path)?;
     relative(&path)?;
     let args = parse_args(args)?;
+    let vars = crate::process::project_env(&cwd, dotenv.unwrap_or(true), env.as_deref());
+    let pause_on = pause_on.unwrap_or_else(|| "uncaught".into());
     if path.ends_with(".java") {
         let (sender, commands) = mpsc::channel();
         app.state::<Debuggers>().0.lock().map_err(err)?.insert(id.clone(), sender);
         let setup = serde_json::json!({
-            "breakpoints": breakpoints.iter().map(|item| serde_json::json!({ "file": item.file, "line": item.line })).collect::<Vec<_>>(),
+            "breakpoints": breakpoints.iter().map(|item| serde_json::json!({ "file": item.file, "line": item.line, "condition": item.condition, "log": item.log })).collect::<Vec<_>>(),
             "watches": watches,
             "stopOnEntry": stop_on_entry,
+            "pauseOn": pause_on,
         });
         let events = app.clone();
         let sessions = app.state::<Debuggers>().inner().clone();
         let session_id = id.clone();
         return jobs.start(app, id, true, move |job| {
+            job.use_env(vars);
             let result = crate::jdebug::run(job, events, session_id.clone(), &cwd, &file, &path, setup, &args, commands);
             if let Ok(mut map) = sessions.0.lock() { map.remove(&session_id); }
             result
@@ -218,9 +267,10 @@ pub fn debug_start(
     let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(err)?;
     let port = listener.local_addr().map_err(err)?.port();
     let setup = serde_json::json!({
-        "breakpoints": breakpoints.iter().map(|item| serde_json::json!({ "file": item.file, "line": item.line })).collect::<Vec<_>>(),
+        "breakpoints": breakpoints.iter().map(|item| serde_json::json!({ "file": item.file, "line": item.line, "condition": item.condition, "log": item.log })).collect::<Vec<_>>(),
         "watches": watches,
         "stopOnEntry": stop_on_entry,
+        "pauseOn": pause_on,
     });
     // The driver connects back once; its messages become events for the window.
     let sessions = app.state::<Debuggers>().inner().clone();
@@ -254,6 +304,7 @@ pub fn debug_start(
     });
     let root_for_driver = cwd.clone();
     jobs.start(app, id, true, move |job| {
+        job.use_env(vars);
         let (program, _, _) = python(&cwd).ok_or("Python 3 was not found on PATH or in .venv.")?;
         let mut cmd = command(program, &cwd);
         cmd.env("PYTHONIOENCODING", "utf-8")

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
@@ -7,16 +7,26 @@ import {
   Check, Circle, CircleAlert, CodeXml, Columns2, Copy, FilePlus2, Files, FolderOpen, FolderPlus,
   FolderSearch, GitBranch, GitCompareArrows, GitPullRequestArrow, Hammer, House, Moon, Package,  Pencil, Play, Plus,
   RefreshCw, Rows2, Search, Server, Settings2, Square, SquareTerminal, Sun, TerminalSquare, Trash2, WrapText, X,
-  Camera, Eye, PenLine, LayoutGrid, Maximize2, Minimize2, Network, BookOpen, Sparkles, Bug, FlaskConical, ArrowLeftRight,
+  Camera, Eye, PenLine, LayoutGrid, Maximize2, Minimize2, Network, BookOpen, Sparkles, Bug, FlaskConical, ArrowLeftRight, AlignLeft,
 } from 'lucide-react'
 import {
   api, clipboard, desktop, editorSupport, fileName, fileTemplate, history, type BlameLine, type FileCommit, fileSystem, home, mod, parentPath, pickFolder, ssh,
   type Branches, type Change, type Commit, type Diagnostic, type Diff, type Entry, type GitStatus, type JobEvent, type Packages, type Runtimes,
   type SshHost, type SshOverview, type Workspace,
+  tex, type TexResult,
 } from './bridge'
 import Editor, { defaultIndent, highlightToHtml, language, type CodeCapture, type Cursor, type EditorHandle, type EditorMemory, type EditorOptions, type LiveIssue } from './Editor'
 import CodeShot from './CodeShot'
-import { Preview, docKind } from './Preview'
+import { Preview, docKind, type DocKind } from './Preview'
+import { ImageView, PdfView, SvgView, TexPreview, binaryKind, fromBase64, type BinaryKind } from './DocViewers'
+import { Minimap } from './Minimap'
+import { RunConfigDialog } from './RunConfig'
+import { Notebook } from './Notebook'
+import { PullRequests } from './PullRequests'
+import { bindings, comboOf } from './keymap'
+import { Chunk } from '@codemirror/merge'
+import { Text } from '@codemirror/state'
+import { PaneGrid, paneIds, removePane, singlePane, splitPane, zoneAt, zoneBox, type DropZone, type PaneLayout } from './Panes'
 import type { OpenOptions } from './Home'
 import { Explorer, PackagesPanel, Palette, SourceControl, isVirtual, symbolsFor, type PaletteItem } from './Panels'
 import { HostDialog, OpenRemoteDialog, RemotePanel, blankHost } from './Remote'
@@ -29,7 +39,7 @@ import { CanvasView, MiniCanvas } from './Canvas'
 import { Chat } from './Chat'
 import { DebugPanel, type DebugOp, type DebugSession, type DebugStop } from './Debug'
 import { TestsPanel, resultFor, testsIn, type TestReport, type TestResult } from './Tests'
-import { lspLanguage, startServer, toUri, type Server as LanguageServer } from './lsp'
+import { lspLanguage, startServer, toUri, workspaceSymbols, type Server as LanguageServer } from './lsp'
 import { type AgentHost, explain, keys, suggestCode } from './ai'
 import { Idle, useIdle } from './Idle'
 import { JournalSheet, useJournal } from './Journal'
@@ -44,7 +54,11 @@ import { Icon, IconButton, LayoutIcon, Menu, relativeTime, useSlider, type MenuE
 type Side = 'explorer' | 'search' | 'git' | 'packages' | 'remote'
 type Drawer = 'terminal' | 'output' | 'problems' | 'debug' | 'tests'
 type DocView = 'edit' | 'split' | 'preview'
-type Tab = { id: string; path: string; contents: string; saved: string; memory?: EditorMemory; diff?: Diff; staged?: boolean; line?: number; view?: DocView }
+type Tab = { id: string; path: string; contents: string; saved: string; memory?: EditorMemory; diff?: Diff; staged?: boolean; line?: number; view?: DocView; binary?: BinaryKind }
+type RightView = 'canvas' | 'chat' | 'minimap'
+type DropTarget = { kind: 'strip'; index: number; left: number; top: number; height: number } | { kind: 'pane'; pane: string; zone: DropZone; box: DOMRect }
+type TabDrag = { tab: string; x: number; y: number; target: DropTarget | null }
+const defaultDocView = (kind: DocKind): DocView => kind === 'tex' || kind === 'svg' ? 'split' : kind === 'notebook' ? 'preview' : 'edit'
 type Job = { id: string; kind: 'run' | 'git' | 'packages'; action: string; path?: string; detail?: string }
 type Edit = { time: number; line: number }
 type Islands = { side: Side | null; graph: boolean; drawer: boolean }
@@ -92,11 +106,14 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const remote = Boolean(workspace.remote)
   const [tabs, setTabs] = useState<Tab[]>([])
   const [selected, setSelected] = useState('')
-  // Split editor: a second pane beside the first. `pane` is the one being typed in; commands follow it.
-  const [splitId, setSplitId] = useState<string | null>(null)
-  const [splitLine, setSplitLine] = useState<number | undefined>(undefined)
-  const [splitRatio, setSplitRatio] = useState(0.5)
-  const [pane, setPane] = useState<'main' | 'side'>('main')
+  // Panes: the editor area holds any number. The focused pane shows `selected`; the others remember their own tab.
+  const [layout, setLayoutState] = useState<PaneLayout>(singlePane('p1'))
+  const [paneTabs, setPaneTabsState] = useState<Record<string, string | null>>({})
+  const [focused, setFocused] = useState('p1')
+  const [tabDrag, setTabDrag] = useState<TabDrag | null>(null)
+  const [binaries, setBinaries] = useState<Record<string, Uint8Array>>({})
+  const [texResults, setTexResults] = useState<Record<string, TexResult>>({})
+  const [texBusy, setTexBusy] = useState<string[]>([])
   const [cursor, setCursor] = useState<Cursor>({ line: 1, column: 1 })
   const [sidebar, setSidebar] = useState<Side | null>('explorer')
   const [lastSide, setLastSide] = useState<Side>('explorer')
@@ -129,7 +146,11 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const [jobReady, setJobReady] = useState(!desktop)
   const [gitBusy, setGitBusy] = useState(false)
   const [commit, setCommit] = useState('')
-  const [runArgs, setRunArgs] = useState<Record<string, string>>({})
+  // Run configurations, per file: program arguments and environment variables (kept for the project).
+  const runKey = 'still.runconfig.' + workspace.root
+  const [runArgs, setRunArgs] = useState<Record<string, string>>(() => { try { return JSON.parse(localStorage.getItem(runKey) ?? '{}').args ?? {} } catch { return {} } })
+  const [runEnv, setRunEnv] = useState<Record<string, string>>(() => { try { return JSON.parse(localStorage.getItem(runKey) ?? '{}').env ?? {} } catch { return {} } })
+  const [runConfig, setRunConfig] = useState<string | null>(null)
   const [palette, setPalette] = useState<string | null>(null)
   const [dialog, setDialog] = useState<DialogState | null>(null)
   const [menu, setMenu] = useState<MenuState | null>(null)
@@ -137,18 +158,39 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const [remoteHost, setRemoteHost] = useState<SshHost | null>(null)
   const [searchFocus, setSearchFocus] = useState(0)
   const [shot, setShot] = useState<CodeCapture | null>(null)
-  // Over SSH the graph reads many files, so it starts hidden there.
-  const [graphOpen, setGraphOpen] = useState(() => !workspace.remote && localStorage.getItem('still.island.graph') !== 'off' && window.innerWidth > 1180)
+  // The right bar is one island with views: the canvas, the assistant, and a minimap of the file.
+  // Over SSH the canvas reads many files, so the bar starts hidden there.
+  const [rightOpen, setRightOpen] = useState(() => {
+    const stored = localStorage.getItem('still.island.right')
+    if (stored) return stored === 'on' && (!workspace.remote || localStorage.getItem('still.island.rightView') !== 'canvas')
+    return localStorage.getItem('still.island.chat') === 'on' || (!workspace.remote && localStorage.getItem('still.island.graph') !== 'off' && window.innerWidth > 1180)
+  })
+  const [rightView, setRightView] = useState<RightView>(() => {
+    const stored = localStorage.getItem('still.island.rightView')
+    return stored === 'chat' || stored === 'minimap' || stored === 'canvas' ? stored : localStorage.getItem('still.island.chat') === 'on' ? 'chat' : 'canvas'
+  })
+  const [rightWidth, setRightWidth] = useState(() => Number(localStorage.getItem('still.island.rightWidth')) || 320)
+  const [chatEverOpen, setChatEverOpen] = useState(false)
+  const [viewport, setViewport] = useState<{ top: number; height: number; lines: number } | null>(null)
+  const graphOpen = rightOpen && rightView === 'canvas'
   const [focusMode, setFocusMode] = useState(false)
   const [focusOutput, setFocusOutput] = useState(false)
-  const [chatOpen, setChatOpen] = useState(() => localStorage.getItem('still.island.chat') === 'on')
+  const chatOpen = rightOpen && rightView === 'chat'
+  /** Shows a view in the right bar, or hides the bar when that view is already showing. */
+  function toggleRight(view: RightView, open?: boolean) {
+    const showing = rightOpen && rightView === view
+    const next = open ?? !showing
+    if (next) { setRightView(view); setRightOpen(true); if (view === 'chat') setChatEverOpen(true) } else if (showing) setRightOpen(false)
+  }
+  function setGraphOpen(next: boolean | ((value: boolean) => boolean)) { toggleRight('canvas', typeof next === 'function' ? next(graphOpen) : next) }
+  function setChatOpen(next: boolean | ((value: boolean) => boolean)) { toggleRight('chat', typeof next === 'function' ? next(chatOpen) : next) }
   const [chatFocus, setChatFocus] = useState(0)
   const [maximized, setMaximized] = useState<'editor' | 'side' | 'terminal' | null>(null)
   const [resizing, setResizing] = useState(false)
   const [overview, setOverview] = useState(false)
   const [graphView, setGraphView] = useState(false)
   // Fullscreen Files and Git (opened from the overview, like the journal and the canvas).
-  const [fullView, setFullView] = useState<'files' | 'git' | 'history' | null>(null)
+  const [fullView, setFullView] = useState<'files' | 'git' | 'history' | 'pulls' | null>(null)
   // History of one file: versions kept on each save (local) and the commits that changed it.
   const [historyFor, setHistoryFor] = useState<{ path: string; tab: 'local' | 'commits' } | null>(null)
   const [historyItems, setHistoryItems] = useState<{ local: { id: string; time: number; size: number }[]; commits: FileCommit[] }>({ local: [], commits: [] })
@@ -159,6 +201,8 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const [testsRunning, setTestsRunning] = useState(false)
   // Debugger: breakpoints per file (kept per project), watch expressions, and the running session.
   const [breakpoints, setBreakpoints] = useState<Record<string, number[]>>(() => { try { return JSON.parse(localStorage.getItem('still.breakpoints.' + workspace.root) ?? '{}') } catch { return {} } })
+  // Conditions and log messages for breakpoints, keyed "path:line".
+  const [breakpointOptions, setBreakpointOptions] = useState<Record<string, { condition?: string; log?: string }>>(() => { try { return JSON.parse(localStorage.getItem('still.breakpointOptions.' + workspace.root) ?? '{}') } catch { return {} } })
   const [watches, setWatches] = useState<string[]>(() => { try { return JSON.parse(localStorage.getItem('still.watches.' + workspace.root) ?? '[]') } catch { return [] } })
   const [debug, setDebug] = useState<DebugSession | null>(null)
   const debugRef = useRef<DebugSession | null>(null)
@@ -180,11 +224,15 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const editor = useRef<EditorHandle | null>(null)
   const terminal = useRef<Xterm | null>(null)
   const activeJob = useRef<Job | null>(null)
-  const latest = useRef({ tabs, selected, expanded, splitId })
-  latest.current = { tabs, selected, expanded, splitId }
-  const paneRef = useRef<'main' | 'side'>('main')
-  const handles = useRef<{ main: EditorHandle | null; side: EditorHandle | null }>({ main: null, side: null })
-  const splitHost = useRef<HTMLDivElement>(null)
+  const latest = useRef({ tabs, selected, expanded })
+  latest.current = { tabs, selected, expanded }
+  const focusedRef = useRef('p1')
+  const layoutRef = useRef<PaneLayout>(layout)
+  const paneTabsRef = useRef<Record<string, string | null>>({})
+  const handles = useRef<Record<string, EditorHandle | null>>({})
+  const paneCount = useRef(1)
+  const tabDragRef = useRef<TabDrag | null>(null)
+  const suppressTabClick = useRef(false)
   const saving = useRef(new Map<string, Promise<void>>())
   const opening = useRef(new Map<string, Promise<void>>())
   const pendingJump = useRef<{ path: string; line: number; column?: number; length?: number } | null>(null)
@@ -192,9 +240,11 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const returnedFocus = useRef<HTMLElement | null>(null)
   const pendingVenv = useRef(Boolean(initial?.venv))
 
-  const mainTab = tabs.find(tab => tab.id === selected)
-  const splitTab = splitId ? tabs.find(tab => tab.id === splitId) : undefined
-  const active = pane === 'side' && splitTab ? splitTab : mainTab
+  const active = tabs.find(tab => tab.id === selected)
+  const mainTab = active
+  const panes = paneIds(layout)
+  const tabOf = (pane: string) => pane === focused ? selected : paneTabs[pane] ?? null
+  const shownTabs = panes.map(pane => tabs.find(tab => tab.id === tabOf(pane))).filter((tab): tab is Tab => Boolean(tab))
   const mode = active ? language(active.path) : null
   const runnable = Boolean(active && !active.diff && mode && (remote ? remoteRunnable : localRunnable).includes(mode))
   const symbols = useMemo(() => active && !active.diff ? symbolsFor(active.contents, active.path) : [], [active?.path, active?.contents, active?.diff])
@@ -213,11 +263,16 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const actualDrawerHeight = Math.min(drawerHeight, drawerMax)
   const tabSize = settings.tabSize === 'auto' ? (active ? defaultIndent(active.path) : 4) : settings.tabSize
   const doc = mainTab && !mainTab.diff ? docKind(mainTab.path) : null
-  const docView: DocView = doc ? active?.view ?? 'edit' : 'edit'
+  const docView: DocView = doc ? active?.view ?? defaultDocView(doc) : 'edit'
   const editorOptions: EditorOptions = {
-    wrap: settings.wordWrap || Boolean(doc), lineNumbers: settings.lineNumbers, highlightLine: settings.highlightLine, tabSize, layout: settings.diffLayout, autocomplete: settings.autocomplete,
-    occurrences: settings.occurrences, whitespace: settings.whitespace, indentGuides: settings.indentGuides && !doc, closeBrackets: settings.closeBrackets, scrollPastEnd: settings.scrollPastEnd,
-    errors: settings.errors && !doc, changes: settings.gitGutter, cursorBlink: settings.cursorBlink, folding: settings.folding, blameColumn,
+    wrap: settings.wordWrap, lineNumbers: settings.lineNumbers, highlightLine: settings.highlightLine, tabSize, layout: settings.diffLayout, autocomplete: settings.autocomplete,
+    occurrences: settings.occurrences, whitespace: settings.whitespace, indentGuides: settings.indentGuides, closeBrackets: settings.closeBrackets, scrollPastEnd: settings.scrollPastEnd,
+    errors: settings.errors, changes: settings.gitGutter, cursorBlink: settings.cursorBlink, folding: settings.folding, blameColumn, constructors: settings.fillConstructors, sticky: settings.stickyScroll, inlayHints: settings.inlayHints,
+  }
+  // Prose (Markdown, text) wraps and skips indent guides and error checks.
+  const optionsFor = (tab: Tab): EditorOptions => {
+    const prose = !tab.diff && (docKind(tab.path) === 'markdown' || docKind(tab.path) === 'text')
+    return prose ? { ...editorOptions, wrap: true, indentGuides: false, errors: false } : editorOptions
   }
   const host = remote ? [...(servers?.saved ?? []), ...(servers?.imported ?? [])].find(item => item.id === workspace.remote) : undefined
 
@@ -239,8 +294,14 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   }, [active?.path, status, settings.gitGutter])
   useEffect(() => { if (live && live.path !== active?.path) setLive(null) }, [active?.path])
 
-  useEffect(() => { if (!remote) localStorage.setItem('still.island.graph', graphOpen ? 'on' : 'off') }, [graphOpen])
-  useEffect(() => { localStorage.setItem('still.island.chat', chatOpen ? 'on' : 'off') }, [chatOpen])
+  useEffect(() => {
+    try {
+      localStorage.setItem('still.island.right', rightOpen ? 'on' : 'off')
+      localStorage.setItem('still.island.rightView', rightView)
+      localStorage.setItem('still.island.rightWidth', String(rightWidth))
+    } catch { /* storage is optional */ }
+  }, [rightOpen, rightView, rightWidth])
+  useEffect(() => { if (chatOpen) setChatEverOpen(true) }, [chatOpen])
 
   // Count active minutes for today's numbers on the idle screen.
   useEffect(() => {
@@ -511,37 +572,142 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     return () => { cancelled = true; unsubscribe?.() }
   }, [])
 
-  function focusPane(which: 'main' | 'side') {
-    if (paneRef.current === which) return
-    paneRef.current = which
-    setPane(which)
-    editor.current = handles.current[which] ?? handles.current.main
+  function setLayout(next: PaneLayout) { layoutRef.current = next; setLayoutState(next) }
+  function setPaneTabs(next: Record<string, string | null>) { paneTabsRef.current = next; setPaneTabsState(next) }
+  /** Makes a pane the one in use: commands, the tab strip and the status bar follow it. */
+  function focusPane(pane: string) {
+    if (focusedRef.current === pane || !paneIds(layoutRef.current).includes(pane)) return
+    setPaneTabs({ ...paneTabsRef.current, [focusedRef.current]: latest.current.selected || null })
+    focusedRef.current = pane
+    setFocused(pane)
+    setSelected(paneTabsRef.current[pane] ?? '')
+    editor.current = handles.current[pane] ?? null
     // Problems follow the pane in use.
     editor.current?.command('lint')
   }
-  useEffect(() => { if (!splitTab && paneRef.current === 'side') focusPane('main') }, [splitTab])
-  function openToSide(tab: Tab | undefined = mainTab) {
-    if (!tab) return
-    setSplitLine(tab.id === selected ? cursor.line : tab.line)
-    setSplitId(tab.id)
-    requestAnimationFrame(() => requestAnimationFrame(() => { focusPane('side'); handles.current.side?.focus() }))
+  /** Shows a tab in a pane, or in a new pane at an edge or corner of it. */
+  function placeTab(tabId: string, pane: string, zone: DropZone) {
+    if (zone === 'center') {
+      if (pane === focusedRef.current) { setSelected(tabId); requestAnimationFrame(() => editor.current?.focus()); return }
+      setPaneTabs({ ...paneTabsRef.current, [pane]: tabId })
+      focusPane(pane)
+      requestAnimationFrame(() => requestAnimationFrame(() => handles.current[pane]?.focus()))
+      return
+    }
+    const id = 'p' + (++paneCount.current), empty = 'p' + (++paneCount.current)
+    const result = splitPane(layoutRef.current, pane, zone, id, empty)
+    setLayout(result.layout)
+    setPaneTabs({ ...paneTabsRef.current, [id]: tabId, ...(result.empty ? { [result.empty]: null } : {}) })
+    focusPane(id)
+    requestAnimationFrame(() => requestAnimationFrame(() => handles.current[id]?.focus()))
   }
-  function closeSplit() {
-    focusPane('main')
-    setSplitId(null)
-    requestAnimationFrame(() => handles.current.main?.focus())
+  function closePane(pane: string) {
+    const next = removePane(layoutRef.current, pane)
+    if (!next) return
+    const order = paneIds(layoutRef.current)
+    setLayout(next)
+    delete handles.current[pane]
+    const { [pane]: _gone, ...rest } = paneTabsRef.current
+    if (focusedRef.current === pane) {
+      const ids = paneIds(next)
+      const target = ids[Math.max(0, Math.min(order.indexOf(pane), ids.length - 1))]
+      focusedRef.current = target
+      setFocused(target)
+      setSelected(rest[target] ?? '')
+      editor.current = handles.current[target] ?? null
+      requestAnimationFrame(() => handles.current[target]?.focus())
+    }
+    setPaneTabs(rest)
   }
-  function toggleSplit() { if (splitTab) closeSplit(); else openToSide() }
-  function swapSplit() {
-    if (!splitTab || !mainTab) return
-    const main = mainTab.id
-    setSelected(splitTab.id)
-    setSplitId(main)
-    focusPane(paneRef.current === 'side' ? 'main' : 'side')
+  function splitRight(tab: Tab | undefined = active, zone: DropZone = 'right') { if (tab) placeTab(tab.id, focusedRef.current, zone) }
+  // A pane whose file was closed goes away (the pane in use moves on to another tab instead).
+  useEffect(() => {
+    const ids = new Set(tabs.map(tab => tab.id))
+    for (const pane of paneIds(layoutRef.current)) {
+      const tab = paneTabsRef.current[pane]
+      if (pane !== focusedRef.current && tab && !ids.has(tab)) closePane(pane)
+    }
+  }, [tabs])
+
+  // ---- Dragging tabs: along the strip to reorder, onto a pane to show or split ----
+  function dropTarget(x: number, y: number): DropTarget | null {
+    const element = document.elementFromPoint(x, y)
+    const strip = element?.closest('.tab-scroll')
+    if (strip) {
+      const items = [...strip.querySelectorAll<HTMLElement>('.tab')]
+      let index = items.findIndex(item => { const box = item.getBoundingClientRect(); return x < box.left + box.width / 2 })
+      if (index < 0) index = items.length
+      const box = (items[index] ?? items.at(-1))?.getBoundingClientRect()
+      const area = strip.getBoundingClientRect()
+      return { kind: 'strip', index, left: box ? (items[index] ? box.left : box.right) : area.left, top: area.top + 8, height: area.height - 16 }
+    }
+    const paneElement = element?.closest<HTMLElement>('[data-pane]')
+    if (paneElement?.dataset.pane) { const box = paneElement.getBoundingClientRect(); return { kind: 'pane', pane: paneElement.dataset.pane, zone: zoneAt(box, x, y), box } }
+    return null
+  }
+  function tabPointerDown(event: ReactPointerEvent, tab: Tab) {
+    if (event.button !== 0 || (event.target as Element).closest('.tab-close')) return
+    const start = { x: event.clientX, y: event.clientY }
+    let cancelled = false
+    const move = (next: PointerEvent) => {
+      if (cancelled) return
+      if (!tabDragRef.current && Math.hypot(next.clientX - start.x, next.clientY - start.y) < 6) return
+      const value = { tab: tab.id, x: next.clientX, y: next.clientY, target: dropTarget(next.clientX, next.clientY) }
+      tabDragRef.current = value
+      setTabDrag(value)
+    }
+    const finish = () => {
+      window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); window.removeEventListener('keydown', key, true)
+      const dropped = tabDragRef.current
+      tabDragRef.current = null
+      setTabDrag(null)
+      return dropped
+    }
+    const up = () => {
+      const dropped = finish()
+      if (!dropped || cancelled) return
+      suppressTabClick.current = true
+      setTimeout(() => { suppressTabClick.current = false }, 0)
+      const target = dropped.target
+      if (target?.kind === 'strip') {
+        setTabs(previous => {
+          const from = previous.findIndex(item => item.id === dropped.tab)
+          if (from < 0) return previous
+          const to = target.index > from ? target.index - 1 : target.index
+          const next = previous.slice()
+          const [moved] = next.splice(from, 1)
+          next.splice(to, 0, moved)
+          return next
+        })
+      } else if (target?.kind === 'pane') placeTab(dropped.tab, target.pane, target.zone)
+    }
+    const key = (next: KeyboardEvent) => { if (next.key === 'Escape') { next.preventDefault(); next.stopPropagation(); cancelled = true; finish() } }
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', up)
+    window.addEventListener('keydown', key, true)
   }
 
+  // ---- PDFs, images and LaTeX ----
+  useEffect(() => {
+    for (const tab of tabs) {
+      if (!tab.binary || binaries[tab.path]) continue
+      const path = tab.path
+      void fs.readBinary(path).then(data => setBinaries(previous => ({ ...previous, [path]: fromBase64(data) }))).catch(notify)
+    }
+  }, [tabs])
+  const texWorks = desktop && !remote
+  function compileTex(path: string) {
+    if (!texWorks) { setTexResults(previous => previous[path] ? previous : { ...previous, [path]: { pdf: null, engine: null, seconds: 0, errors: [], log: '' } }); return }
+    setTexBusy(previous => previous.includes(path) ? previous : [...previous, path])
+    // A failed compile keeps showing the last PDF that worked.
+    void tex.compile(workspace.root, path).then(result => setTexResults(previous => ({ ...previous, [path]: { ...result, pdf: result.pdf ?? previous[path]?.pdf ?? null } }))).catch(notify)
+      .finally(() => setTexBusy(previous => previous.filter(item => item !== path)))
+  }
+  // A LaTeX file shown with its preview is compiled when it first appears (and again on each save).
+  const texShown = shownTabs.filter(tab => !tab.diff && docKind(tab.path) === 'tex' && (tab.view ?? 'split') !== 'edit').map(tab => tab.path).join('|')
+  useEffect(() => { for (const path of texShown ? texShown.split('|') : []) if (!texResults[path] && !texBusy.includes(path)) compileTex(path) }, [texShown])
+
   function activate(path: string) {
-    focusPane('main')
     if (latest.current.selected === path) editor.current?.focus()
     else setSelected(path)
   }
@@ -563,9 +729,10 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       return
     }
     if (opening.current.has(path)) return opening.current.get(path)
-    const task = fs.read(path).then(contents => {
+    const binary = binaryKind(path)
+    const task = (binary ? Promise.resolve('') : fs.read(path)).then(contents => {
       if (generation.current !== id) return
-      setTabs(previous => previous.some(tab => tab.id === path) ? previous : [...previous, fileTab(path, contents)])
+      setTabs(previous => previous.some(tab => tab.id === path) ? previous : [...previous, binary ? { ...fileTab(path, ''), binary } : fileTab(path, contents)])
       activate(path)
       expandParents(path)
     }).catch(error => {
@@ -575,14 +742,10 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     return task
   }
 
-  function selectSideEditor(handle: EditorHandle | null) {
-    handles.current.side = handle
-    if (paneRef.current === 'side') editor.current = handle ?? handles.current.main
-  }
-
-  function selectEditor(handle: EditorHandle | null) {
-    handles.current.main = handle
-    if (paneRef.current === 'main' || !handles.current.side) editor.current = handle
+  function paneHandle(pane: string, handle: EditorHandle | null) {
+    handles.current[pane] = handle
+    if (focusedRef.current !== pane) return
+    editor.current = handle
     const jump = pendingJump.current
     if (handle && jump && jump.path === latest.current.selected) {
       pendingJump.current = null
@@ -591,10 +754,12 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   }
 
   function jumpTo(item: { path: string; line: number; column?: number; length?: number }) {
-    const side = latest.current.splitId ? latest.current.tabs.find(tab => tab.id === latest.current.splitId) : undefined
-    if (paneRef.current === 'side' && side?.path === item.path && !side.diff && handles.current.side) handles.current.side.jump(item.line, item.column, item.length)
-    else if (latest.current.selected === item.path) { focusPane('main'); handles.current.main?.jump(item.line, item.column, item.length) }
-    else { pendingJump.current = item; void openFile(item.path) }
+    const current = latest.current.tabs.find(tab => tab.id === latest.current.selected)
+    if (current && current.path === item.path && !current.diff && !current.binary) { editor.current?.jump(item.line, item.column, item.length); return }
+    const other = paneIds(layoutRef.current).find(pane => pane !== focusedRef.current && paneTabsRef.current[pane] === item.path)
+    if (other) { focusPane(other); requestAnimationFrame(() => handles.current[other]?.jump(item.line, item.column, item.length)); return }
+    pendingJump.current = item
+    void openFile(item.path)
   }
 
   useEffect(() => {
@@ -630,7 +795,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   }
 
   async function store(tab?: Tab) {
-    if (!tab || tab.diff) return
+    if (!tab || tab.diff || tab.binary) return
     const id = generation.current
     const key = tab.id
     const previousSave = saving.current.get(key)
@@ -661,6 +826,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       staleGraph()
       if (!remote && !workspace.sample) void history.save(workspace.root, current.path, current.contents).catch(() => {})
       tellServers([{ path: current.path, type: 'changed' }])
+      if (docKind(current.path) === 'tex') compileTex(current.path)
       const markSaved = (items: Tab[]) => items.map(item => item.id === current.id ? { ...item, saved: current.contents } : item)
       latest.current.tabs = markSaved(latest.current.tabs)
       setTabs(markSaved)
@@ -832,7 +998,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   // Blame for the active file (who last changed each line), refreshed after edits settle and after Git changes.
   const blameText = active && !active.diff ? active.contents : ''
   useEffect(() => {
-    if (!active || active.diff || remote || !desktop || (!settings.inlineBlame && !blameColumn) || !status.branch) { setBlame(null); return }
+    if (!active || active.diff || active.binary || remote || !desktop || (!settings.inlineBlame && !blameColumn) || !status.branch) { setBlame(null); return }
     const path = active.path, contents = active.contents
     let current = true
     const timer = setTimeout(() => { void history.blame(workspace.root, path, contents).then(lines => { if (current) setBlame({ path, lines }) }).catch(() => {}) }, 700)
@@ -927,11 +1093,15 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
         item('Sidebar', () => setSidebar(value => value ? null : lastSide), mod + '+B', { checked: Boolean(sidebar) }),
         ...sideItems.map(side => item(side.label, () => showSide(side.key), mod + '+' + side.keys, { checked: sidebar === side.key })),
         'separator',
+        item('Right bar', () => setRightOpen(value => !value), undefined, { checked: showRight }),
         item('Canvas', () => setGraphOpen(value => !value), mod + '+Shift+D', { checked: showGraph }),
-        item('Chat', toggleChat, mod + '+Shift+A', { checked: showChat }),
+        item('Assistant', toggleChat, mod + '+Shift+A', { checked: showChat }),
+        item('Minimap', () => toggleRight('minimap'), mod + '+Shift+Y', { checked: showRight && rightView === 'minimap' }),
         item('Terminal', () => drawerOpen ? setDrawerOpen(false) : showDrawer('terminal', true), mod + '+J', { checked: drawerOpen }),
         'separator',
-        item('Split editor', toggleSplit, mod + '+\\', { checked: Boolean(splitTab), disabled: !mainTab }),
+        item('Split editor right', () => splitRight(), mod + '+\\', { disabled: !active }),
+        item('Split editor down', () => splitRight(active, 'bottom'), undefined, { disabled: !active }),
+        item('Close this pane', () => closePane(focusedRef.current), undefined, { disabled: panes.length < 2 }),
         item('Focus mode', toggleFocus, mod + '+.'),
         item('Overview', openOverview, mod + '+↑'),
         item('Fullscreen editor', () => toggleMaximize('editor'), mod + '+Shift+M', { checked: maximized === 'editor' }),
@@ -953,7 +1123,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       ] },
       { label: 'Run', items: [
         item(active ? 'Run ' + fileName(active.path) : 'Run', () => { void run() }, mod + '+Enter', { disabled: !runnable || Boolean(job) }),
-        item('Run with arguments…', askArguments, undefined, { disabled: !runnable || Boolean(job) }),
+        item('Run configuration…', askArguments, undefined, { disabled: !runnable || Boolean(job) }),
         'separator',
         item('Run all tests', () => { void runTests(null) }, undefined, { disabled: Boolean(testsWhy) || Boolean(job) }),
         item('Run tests in this file', () => runTestsFrom('file'), undefined, { disabled: Boolean(testsWhy) || Boolean(job) || !active }),
@@ -975,6 +1145,11 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
         item('Pull', () => gitAction('pull')),
         item('Push', () => gitAction('push')),
         item('Fetch', () => gitAction('fetch')),
+        'separator',
+        item('Stash changes…', stashChanges, undefined, { disabled: !status.changes.length }),
+        item('Bring back the latest stash', () => { void runStash('pop') }),
+        item('Stashes…', () => { void showStashes() }),
+        item('Pull requests…', () => setFullView('pulls')),
       ] } as MenuEntry] : []),
       { label: 'Tools', items: [
         item('Create image of code', captureCode, undefined, { disabled: !active || Boolean(active.diff) }),
@@ -997,6 +1172,131 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     setMenu({ x: box.left, y: box.bottom + 6, items })
   }
 
+  // ---- Git: stashes, and staging or reverting one change from the gutter ----
+  async function runStash(action: 'push' | 'pop' | 'apply' | 'drop', index?: number, message?: string) {
+    try {
+      await api.stash(workspace.root, action, index, message)
+      notify(action === 'push' ? 'Changes stashed.' : action === 'drop' ? 'Stash dropped.' : 'Stash brought back.')
+      await refreshGit()
+      reloadFromDisk()
+    } catch (error) { notify(error) }
+  }
+  // Files changed on disk under the open tabs (another program, a script, Git): reload the tabs
+  // with no unsaved edits. Tabs you have edited keep your version.
+  function reloadFromDisk() {
+    for (const tab of latest.current.tabs) {
+      if (tab.diff || tab.binary || dirty(tab)) continue
+      void fs.read(tab.path).then(contents => {
+        if (contents !== tab.saved) setTabs(previous => previous.map(item => item.id === tab.id && !dirty(item) ? { ...item, contents, saved: contents } : item))
+      }).catch(() => {})
+    }
+  }
+  const reloadRef = useRef(reloadFromDisk)
+  reloadRef.current = reloadFromDisk
+  useEffect(() => {
+    // Coming back to Still after editing elsewhere picks up the changes (local projects; a remote
+    // one would mean a round trip per tab, so Refresh in Files does it there).
+    if (remote) return
+    const onFocus = () => reloadRef.current()
+    window.addEventListener('focus', onFocus)
+    return () => window.removeEventListener('focus', onFocus)
+  }, [])
+  function stashChanges() {
+    setDialog({ title: 'Stash changes', description: 'Puts your uncommitted changes (new files too) aside and leaves the working tree clean. Bring them back from Git → Stashes.', input: '', placeholder: 'Half-done login form', inputLabel: 'Note (optional)', label: 'Stash',
+      action: value => { void (async () => { await storeAll(); await runStash('push', undefined, value) })() } })
+  }
+  async function showStashes() {
+    try {
+      const list = await api.stash(workspace.root, 'list')
+      if (!list.length) { notify('No stashes.'); return }
+      setMenu({ x: Math.round(frame.width / 2) - 160, y: 120, items: list.slice(0, 12).map(entry => ({ label: (entry.message || 'stash@{' + entry.index + '}') + ' · ' + entry.when, items: [
+        { label: 'Apply and remove', action: () => { void runStash('pop', entry.index) } },
+        { label: 'Apply and keep', action: () => { void runStash('apply', entry.index) } },
+        { label: 'Drop', danger: true, action: () => { void runStash('drop', entry.index) } },
+      ] })) })
+    } catch (error) { notify(error) }
+  }
+  function changeMarkerMenu(tab: Tab, pane: string, line: number, event: MouseEvent) {
+    const base = heads[tab.path]
+    if (base === undefined || base === null) return
+    const a = Text.of(base.split('\n')), b = Text.of(tab.contents.split('\n'))
+    const lines = (doc: Text, from: number, to: number) => {
+      if (to <= from) return { start: doc.lineAt(Math.min(from, doc.length)).number, text: [] as string[] }
+      const first = doc.lineAt(from).number, last = doc.lineAt(Math.min(to - 1, doc.length)).number
+      return { start: first, text: Array.from({ length: last - first + 1 }, (_, index) => doc.line(first + index).text) }
+    }
+    const chunk = Chunk.build(a, b).find(item => {
+      const range = lines(b, item.fromB, item.toB)
+      return range.text.length ? line >= range.start && line < range.start + range.text.length : line === range.start || line === range.start - 1
+    })
+    if (!chunk) return
+    const old = lines(a, chunk.fromA, chunk.toA), now = lines(b, chunk.fromB, chunk.toB)
+    const header = `@@ -${old.text.length ? old.start : old.start - 1},${old.text.length} +${now.text.length ? now.start : now.start - 1},${now.text.length} @@`
+    const patch = `diff --git a/${tab.path} b/${tab.path}\n--- a/${tab.path}\n+++ b/${tab.path}\n${header}\n${old.text.map(text => '-' + text + '\n').join('')}${now.text.map(text => '+' + text + '\n').join('')}`
+    const what = !old.text.length ? 'added lines' : !now.text.length ? 'removed lines' : 'change'
+    setMenu({ x: event.clientX + 6, y: event.clientY, items: [
+      { label: 'Revert this ' + what, action: () => {
+        const reverted = b.sliceString(0, chunk.fromB) + a.sliceString(chunk.fromA, Math.min(chunk.toA, a.length)) + b.sliceString(Math.min(chunk.toB, b.length))
+        const handle = handles.current[pane]
+        if (handle) handle.replaceAll(reverted); else edited(tab, reverted)
+      } },
+      ...(!remote && desktop ? [{ label: 'Stage just this ' + what, action: () => { void (async () => {
+        try { await store(tab); await api.applyPatch(workspace.root, patch, true); notify('Staged.'); await refreshGit() }
+        catch (error) { notify("Couldn't stage that change by itself: " + String(error)) }
+      })() } }] : []),
+      ...(old.text.length ? [{ label: 'Copy the previous version', action: () => copyText(old.text.join('\n')) }] : []),
+    ] })
+  }
+
+  // ---- Shortcuts from the keymap (a preset and your own); checked before everything else ----
+  const keyHandlers: Record<string, () => void> = {
+    'palette.files': () => openPalette(''), 'palette.commands': () => openPalette('>'), 'palette.symbols': () => openPalette('#'),
+    save: () => { void store(active).catch(notify) }, close: () => { if (active) closeTab(active) },
+    'next-tab': () => { const index = tabs.findIndex(tab => tab.id === selected); if (tabs.length) activate(tabs[(index + 1) % tabs.length].id) },
+    'prev-tab': () => { const index = tabs.findIndex(tab => tab.id === selected); if (tabs.length) activate(tabs[(index - 1 + tabs.length) % tabs.length].id) },
+    split: () => splitRight(), run: () => { void run() }, debug: () => { void startDebug() }, tests: () => { void runTests(null) },
+    format: () => { void formatDocument() }, rename: () => { editor.current?.command('rename') }, definition: () => { void goToDefinition() },
+    references: () => { editor.current?.command('references') }, quickfix: () => { void showQuickFixes() }, 'goto-line': () => { editor.current?.command('gotoLine') },
+    comment: () => { editor.current?.command('comment') }, terminal: () => { if (drawerOpen) setDrawerOpen(false); else showDrawer('terminal', true) },
+    'side.files': () => showSide('explorer', true), 'side.search': () => showSide('search', true), 'side.git': () => { if (!remote) showSide('git', true) },
+    commit: () => { if (!remote) { showSide('git'); if (commit.trim()) gitAction('commit') } }, push: () => { if (!remote) gitAction('push') }, pull: () => { if (!remote) gitAction('pull') },
+    assistant: toggleChat, minimap: () => toggleRight('minimap'), focus: toggleFocus, overview: openOverview, home: goHome, settings: () => onSettings(),
+  }
+  const keyHandlersRef = useRef(keyHandlers)
+  keyHandlersRef.current = keyHandlers
+  const keyBindingKey = settings.keymap + JSON.stringify(settings.keybindings)
+  useEffect(() => {
+    const byCombo = new Map(Object.entries(bindings(settings.keymap, settings.keybindings)).map(([action, combo]) => [combo, action]))
+    if (!byCombo.size) return
+    const handle = (event: KeyboardEvent) => {
+      if (event.repeat || document.querySelector('.modal-backdrop, .settings-backdrop, .palette') || (event.target as Element | null)?.closest?.('.key-recorder, .nb')) return
+      const combo = comboOf(event)
+      const action = combo ? byCombo.get(combo) : undefined
+      if (!action || !keyHandlersRef.current[action]) return
+      event.preventDefault(); event.stopPropagation()
+      keyHandlersRef.current[action]()
+    }
+    window.addEventListener('keydown', handle, true)
+    return () => window.removeEventListener('keydown', handle, true)
+  }, [keyBindingKey])
+
+  /** Alt+Enter: the language server's fixes for this line, in a menu at the caret. */
+  async function showQuickFixes(at?: { x: number; y: number }) {
+    const handle = editor.current
+    if (!handle) return
+    const point = at ?? handle.caretPoint() ?? { x: 400, y: 300 }
+    let fixes: Awaited<ReturnType<EditorHandle['quickFixes']>> = null
+    try { fixes = await handle.quickFixes() } catch (error) { notify(error); return }
+    if (fixes === null) { notify(active && lspLanguage(active.path) ? 'Quick fixes come from a language server. Install one (Settings → Editor) to get them.' : 'No quick fixes for this kind of file.'); return }
+    if (!fixes.length) { notify('No quick fixes here.'); return }
+    setMenu({ x: point.x, y: point.y, items: fixes.slice(0, 14).map(fix => ({ label: fix.title, action: () => { void fix.run().catch(notify) } })) })
+  }
+  useEffect(() => {
+    const open = () => { void showQuickFixes() }
+    window.addEventListener('still-quick-fix', open)
+    return () => window.removeEventListener('still-quick-fix', open)
+  })
+
   function editorMenu(event: ReactMouseEvent) {
     if (!active) return
     const handle = editor.current
@@ -1012,7 +1312,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       'separator',
       ...(!readOnly ? [
         { label: 'Go to definition', shortcut: 'F12', disabled: !word, action: () => { void goToDefinition() } },
-        ...(hasServer ? [{ label: 'Find all references', shortcut: 'Shift+F12', disabled: !word, action: () => { handle?.command('references') } }] : []),
+        ...(hasServer ? [{ label: 'Find all references', shortcut: 'Shift+F12', disabled: !word, action: () => { handle?.command('references') } }, { label: 'Quick fix…', shortcut: 'Alt+Enter', action: () => { void showQuickFixes({ x: event.clientX, y: event.clientY }) } }] : []),
         { label: hasServer ? (word ? 'Rename “' + word.text.slice(0, 24) + '”' : 'Rename symbol') : word ? 'Rename “' + word.text.slice(0, 24) + '” in this file' : 'Rename in this file', shortcut: 'F2', disabled: !word, action: () => { handle?.command('rename') } },
         { label: 'Select next match', shortcut: mod + '+D', disabled: !word && !selectedText, action: () => { handle?.command('selectNext') } },
       ] : []),
@@ -1086,6 +1386,35 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   }
 
   useEffect(() => { try { localStorage.setItem('still.breakpoints.' + workspace.root, JSON.stringify(breakpoints)) } catch { /* ignore */ } }, [breakpoints])
+  useEffect(() => { try { localStorage.setItem('still.breakpointOptions.' + workspace.root, JSON.stringify(breakpointOptions)) } catch { /* ignore */ } }, [breakpointOptions])
+  useEffect(() => { try { localStorage.setItem(runKey, JSON.stringify({ args: runArgs, env: runEnv })) } catch { /* ignore */ } }, [runArgs, runEnv])
+  const breakpointItems = (lines: Record<string, number[]> = breakpoints, options = breakpointOptions) =>
+    Object.entries(lines).flatMap(([file, list]) => list.map(line => ({ file, line, ...options[file + ':' + line] })))
+  function breakpointMenu(path: string, line: number, event: MouseEvent) {
+    const key = path + ':' + line
+    const current = breakpointOptions[key] ?? {}
+    const has = (breakpoints[path] ?? []).includes(line)
+    const setOption = (next: { condition?: string; log?: string } | null) => {
+      const options = { ...breakpointOptions }
+      if (next && (next.condition || next.log)) options[key] = next; else delete options[key]
+      setBreakpointOptions(options)
+      const lines = has ? breakpoints : { ...breakpoints, [path]: [...(breakpoints[path] ?? []), line].sort((a, b) => a - b) }
+      if (!has) setBreakpoints(lines)
+      if (debugRef.current?.state === 'paused') debugSend({ op: 'breakpoints', items: breakpointItems(lines, options) })
+    }
+    setMenu({ x: event.clientX, y: event.clientY, items: [
+      { label: current.condition ? 'Edit condition…' : 'Stop only when…', action: () => setDialog({
+        title: 'Breakpoint condition', description: 'Stop on line ' + line + ' only when this expression is true.', input: current.condition ?? '', placeholder: 'count > 10', inputLabel: 'Condition', label: 'Set',
+        action: value => setOption({ condition: value.trim() || undefined }),
+      }) },
+      { label: current.log ? 'Edit log message…' : 'Log a message instead…', action: () => setDialog({
+        title: 'Logpoint', description: 'Print a message when line ' + line + ' runs, without stopping. Put expressions in braces.', input: current.log ?? '', placeholder: 'total is {total}', inputLabel: 'Message', label: 'Set',
+        action: value => setOption({ log: value.trim() || undefined }),
+      }) },
+      ...(current.condition || current.log ? [{ label: 'Make it a plain breakpoint', action: () => setOption(null) }] : []),
+      ...(has ? ['separator' as const, { label: 'Remove breakpoint', action: () => { setOption(null); changeBreakpoints(path, (breakpoints[path] ?? []).filter(item => item !== line)) } }] : []),
+    ] })
+  }
   useEffect(() => { try { localStorage.setItem('still.watches.' + workspace.root, JSON.stringify(watches)) } catch { /* ignore */ } }, [watches])
   useEffect(() => {
     if (!desktop) return
@@ -1109,9 +1438,9 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
  useEffect(() => {
     if (!desktop) return
     let stop: UnlistenFn | null = null, cancelled = false
-    void listen<{ id: string; tool: string; results: TestResult[] }>('test-results', ({ payload }) => {
+    void listen<{ id: string; tool: string; results: TestResult[]; coverage?: TestReport['coverage'] }>('test-results', ({ payload }) => {
       setTestsRunning(false)
-      setTestReport({ tool: payload.tool, results: payload.results, time: Date.now() })
+      setTestReport({ tool: payload.tool, results: payload.results, time: Date.now(), coverage: payload.coverage ?? null })
       setDrawer('tests'); setDrawerOpen(true)
     }).then(unlisten => { if (cancelled) unlisten(); else stop = unlisten })
     return () => { cancelled = true; stop?.() }
@@ -1133,20 +1462,22 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   }
   const editRef = useRef(editInBackground)
   editRef.current = editInBackground
-  const langServersOn = Boolean(settings.languageServers) && desktop && !remote
+  const langServersOn = Boolean(settings.languageServers) && desktop
   const langServersOnRef = useRef(langServersOn)
   langServersOnRef.current = langServersOn
-  const serverKey = [...new Set([mainTab, splitTab].map(tab => tab && !tab.diff ? lspLanguage(tab.path)?.server : undefined).filter(Boolean))].sort().join(',')
+  const serverKey = [...new Set(shownTabs.map(tab => !tab.diff && !tab.binary ? lspLanguage(tab.path)?.server : undefined).filter(Boolean))].sort().join(',')
   useEffect(() => {
     if (!langServersOn || !serverKey) return
     for (const language of serverKey.split(',')) {
       if (langServersRef.current[language]) continue
       langServersRef.current = { ...langServersRef.current, [language]: 'starting' }
       setLangServers(previous => ({ ...previous, [language]: 'starting' }))
-      const host = { root: workspace.root, open: async (path: string) => { await openRef.current(path) }, editFile: (path: string, edit: (text: string) => string) => editRef.current(path, edit), notify,
+      const host = { root: workspace.root, remote: workspace.remote ?? null, open: async (path: string) => { await openRef.current(path) }, editFile: (path: string, edit: (text: string) => string) => editRef.current(path, edit), notify,
         read: async (path: string) => latest.current.tabs.find(tab => tab.path === path && !tab.diff)?.contents ?? fs.read(path) }
       void startServer(host, language, log => {
         setLangServers(previous => ({ ...previous, [language]: 'none' }))
+        // On a server with no language server installed, just carry on without one.
+        if (log.includes('NOSERVER')) return
         const last = log.split('\n').map(line => line.trim()).filter(Boolean).at(-1)
         notify('The ' + language + ' language server stopped.' + (last ? ' ' + last.slice(0, 160) : '') + ' Click its name in the status bar to restart it.')
       }).then(server => {
@@ -1195,14 +1526,15 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const activeServer = activeServerLanguage ? langServers[activeServerLanguage] : undefined
 
   const testLanguage = mode === 'Java' || (!mode && files.some(file => file.path === 'pom.xml' || file.path.startsWith('build.gradle'))) ? 'java' : 'python'
-  const testsWhy = !desktop ? 'Tests run in the Still desktop app.' : remote ? 'Running tests works for local projects for now.' : undefined
+  const testsWhy = !desktop ? 'Tests run in the Still desktop app.' : remote && testLanguage !== 'python' ? 'On a server, Still runs Python tests (pytest) for now.' : undefined
   async function runTests(target: string | null, language = testLanguage) {
     if (testsWhy) { notify(testsWhy); return }
     if (activeJob.current) { notify('Wait for the current process to finish.'); return }
     if (active && dirty(active)) await store(active).catch(notify)
     await storeAll()
     setTestsRunning(true)
-    await launch('run', 'test', 'tests_run', { rootPath: workspace.root, target, language })
+    if (remote) await launch('run', 'test', 'ssh_tests_run', { hostId: workspace.remote, root: workspace.root, target })
+    else await launch('run', 'test', 'tests_run', { rootPath: workspace.root, target, language, dotenv: settings.loadDotEnv, coverage: settings.testCoverage && language === 'python' })
     setDrawer('tests'); setDrawerOpen(true)
     if (!activeJob.current) setTestsRunning(false)
   }
@@ -1231,9 +1563,9 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   async function startDebug() {
     if (!active || debugWhy || activeJob.current) { if (debugWhy) notify(debugWhy); return }
     await store(active)
-    const items = Object.entries(breakpoints).flatMap(([file, lines]) => lines.map(line => ({ file, line })))
+    const items = breakpointItems()
     putDebug({ id: '', state: 'starting', stop: null, evals: [] })
-    const options = { path: active.path, breakpoints: items, watches, stopOnEntry: false, args: runArgs[active.path] || null }
+    const options = { path: active.path, breakpoints: items, watches, stopOnEntry: false, args: runArgs[active.path] || null, env: runEnv[active.path] || null, dotenv: settings.loadDotEnv, pauseOn: settings.pauseOnExceptions }
     const started = remote
       ? launch('run', 'debug', 'ssh_debug_start', { ...options, hostId: workspace.remote, root: workspace.root }, { path: active.path })
       : launch('run', 'debug', 'debug_start', { ...options, rootPath: workspace.root }, { path: active.path })
@@ -1266,7 +1598,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       const next = { ...previous, [path]: [...new Set(lines)].sort((a, b) => a - b) }
       if (!next[path].length) delete next[path]
       // A running program learns about new breakpoints at once.
-      if (debugRef.current?.state === 'paused') debugSend({ op: 'breakpoints', items: Object.entries(next).flatMap(([file, items]) => items.map(line => ({ file, line }))) })
+      if (debugRef.current?.state === 'paused') debugSend({ op: 'breakpoints', items: breakpointItems(next) })
       return next
     })
   }
@@ -1279,6 +1611,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   useEffect(() => {
     const keys = (event: KeyboardEvent) => {
       if (event.shiftKey && event.altKey && !event.ctrlKey && !event.metaKey && event.code === 'KeyF' && !document.querySelector('.modal-backdrop, .settings-backdrop')) { event.preventDefault(); void formatDocument(); return }
+      if (event.altKey && !event.shiftKey && !event.ctrlKey && !event.metaKey && event.key === 'Enter' && (event.target as Element | null)?.closest?.('.cm-editor') && !(event.target as Element).closest('.nb') && !document.querySelector('.modal-backdrop, .settings-backdrop')) { event.preventDefault(); void showQuickFixes(); return }
       if (!/^F(5|9|10|11)$/.test(event.key) || event.ctrlKey || event.metaKey || event.altKey || document.querySelector('.modal-backdrop, .settings-backdrop')) return
       event.preventDefault()
       const current = debugRef.current
@@ -1310,7 +1643,9 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     }
   }
 
-  async function run(buildOnly = false) {
+  // `config` carries arguments and environment just saved in the run configuration, before the
+  // state holding them has re-rendered.
+  async function run(buildOnly = false, config?: { args: string; env: string }) {
     if (!active || !runnable || runningRequest || activeJob.current) return
     if (!desktop) {
       if (focusMode) setFocusOutput(true); else showDrawer('output')
@@ -1322,21 +1657,17 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     try {
       await store(active)
       setDiagnostics([])
-      const args = runArgs[active.path] || null
+      const args = (config ? config.args : runArgs[active.path]) || null
+      const env = (config ? config.env : runEnv[active.path]) || null
       if (remote) await launch('run', 'run', 'ssh_run', { hostId: workspace.remote, root: workspace.root, path: active.path, args }, { path: active.path })
-      else await launch('run', buildOnly ? 'build' : 'run', 'run_file', { rootPath: workspace.root, path: active.path, buildOnly, args }, { path: active.path })
+      else await launch('run', buildOnly ? 'build' : 'run', 'run_file', { rootPath: workspace.root, path: active.path, buildOnly, args, env, dotenv: settings.loadDotEnv }, { path: active.path })
     } catch (error) { notify(error) }
     finally { setRunningRequest(false) }
   }
 
   function askArguments() {
     if (!active || !runnable) return
-    const path = active.path
-    setDialog({
-      title: 'Run with arguments', description: 'Arguments for ' + fileName(path) + '. They are remembered for this file until you close the project.',
-      input: runArgs[path] ?? '', placeholder: '--verbose input.txt "two words"', inputLabel: 'Program arguments', label: 'Run',
-      action: value => { setRunArgs(previous => ({ ...previous, [path]: value })); setTimeout(() => { void run() }) },
-    })
+    setRunConfig(active.path)
   }
 
   async function updateStage(change: Change, index: boolean) {
@@ -1416,6 +1747,27 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       title: 'Remove ' + name + '?', description: 'This uninstalls the package from the active Python environment.', label: 'Remove package', danger: true, action: start,
     })
     else start()
+  }
+
+  /** Ctrl+T: symbols across the project. The language server knows them best; otherwise search for definitions. */
+  async function findSymbols(query: string): Promise<PaletteItem[]> {
+    if (!query) return []
+    const server = Object.values(langServersRef.current).find((value): value is LanguageServer => typeof value === 'object' && (!active || lspLanguage(active.path)?.server === value.language))
+      ?? Object.values(langServersRef.current).find((value): value is LanguageServer => typeof value === 'object')
+    if (server) {
+      try {
+        const found = await workspaceSymbols(server, workspace.root, query)
+        if (found.length) return found.map((item, index) => ({ id: 'symbol-' + index, label: item.name, detail: (item.container ? item.container + ' · ' : '') + item.path + ':' + item.line, path: item.path, action: () => jumpTo({ path: item.path, line: item.line, column: item.column }) }))
+      } catch { /* fall back to searching */ }
+    }
+    const name = query.replace(/[^\w$]/g, '')
+    if (!name) return []
+    const pattern = `\\b(def|class|function|interface|struct|enum|trait|fn|func|record|type|const|let|var)\\s+[\\w$]*${name}[\\w$]*|(public|private|protected|static)[\\w<>\\[\\], ?]*\\s+[\\w$]*${name}[\\w$]*\\s*\\(`
+    const result = await fs.search(pattern, { regex: true, caseSensitive: false, wholeWord: false })
+    return result.matches.slice(0, 60).map((match, index) => {
+      const symbol = new RegExp(`[\\w$]*${name}[\\w$]*`, 'i').exec(match.preview.trim())?.[0] ?? name
+      return { id: 'symbol-' + index, label: symbol, detail: match.path + ':' + match.line + ' · ' + match.preview.trim().slice(0, 60), path: match.path, action: () => jumpTo({ path: match.path, line: match.line, column: match.column }) }
+    })
   }
 
   function openPalette(query: string) {
@@ -1505,7 +1857,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
         update({ editorFontSize: key === '0' ? 14 : Math.max(9, Math.min(28, settings.editorFontSize + (key === '-' || key === '_' ? -1 : 1))) })
         return
       }
-      if (event.altKey || !(['k', 'p', 's', 'w', 'b', 'j', 'o', 'enter', 'tab', ',', 'arrowup', '.', '\\'].includes(key) || shiftOnly)) return
+      if (event.altKey || !(['k', 'p', 's', 'w', 'b', 'j', 'o', 't', 'enter', 'tab', ',', 'arrowup', '.', '\\'].includes(key) || shiftOnly)) return
       if ((overview || graphView) && !['k', 'p', '.'].includes(key)) return
       if (key === 'enter' && palette !== null) return
       event.preventDefault()
@@ -1514,7 +1866,8 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       if (key === 'tab') { cycleTab(event.shiftKey ? -1 : 1); return }
       if (key === 'arrowup') { openOverview(); return }
       if (key === '.') { toggleFocus(); return }
-      if (key === '\\' && !event.shiftKey) { toggleSplit(); return }
+      if (key === '\\' && !event.shiftKey) { splitRight(); return }
+      if (key === 't' && !event.shiftKey) { event.preventDefault(); openPalette('#'); return }
       if (key === 'v' && event.shiftKey) { cycleDocView(); return }
       // The island shortcuts toggle: press once to show, again to hide.
       if (key === 'f') { if (focusMode) setFocusMode(false); showSide('search', true) }
@@ -1523,6 +1876,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       if (key === 'u' && event.shiftKey && !remote) showSide('packages', true)
       if (key === 'r' && event.shiftKey) showSide('remote', true)
       if (key === 'd' && event.shiftKey) setGraphOpen(value => !value)
+      if (key === 'y' && event.shiftKey) toggleRight('minimap')
       if (key === 'm' && event.shiftKey) toggleMaximize()
       if (key === 'a' && event.shiftKey) toggleChat()
       if (key === 'h' && event.shiftKey) goHome()
@@ -1655,9 +2009,18 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const commands: PaletteItem[] = [
     { id: 'home', label: 'Go to Home', shortcut: mod + '+Shift+H', icon: House, action: goHome },
     { id: 'folder', label: 'Open folder', shortcut: mod + '+O', icon: FolderOpen, action: chooseFolder },
+    { id: 'symbols', label: 'Go to symbol in project', shortcut: mod + '+T', icon: Search, action: () => openPalette('#') },
+    ...(!remote ? [
+      { id: 'stash', label: 'Git: stash changes', icon: GitBranch, action: stashChanges },
+      { id: 'stash-pop', label: 'Git: bring back the latest stash', icon: GitBranch, action: () => { void runStash('pop') } },
+      { id: 'stashes', label: 'Git: stashes…', icon: GitBranch, action: () => { void showStashes() } },
+      { id: 'pulls', label: 'Git: pull requests', icon: GitBranch, action: () => setFullView('pulls') },
+    ] : []),
+    { id: 'run-config', label: 'Run configuration…', icon: Play, action: askArguments },
     { id: 'overview', label: 'Overview of everything', shortcut: mod + '+↑', icon: LayoutGrid, action: openOverview },
     { id: 'focus', label: focusMode ? 'Leave focus mode' : 'Focus mode', shortcut: mod + '+.', icon: Maximize2, action: toggleFocus },
-    ...(mainTab ? [{ id: 'split', label: splitTab ? 'Close the split editor' : 'Split editor: open this file to the side', shortcut: mod + '+\\', icon: Columns2, action: toggleSplit }] : []),
+    ...(active ? [{ id: 'split', label: 'Split editor right', shortcut: mod + '+\\', icon: Columns2, action: () => splitRight() }, { id: 'split-down', label: 'Split editor down', icon: Rows2, action: () => splitRight(active, 'bottom') }] : []),
+    ...(panes.length > 1 ? [{ id: 'close-pane', label: 'Close this pane', icon: X, action: () => closePane(focusedRef.current) }] : []),
     { id: 'graph-view', label: 'Open the canvas', icon: Network, action: () => setGraphView(true) },
     { id: 'graph-island', label: graphOpen ? 'Hide the canvas island' : 'Show the canvas island', icon: Network, action: () => setGraphOpen(value => !value) },
     { id: 'journal', label: 'Open journal', icon: BookOpen, action: () => setJournalOpen(true) },
@@ -1673,7 +2036,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       { id: 'run-args', label: 'Run active file with arguments…', icon: Play, action: askArguments },
       ...(!remote ? [{ id: 'build', label: mode === 'Java' ? 'Compile active file' : 'Check active file', shortcut: mod + '+Shift+Enter', icon: Hammer, action: () => { void run(true) } }] : []),
     ] : []),
-    ...(doc ? [{ id: 'doc-preview', label: docView === 'preview' ? 'Edit ' + (doc === 'markdown' ? 'Markdown' : 'text') : 'Preview ' + (doc === 'markdown' ? 'Markdown' : 'text') + ' file', shortcut: mod + '+Shift+V', icon: Eye, action: cycleDocView }] : []),
+    ...(doc ? [{ id: 'doc-preview', label: (docView === 'preview' ? 'Edit ' : 'Preview ') + ({ markdown: 'Markdown', text: 'text', tex: 'LaTeX', svg: 'SVG', notebook: 'notebook' } as const)[doc] + ' file', shortcut: mod + '+Shift+V', icon: Eye, action: cycleDocView }] : []),
     ...(active && !active.diff && docView !== 'preview' ? [{ id: 'code-image', label: 'Create image of selected code', icon: Camera, action: captureCode }] : []),
     { id: 'close-saved', label: 'Close saved tabs', icon: X, action: () => closeTabs(latest.current.tabs.filter(tab => !dirty(tab))) },
     { id: 'settings', label: 'Open settings', shortcut: mod + '+,', icon: Settings2, action: () => onSettings() },
@@ -1720,78 +2083,111 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     ...(!remote ? [{ key: 'git', label: 'Git', keys: 'Shift+G', glyph: GitBranch }, { key: 'packages', label: 'Packages', keys: 'Shift+U', glyph: Package }] : []),
     { key: 'remote', label: 'Servers', keys: 'Shift+R', glyph: Server },
   ]) as { key: Side; label: string; keys: string; glyph: typeof Files }[]
-  const testsFor = (tab: Tab | undefined) => tab && !tab.diff && desktop && !remote ? testsIn(tab.path, tab.contents).map(test => ({ ...test, status: resultFor(testReport, tab.path, test) })) : []
-  const mainTests = useMemo(() => testsFor(mainTab), [mainTab?.path, mainTab?.contents, mainTab?.diff, testReport])
-  const sideTests = useMemo(() => testsFor(splitTab), [splitTab?.path, splitTab?.contents, splitTab?.diff, testReport])
+  const testCache = useRef(new Map<string, { contents: string; report: TestReport | null; tests: { line: number; id: string; name: string; status?: string }[] }>())
+  const testsFor = (tab: Tab) => {
+    if (tab.diff || tab.binary || !desktop || (remote && !tab.path.endsWith('.py'))) return []
+    const cached = testCache.current.get(tab.id)
+    if (cached && cached.contents === tab.contents && cached.report === testReport) return cached.tests
+    const tests = testsIn(tab.path, tab.contents).map(test => ({ ...test, status: resultFor(testReport, tab.path, test) }))
+    testCache.current.set(tab.id, { contents: tab.contents, report: testReport, tests })
+    return tests
+  }
   // Ctrl+click and right-click can arrive before the pane they're in has become the current one,
   // so they run on the next tick, against what is current then.
   const later = useRef({ editorMenu, goToDefinition })
   later.current = { editorMenu, goToDefinition }
-  function paneProps(tab: Tab, which: 'main' | 'side') {
+  function paneProps(tab: Tab, pane: string) {
+    // Only one pane can keep a tab's editor state between visits: the first pane showing it.
+    const primary = panes.find(item => tabOf(item) === tab.id) === pane
     return {
-      path: tab.path, text: tab.contents, memory: which === 'main' ? tab.memory : undefined, diff: tab.diff, initialLine: which === 'main' ? tab.line : splitLine,
-      options: focusMode ? { ...editorOptions, lineNumbers: false, highlightLine: true } : editorOptions, diagnostics,
-      handle: which === 'main' ? selectEditor : selectSideEditor,
-      onFocus: () => focusPane(which),
-      onCursor: (next: Cursor) => { if (paneRef.current === which) setCursor(next) },
+      path: tab.path, text: tab.contents, memory: primary ? tab.memory : undefined, diff: tab.diff, initialLine: tab.line,
+      options: focusMode ? { ...optionsFor(tab), lineNumbers: false, highlightLine: true } : optionsFor(tab), diagnostics,
+      handle: (handle: EditorHandle | null) => paneHandle(pane, handle),
+      onFocus: () => focusPane(pane),
+      onViewport: (next: { top: number; height: number; lines: number }) => { if (focusedRef.current === pane) setViewport(next) },
+      onCursor: (next: Cursor) => { if (focusedRef.current === pane) setCursor(next) },
       onBlur: () => { if (settings.autoSave === 'blur') void store(latest.current.tabs.find(item => item.id === tab.id)).catch(notify) },
       onEdit: (contents: string) => edited(tab, contents),
       base: !tab.diff && !remote ? heads[tab.path] ?? null : null,
       check: desktop && !remote && !tab.diff && language(tab.path) === 'Python' ? (text: string) => editorSupport.checkPython(workspace.root, text, tab.path, settings.lintWithRuff) : undefined,
       onIssues: (issues: LiveIssue[]) => {
-        if (paneRef.current !== which) return
+        if (focusedRef.current !== pane) return
         const path = tab.path
         setLive(previous => previous && previous.path === path && JSON.stringify(previous.issues) === JSON.stringify(issues) ? previous : { path, issues })
       },
       onContextMenu: (event: ReactMouseEvent) => {
-        if (paneRef.current === which) { editorMenu(event); return }
-        focusPane(which)
+        if (focusedRef.current === pane) { editorMenu(event); return }
+        focusPane(pane)
         const { clientX, clientY } = event
         setTimeout(() => later.current.editorMenu({ clientX, clientY } as ReactMouseEvent))
       },
-      onDefinition: () => { focusPane(which); setTimeout(() => { void later.current.goToDefinition() }) },
+      onDefinition: () => { focusPane(pane); setTimeout(() => { void later.current.goToDefinition() }) },
       suggest: settings.aiComplete && !tab.diff ? suggestInline : undefined,
       breakpoints: breakpoints[tab.path] ?? [],
       onBreakpoints: (lines: number[]) => changeBreakpoints(tab.path, lines),
+      breakpointKinds: Object.fromEntries((breakpoints[tab.path] ?? []).flatMap((line): [number, 'condition' | 'log'][] => { const option = breakpointOptions[tab.path + ':' + line]; return option?.log ? [[line, 'log']] : option?.condition ? [[line, 'condition']] : [] })),
+      onBreakpointMenu: (line: number, event: MouseEvent) => breakpointMenu(tab.path, line, event),
+      onChangeMarker: (line: number, event: MouseEvent) => changeMarkerMenu(tab, pane, line, event),
+      coverage: testReport?.coverage?.[tab.path] ?? null,
       debugLine: debug?.state === 'paused' && debug.stop && debug.stop.frameFile === tab.path ? debug.stop.frameLine : null,
       blame: blame && blame.path === tab.path ? blame.lines : null,
-      tests: which === 'main' ? mainTests : sideTests,
+      tests: testsFor(tab),
       onRunTest: (id: string) => { void runTests(id, tab.path.endsWith('.java') ? 'java' : 'python') },
       server: serverOf(tab),
       serverUri: toUri(workspace.root, tab.path),
       blameMode: blameColumn ? 'all' as const : settings.inlineBlame ? 'line' as const : 'off' as const,
     }
   }
-  const editorProps = mainTab ? paneProps(mainTab, 'main') : null
-  const sideProps = splitTab ? paneProps(splitTab, 'side') : null
-  function dragSplit(event: React.PointerEvent<HTMLDivElement>) {
-    if (event.button !== 0) return
-    event.preventDefault()
-    const grip = event.currentTarget
-    grip.setPointerCapture(event.pointerId)
-    setResizing(true)
-    const move = (next: PointerEvent) => {
-      const box = splitHost.current?.getBoundingClientRect()
-      if (box) setSplitRatio(Math.max(0.2, Math.min(0.8, (next.clientX - box.left) / box.width)))
-    }
-    const up = () => { grip.removeEventListener('pointermove', move); grip.removeEventListener('pointerup', up); setResizing(false) }
-    grip.addEventListener('pointermove', move)
-    grip.addEventListener('pointerup', up)
+  const editorProps = active && !active.binary ? paneProps(active, focused) : null
+  function previewFor(kind: DocKind, tab: Tab, pane: string) {
+    if (kind === 'tex') return <TexPreview text={tab.contents} result={texResults[tab.path] ?? null} compiling={texBusy.includes(tab.path)}
+      onJump={line => { focusPane(pane); requestAnimationFrame(() => handles.current[pane]?.jump(line)) }} />
+    if (kind === 'svg') return <SvgView text={tab.contents} />
+    return <Preview text={tab.contents} kind={kind} onLink={openLink} />
+  }
+  function paneContent(tab: Tab, pane: string) {
+    if (tab.binary === 'pdf') return <PdfView data={binaries[tab.path] ?? null} label={fileName(tab.path)} />
+    if (tab.binary === 'image') return <ImageView data={binaries[tab.path] ?? null} path={tab.path} />
+    const props = paneProps(tab, pane)
+    const kind = tab.diff ? null : docKind(tab.path)
+    const view = kind ? tab.view ?? defaultDocView(kind) : 'edit'
+    if (!kind || view === 'edit') return <Editor {...props} />
+    if (kind === 'notebook') return <Notebook key={tab.id + pane} text={tab.contents} path={tab.path} rootPath={workspace.root} canRun={desktop && !remote}
+      why={!desktop ? 'Running cells works in the Still desktop app.' : 'Running cells works for local projects for now.'} onChange={text => edited(tab, text)} />
+    return <div className={'doc-split' + (view === 'preview' ? ' preview-only' : '')}>
+      {view === 'split' && <div className="doc-pane"><Editor {...props} /></div>}
+      <div className="doc-pane doc-pane-preview">{previewFor(kind, tab, pane)}</div>
+    </div>
+  }
+  function renderPane(pane: string) {
+    const tab = tabs.find(item => item.id === tabOf(pane))
+    const many = panes.length > 1
+    return <div key={pane} data-pane={pane} className={'pane' + (pane === focused ? ' is-current' : '') + (many ? ' has-head' : '')} onMouseDown={() => focusPane(pane)}>
+      {many && <div className="pane-head">
+        <span className="pane-name" title={tab?.path}>{tab ? fileName(tab.path) + (tab.diff ? ' · diff' : '') : 'Empty pane'}{tab && dirty(tab) && <i className="split-dot" aria-label="unsaved" />}</span>
+        <IconButton glyph={X} label="Close pane" onClick={event => { event.stopPropagation(); closePane(pane) }} />
+      </div>}
+      <div className="pane-body">{tab ? paneContent(tab, pane) : <div className="pane-empty">
+        <p>Drag a tab here, or choose a file.</p>
+        <div className="pane-empty-list">{tabs.filter(item => !item.diff).slice(0, 8).map(item => <button key={item.id} onClick={() => placeTab(item.id, pane, 'center')}>{fileName(item.path)}<span>{parentPath(item.path)}</span></button>)}</div>
+        <button className="text-btn" onClick={() => openPalette('')}>Find a file… <kbd>{mod}+P</kbd></button>
+      </div>}</div>
+    </div>
   }
   // On narrow windows the graph island steps aside on its own; the setting is kept for when there is room again.
-  const showChat = chatOpen && frame.width >= 760
-  const showGraph = graphOpen && frame.width >= (showChat ? 1560 : 1080)
+  const showRight = rightOpen && frame.width >= 900
+  const showChat = showRight && rightView === 'chat'
+  const showGraph = showRight && rightView === 'canvas'
   // The grid always has the same tracks (sidebar, editor, canvas, chat × editor, drawer); a hidden island's track
   // is 0px. Keeping the track count fixed lets the browser animate the widths, so islands slide in and out.
   const gap = frame.width <= 720 ? 12 : 20
-  const chatWidth = frame.width < 1100 ? 320 : 380
+  const rightTrack = Math.min(rightWidth, Math.max(260, frame.width * 0.4))
   const sideTrack = sidebar && (!maximized || maximized === 'side') ? workspaceWidth + gap : 0
   const columns = maximized === 'side' ? 'minmax(0, 1fr) 0px 0px 0px'
-    : [sideTrack + 'px', 'minmax(0, 1fr)', (showGraph && !maximized ? 272 + gap : 0) + 'px', (showChat && !maximized ? chatWidth + gap : 0) + 'px'].join(' ')
+    : [sideTrack + 'px', 'minmax(0, 1fr)', (showRight && !maximized ? rightTrack + gap : 0) + 'px', '0px'].join(' ')
   const rows = maximized === 'terminal' ? '0px minmax(0, 1fr)' : 'minmax(0, 1fr) ' + (drawerOpen && !maximized ? actualDrawerHeight + gap : 0) + 'px'
   const sideMounted = usePresence(Boolean(sidebar))
-  const graphMounted = usePresence(showGraph)
-  const chatMounted = usePresence(showChat)
+  const rightMounted = usePresence(showRight)
   const shownSide: Side = sidebar ?? lastSide
   const drawerMounted = usePresence(drawerOpen)
   const idleShown = usePresence(idle, 520)
@@ -1880,10 +2276,8 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
               data-tip={(sidebar ? 'Hide' : 'Show') + ' sidebar · ' + mod + '+B'} aria-label="Sidebar"><LayoutIcon part="left" on={Boolean(sidebar)} />{status.changes.length > 0 && !remote && !sidebar && <i className="toggle-dot" />}</button>
             <button aria-pressed={drawerOpen} className={drawerOpen ? 'is-on' : ''} onClick={() => drawerOpen ? setDrawerOpen(false) : showDrawer('terminal', true)}
               data-tip={(drawerOpen ? 'Hide' : 'Show') + ' terminal and output · ' + mod + '+J'} aria-label="Terminal"><LayoutIcon part="bottom" on={drawerOpen} /></button>
-            <button aria-pressed={graphOpen} className={graphOpen ? 'is-on' : ''} onClick={() => setGraphOpen(value => !value)}
-              data-tip={(graphOpen ? 'Hide' : 'Show') + ' canvas · ' + mod + '+Shift+D'} aria-label="Canvas"><LayoutIcon part="canvas" on={showGraph} /></button>
-            <button aria-pressed={showChat} className={showChat ? 'is-on' : ''} onClick={toggleChat}
-              data-tip={(showChat ? 'Hide' : 'Show') + ' chat · ' + mod + '+Shift+A'} aria-label="Chat"><LayoutIcon part="right" on={showChat} /></button>
+            <button aria-pressed={showRight} className={showRight ? 'is-on' : ''} onClick={() => { if (focusMode) setFocusMode(false); setRightOpen(value => !value) }}
+              data-tip={(showRight ? 'Hide' : 'Show') + ' the right bar (canvas, assistant, minimap)'} aria-label="Right bar"><LayoutIcon part="right" on={showRight} /></button>
             <span className="nav-rule" />
             <button onClick={toggleFocus} data-tip={'Focus: only the code · ' + mod + '+.'} aria-label="Focus"><LayoutIcon part="focus" on={false} /></button>
             <button onClick={openOverview} data-tip={'Overview · ' + mod + '+↑'} aria-label="Overview"><LayoutIcon part="overview" on={false} /></button>
@@ -1919,7 +2313,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
         <div className="side-body" key={'side-' + shownSide}>
         {shownSide === 'explorer' && <Explorer workspace={workspace} directories={directories} expanded={expanded} active={active?.path} changes={status} symbols={symbols}
           onOpen={path => { void openFile(path) }} onExpand={toggleFolder} onNew={() => newFile()} onNewFolder={() => newFolder()} onWorkspace={chooseFolder}
-          onRefresh={() => { void refreshFiles() }} onJump={line => editor.current?.jump(line)} onContext={explorerMenu} onKey={explorerKey} />}
+          onRefresh={() => { void refreshFiles(); reloadFromDisk() }} onJump={line => editor.current?.jump(line)} onContext={explorerMenu} onKey={explorerKey} />}
         {shownSide === 'search' && <SearchPanel search={fs.search} remote={remote} focusKey={searchFocus} seed={searchSeed} onOpen={(path, line, column, length) => jumpTo({ path, line, column, length })} />}
         {shownSide === 'git' && <SourceControl status={status} busy={Boolean(job) || gitBusy} error={gitError} commit={commit} log={log} onCommitText={setCommit}
           onDiff={(change, index) => { void openDiff(change, index) }} onStage={(change, index) => { void updateStage(change, index) }} onAction={gitAction}
@@ -1937,20 +2331,22 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       <main className="island main">
         <div className="tab-strip" onDoubleClick={event => { if (event.target === event.currentTarget || (event.target as Element).classList.contains('tab-scroll')) toggleMaximize('editor') }}>
           <div className="tab-scroll" role="tablist" aria-label="Open files" ref={tabSlider.ref}>
-            {tabs.map((tab, index) => <div key={tab.id} className={'tab' + (tab.id === selected ? ' is-active' : '')} data-slide={tab.id === selected ? '' : undefined}
+            {tabs.map((tab, index) => <div key={tab.id} className={'tab' + (tab.id === selected ? ' is-active' : '') + (tabDrag?.tab === tab.id ? ' is-dragging' : '') + (shownTabs.includes(tab) && tab.id !== selected ? ' is-shown' : '')} data-slide={tab.id === selected ? '' : undefined}
+              onPointerDown={event => tabPointerDown(event, tab)}
               onAuxClick={event => { if (event.button === 1) closeTab(tab) }}
               onContextMenu={event => { event.preventDefault(); setMenu({ x: event.clientX, y: event.clientY, items: [
                 { label: 'Close', icon: X, shortcut: mod + '+W', action: () => closeTab(tab) },
                 { label: 'Close others', action: () => { const others = tabs.filter(item => item.id !== tab.id); if (others.some(dirty)) askDiscard('Close other tabs?', 'Some have unsaved changes.', () => closeTabs(others)); else closeTabs(others) } },
                 { label: 'Close saved tabs', action: () => closeTabs(tabs.filter(item => !dirty(item))) },
                 'separator',
-                { label: 'Open to the side', icon: Columns2, shortcut: tab.id === selected ? mod + '+\\' : undefined, action: () => openToSide(tab) },
+                { label: 'Open to the side', icon: Columns2, shortcut: tab.id === selected ? mod + '+\\' : undefined, action: () => splitRight(tab) },
+                { label: 'Open below', icon: Rows2, action: () => splitRight(tab, 'bottom') },
                 ...(!remote && desktop && !tab.diff ? [{ label: 'History of this file…', action: () => openHistory(tab.path) }] : []),
                 { label: 'Copy relative path', icon: Copy, action: () => copyText(tab.path) },
                 ...(desktop && !remote ? [{ label: 'Reveal in file manager', icon: FolderSearch, action: () => { void home.reveal(absolute(parentPath(tab.path))).catch(notify) } }] : []),
               ] }) }}>
               <button role="tab" type="button" id={'file-tab-' + index} aria-controls="editor-panel" aria-selected={tab.id === selected} className="tab-select"
-                title={tab.path} onClick={() => activate(tab.id)}
+                title={tab.path} onClick={() => { if (!suppressTabClick.current) activate(tab.id) }}
                 onKeyDown={event => {
                   if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return
                   event.preventDefault()
@@ -1985,27 +2381,14 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
         </div>
 
         <section className="editor-wrap" id="editor-panel" role="tabpanel" aria-labelledby={active ? 'file-tab-' + tabs.indexOf(active) : undefined}>
-          {mainTab && editorProps ? (() => {
-            const mainView = doc && docView !== 'edit'
-              ? <div className={'doc-split' + (docView === 'preview' ? ' preview-only' : '')}>
-                  {docView === 'split' && <div className="doc-pane"><Editor {...editorProps} /></div>}
-                  <div className="doc-pane doc-pane-preview"><Preview text={mainTab.contents} kind={doc} onLink={openLink} /></div>
-                </div>
-              : <Editor {...editorProps} />
-            if (!splitTab || !sideProps) return mainView
-            return <div className="split-editors" ref={splitHost} style={{ gridTemplateColumns: `minmax(0, ${splitRatio}fr) 1px minmax(0, ${1 - splitRatio}fr)` }}>
-              <div className={'split-pane' + (pane === 'main' ? ' is-current' : '')} onMouseDown={() => focusPane('main')}>{mainView}</div>
-              <div className="split-grip" role="separator" aria-orientation="vertical" aria-label="Resize split" onPointerDown={dragSplit} onDoubleClick={() => setSplitRatio(0.5)} />
-              <div className={'split-pane is-side' + (pane === 'side' ? ' is-current' : '')}>
-                <div className="split-head">
-                  <span className="split-name" title={splitTab.path}>{fileName(splitTab.path)}{splitTab.diff ? ' · diff' : ''}{dirty(splitTab) && <i className="split-dot" aria-label="unsaved" />}</span>
-                  <IconButton glyph={ArrowLeftRight} label="Swap sides" onClick={swapSplit} />
-                  <IconButton glyph={X} label={'Close split (' + mod + '+\\)'} onClick={closeSplit} />
-                </div>
-                <div className="split-body"><Editor key={'side:' + splitTab.id} {...sideProps} /></div>
-              </div>
-            </div>
-          })() : <div className="empty-editor">
+          {tabDrag && <div className="tab-drag-layer" aria-hidden="true">
+            {tabDrag.target?.kind === 'pane' && <div className="drop-preview" style={{ left: tabDrag.target.box.left, top: tabDrag.target.box.top, width: tabDrag.target.box.width, height: tabDrag.target.box.height }}>
+              <i style={zoneBox(tabDrag.target.zone)} />
+            </div>}
+            {tabDrag.target?.kind === 'strip' && <div className="drop-caret" style={{ left: tabDrag.target.left - 1, top: tabDrag.target.top, height: tabDrag.target.height }} />}
+            <div className="tab-ghost" style={{ transform: `translate(${tabDrag.x + 14}px, ${tabDrag.y + 12}px)` }}>{fileName(tabs.find(tab => tab.id === tabDrag.tab)?.path ?? '')}</div>
+          </div>}
+          {active || panes.length > 1 ? <PaneGrid layout={layout} renderPane={renderPane} onLayout={setLayout} onResizing={setResizing} /> : <div className="empty-editor" data-pane={focused}>
             <div className="empty-inner">
               <p className="empty-title">{workspace.name}</p>
               <div className="empty-keys">
@@ -2022,16 +2405,24 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
         </section>
       </main>
 
-      <div className={'slot slot-graph' + (showGraph && !maximized ? ' is-open' : '')} aria-hidden={!showGraph || undefined}>
-      {graphMounted && <aside className="island graph-island" aria-label="Canvas island" inert={!showGraph || undefined}>
-        <MiniCanvas graph={graph} root={workspace.root} active={active && !active.diff ? active.path : undefined} onOpen={path => { void openFile(path) }} onExpand={() => setGraphView(true)} />
-      </aside>}
-      </div>
-
-      <div className={'slot slot-chat' + (showChat && !maximized ? ' is-open' : '')} aria-hidden={!showChat || undefined}>
-      {chatMounted && <aside className="island chat-island" style={{ width: chatWidth }} aria-label="Chat island" inert={!showChat || undefined}>
-        <Chat settings={{ provider: settings.aiProvider, model: settings.aiModel, effort: settings.aiEffort, ollamaUrl: settings.ollamaUrl, ollamaModel: settings.ollamaModel, githubModel: settings.githubModel, autoApproveEdits: settings.aiAutoApprove }}
-          host={agentHost} projectKey={(workspace.remote ?? '') + workspace.root} focusKey={chatFocus} onSettings={() => onSettings('ai')} onClose={() => setChatOpen(false)} />
+      <div className={'slot slot-right' + (showRight && !maximized ? ' is-open' : '')} aria-hidden={!showRight || undefined}>
+      {rightMounted && <aside className="island right-island" style={{ width: rightTrack }} aria-label="Right bar" inert={!showRight || undefined}>
+        <SplitGrip vertical value={-rightTrack} min={-Math.min(640, frame.width * 0.5)} max={-260} change={value => setRightWidth(Math.round(-value))} onActive={setResizing} />
+        <nav className="right-views" role="tablist" aria-label="Right bar">
+          {([['canvas', 'Canvas', Network], ['chat', 'Assistant', Sparkles], ['minimap', 'Minimap', AlignLeft]] as const).map(([key, label, glyph]) =>
+            <button key={key} role="tab" aria-selected={rightView === key} className={rightView === key ? 'is-active' : ''} onClick={() => toggleRight(key, true)}><Icon glyph={glyph} size={13} />{label}</button>)}
+          <span className="flex-1" />
+          <IconButton glyph={X} label="Hide the right bar" onClick={() => setRightOpen(false)} />
+        </nav>
+        <div className="right-body">
+          {rightView === 'canvas' && <MiniCanvas graph={graph} root={workspace.root} active={active && !active.diff ? active.path : undefined} onOpen={path => { void openFile(path) }} onExpand={() => setGraphView(true)} />}
+          {(chatEverOpen || rightView === 'chat') && <div className="right-chat" hidden={rightView !== 'chat'}>
+            <Chat settings={{ provider: settings.aiProvider, model: settings.aiModel, effort: settings.aiEffort, ollamaUrl: settings.ollamaUrl, ollamaModel: settings.ollamaModel, githubModel: settings.githubModel, autoApproveEdits: settings.aiAutoApprove }}
+              host={agentHost} projectKey={(workspace.remote ?? '') + workspace.root} focusKey={chatFocus} onSettings={() => onSettings('ai')} onClose={() => setRightOpen(false)} />
+          </div>}
+          {rightView === 'minimap' && <Minimap path={active && !active.binary ? active.path : null} text={active && !active.binary ? active.diff?.after ?? active.contents : ''} viewport={viewport}
+            onScroll={fraction => editor.current?.scrollTo(fraction)} />}
+        </div>
       </aside>}
       </div>
 
@@ -2075,7 +2466,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
           {drawer === 'output' && <Output entries={output} sample={sampleRun}
             onInput={job?.kind === 'run' ? text => { void invoke('job_input', { id: job.id, text }).catch(notify) } : undefined} />}
           {drawer === 'problems' && <Problems items={problems} jump={jumpTo} />}
-          {drawer === 'tests' && <TestsPanel report={testReport} running={testsRunning} canRun={!testsWhy && !job} why={testsWhy} onRun={runTestsFrom} onJump={jumpToTest} />}
+          {drawer === 'tests' && <TestsPanel report={testReport} running={testsRunning} canRun={!testsWhy && !job} why={testsWhy} onRun={runTestsFrom} onJump={jumpToTest} coverage={settings.testCoverage} onCoverage={value => update({ testCoverage: value })} />}
           {drawer === 'debug' && <DebugPanel session={debug} canDebug={!debugWhy && Boolean(active) && !job} why={debugWhy} breakpointCount={Object.values(breakpoints).reduce((sum, lines) => sum + lines.length, 0)}
             watches={watches} onStart={() => { void startDebug() }} onCommand={debugCommand} onFrame={index => debugSend({ op: 'frame', index })}
             onEval={expression => debugSend({ op: 'eval', expression })} onWatches={changeWatches} onJump={(file, line) => jumpTo({ path: file, line })}
@@ -2120,7 +2511,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       <div className="flex-1" />
       {active && <><span className="status-item">Ln {cursor.line}, Col {cursor.column}{cursor.selected ? ` (${cursor.selected} selected)` : ''}</span>
         <button className="status-item status-optional" onClick={() => onSettings('editor')} title="Indentation settings">Spaces: {tabSize}</button>
-        <span className="status-item status-language">{mode}</span>
+        <span className="status-item status-language">{active.binary === 'pdf' ? 'PDF' : active.binary === 'image' ? 'Image' : mode}</span>
         {activeServerLanguage && activeServer && activeServer !== 'none' && <button className="status-item status-optional" title={typeof activeServer === 'object' ? activeServer.name + ' is running. Click to restart it.' : 'Starting the language server…'}
           onClick={() => restartServer(activeServerLanguage)}><span className={'status-dot' + (activeServer === 'starting' ? ' busy' : '')} />{typeof activeServer === 'object' ? activeServer.name : 'Starting…'}</button>}</>}
       {!remote && <button className="status-item" title="Show runtimes and packages" onClick={() => showSide('packages')}>
@@ -2159,11 +2550,14 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
         </> : <p className="full-empty">Choose a version to compare it with the file as it is now.</p>}
       </div>
     </FullView>}
+    {fullView === 'pulls' && <FullView title="Pull requests" project={workspace.name} onClose={() => { setFullView(null); requestAnimationFrame(() => editor.current?.focus()) }}>
+      <PullRequests rootPath={workspace.root} notify={notify} onLink={openLink} onCheckedOut={() => { void refreshGit(); void refreshFiles() }} />
+    </FullView>}
     {fullView === 'files' && <FullView title="Files" project={workspace.name} onClose={() => { setFullView(null); requestAnimationFrame(() => editor.current?.focus()) }}>
       <div className="full-side island side">
         <Explorer workspace={workspace} directories={directories} expanded={expanded} active={filePreview?.path ?? active?.path} changes={status} symbols={[]}
           onOpen={path => { void fs.read(path).then(text => setFilePreview({ path, text })).catch(notify) }} onExpand={toggleFolder} onNew={() => newFile()} onNewFolder={() => newFolder()} onWorkspace={chooseFolder}
-          onRefresh={() => { void refreshFiles() }} onJump={() => {}} onContext={explorerMenu} onKey={explorerKey} />
+          onRefresh={() => { void refreshFiles(); reloadFromDisk() }} onJump={() => {}} onContext={explorerMenu} onKey={explorerKey} />
       </div>
       <div className="full-main">
         {filePreview ? <>
@@ -2191,8 +2585,16 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     {graphView && <CanvasView graph={graph} error={graphError} root={workspace.root} project={workspace.name} active={active && !active.diff ? active.path : undefined} changed={changedPaths}
       onOpen={path => { setGraphView(false); void openFile(path) }} onClose={() => { setGraphView(false); requestAnimationFrame(() => editor.current?.focus()) }} />}
     {idleShown && <Idle leaving={!idle} sources={tabs.filter(tab => !tab.diff).map(tab => ({ path: tab.path, project: workspace.name, text: tab.contents, edited: edits[tab.path]?.at(-1)?.time }))} onWake={wake} />}
-    {palette !== null && <Palette commands={commands} files={fileItems} start={palette} onClose={closePalette} />}
+    {palette !== null && <Palette commands={commands} files={fileItems} start={palette} onClose={closePalette} symbols={findSymbols} />}
     {dialog && <Dialog dialog={dialog} close={() => setDialog(null)} />}
+    {runConfig && <RunConfigDialog file={fileName(runConfig)} args={runArgs[runConfig] ?? ''} env={runEnv[runConfig] ?? ''} dotenv={settings.loadDotEnv} onClose={() => setRunConfig(null)}
+      onSave={(args, env, andRun) => {
+        const path = runConfig
+        setRunArgs(previous => ({ ...previous, [path]: args }))
+        setRunEnv(previous => ({ ...previous, [path]: env }))
+        setRunConfig(null)
+        if (andRun && active?.path === path) void run(false, { args, env })
+      }} />}
     {menu && <Menu {...menu} onClose={() => setMenu(null)} />}
     {journalOpen && <JournalSheet root={workspace.root} onClose={() => setJournalOpen(false)}
       onOpen={entry => { if (entry.root === workspace.root && entry.path) { setJournalOpen(false); void openFile(entry.path) } }} />}

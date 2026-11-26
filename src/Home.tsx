@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent } from 'react'
 import { listen } from '@tauri-apps/api/event'
-import { Copy, Ellipsis, FolderOpen, FolderSearch, Moon, Pin, PinOff, Sun, X } from 'lucide-react'
+import { Copy, Ellipsis, FolderOpen, FolderSearch, Moon, Pin, PinOff, Server, Sun, Trash2, X } from 'lucide-react'
 import {
   type HomeState, type JobEvent, type ProjectSummary, type SshHost, type SshOverview, type Workspace,
-  api, demo, desktop, home, hostLabel, mod, pickFolder, ssh,
+  api, demo, desktop, forgetProject, home, hostLabel, mod, pickFolder, ssh,
 } from './bridge'
 import { ConnectDialog, HostDialog, OpenRemoteDialog } from './Remote'
 import { useSettings } from './settings'
@@ -49,6 +49,7 @@ export default function Home(props: Props) {
   const [cloneUrl, setCloneUrl] = useState('')
   const [connectTarget, setConnectTarget] = useState('')
   const [newName, setNewName] = useState('')
+  const [deleting, setDeleting] = useState<ProjectSummary | null>(null)
   const filterInput = useRef<HTMLInputElement>(null)
   const list = useRef<HTMLDivElement>(null)
 
@@ -119,9 +120,12 @@ export default function Home(props: Props) {
       ] : []),
       { label: 'Copy path', icon: Copy, action: () => { void navigator.clipboard.writeText(project.path) } },
       { label: project.pinned ? 'Unpin from recents' : 'Pin to recents', icon: project.pinned ? PinOff : Pin, action: () => { void home.pin(project.path, !project.pinned).then(refresh).catch(props.notify) } },
-      ...(project.location === 'external' ? ['separator' as const, {
-        label: 'Remove from Home', icon: X, action: () => { void home.forget(project.path).then(refresh).catch(props.notify) },
+      'separator' as const,
+      // A project deleted outside Still can be taken off the list; one that's there can be deleted (to the trash).
+      ...(project.missing || project.location === 'external' ? [{
+        label: project.missing ? 'Remove from the list' : 'Remove from Home', icon: X, action: () => { void home.forget(project.path).then(refresh).catch(props.notify) },
       }] : []),
+      ...(!project.missing && desktop ? [{ label: 'Delete project…', icon: Trash2, danger: true, action: () => setDeleting(project) }] : []),
     ]
   }
 
@@ -193,66 +197,83 @@ export default function Home(props: Props) {
       left={<span className="brand"><img src={mark} alt="" /><span className="brand-word">Still</span></span>}
       right={<button className="quiet-link" onClick={() => props.onSettings()}>Settings</button>} />
 
-    <main className="home launch">
-      <div className="launch-column">
-        <header className="launch-hero">
-          <h1>{greeting()}.</h1>
-        </header>
+    <main className="home launch contents">
+      <div className="contents-page">
+        <div className="launch-column">
+          <header className="launch-hero">
+            <p className="contents-date">{new Date().toLocaleDateString([], { weekday: 'long', day: 'numeric', month: 'long' })}</p>
+            <h1>{greeting()}.</h1>
+          </header>
 
-        {state && !state.projectsRoot && desktop && <section className="setup-card">
-          <div>
-            <h2>Where should your projects live?</h2>
-            <p>Still keeps new projects in one folder so they are easy to find. You can still create or open individual projects anywhere, and uninstalling Still never touches them.</p>
-          </div>
-          <div className="setup-actions">
-            <button className="paper-btn primary" onClick={() => { void chooseRoot(state.suggestedRoot) }}>Use {shortPath(state.suggestedRoot, homeDir)}</button>
-            <button className="paper-btn" onClick={() => { void chooseRoot() }}>Choose folder…</button>
-          </div>
-        </section>}
+          {state && !state.projectsRoot && desktop && <section className="setup-card">
+            <div>
+              <h2>Where should your projects live?</h2>
+              <p>Still keeps new projects in one folder so they are easy to find. You can still create or open individual projects anywhere, and uninstalling Still never touches them.</p>
+            </div>
+            <div className="setup-actions">
+              <button className="paper-btn primary" onClick={() => { void chooseRoot(state.suggestedRoot) }}>Use {shortPath(state.suggestedRoot, homeDir)}</button>
+              <button className="paper-btn" onClick={() => { void chooseRoot() }}>Choose folder…</button>
+            </div>
+          </section>}
 
-        {/* One box for everything: find a project, paste a Git URL to clone, or type user@host to connect. */}
-        <div className="launch-box">
-          <input ref={filterInput} value={filter} onChange={event => { setFilter(event.target.value); setPicked(0) }} spellCheck={false} autoFocus
-            placeholder="Open a project, paste a Git URL, or type user@host" aria-label="Open a project, clone a repository or connect to a server"
-            onKeyDown={event => {
-              if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); setPicked(value => Math.max(0, Math.min(launchRows.length - 1, value + (event.key === 'ArrowDown' ? 1 : -1)))) }
-              else if (event.key === 'Enter') { event.preventDefault(); launchRows[picked]?.run() }
-              else if (event.key === 'Escape') { setFilter(''); setPicked(0) }
-            }} />
-          <kbd>{mod}+K</kbd>
+          {/* One box for everything: find a project, paste a Git URL to clone, or type user@host to connect. */}
+          <div className="launch-box">
+            <input ref={filterInput} value={filter} onChange={event => { setFilter(event.target.value); setPicked(0) }} spellCheck={false} autoFocus
+              placeholder="Open a project, paste a Git URL, or type user@host" aria-label="Open a project, clone a repository or connect to a server"
+              onKeyDown={event => {
+                if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); setPicked(value => Math.max(0, Math.min(launchRows.length - 1, value + (event.key === 'ArrowDown' ? 1 : -1)))) }
+                else if (event.key === 'Enter') { event.preventDefault(); launchRows[picked]?.run() }
+                else if (event.key === 'Escape') { setFilter(''); setPicked(0) }
+              }} />
+            <kbd>{mod}+K</kbd>
+          </div>
+
+          <h2 className="contents-heading">{term ? 'Results' : 'Contents'}</h2>
+          <div className="launch-list" ref={list} role="listbox" aria-label="Projects and actions">
+            {launchRows.map((row, index) => {
+              const number = launchRows.slice(0, index + 1).filter(item => item.kind === 'project').length
+              return <div key={row.key} role="option" aria-selected={index === picked} className={'launch-row' + (index === picked ? ' is-picked' : '') + (row.kind === 'continue' ? ' is-continue' : '') + (row.missing ? ' missing' : '')}
+                onMouseEnter={() => setPicked(index)} onContextMenu={row.project ? event => showMenu(event, projectMenu(row.project!)) : undefined}>
+                <button className="project-open" onClick={row.run} disabled={row.missing}>
+                  <span className="launch-kind">{row.kind === 'project' ? String(number).padStart(2, '0') : row.label}</span>
+                  <span className="launch-name">{row.name}</span>
+                  <span className="contents-leader" aria-hidden="true" />
+                  <span className="launch-detail">{row.detail}</span>
+                </button>
+                {row.project && <IconButton glyph={Ellipsis} label={'Actions for ' + row.name} className="row-action" onClick={event => showMenu(event, projectMenu(row.project!), true)} />}
+              </div>
+            })}
+            {state && !launchRows.length && <p className="calm-quiet">{term ? <>Nothing matches “{filter}”. Press Enter to create a project with that name.</> : <>No projects yet. <button className="link" onClick={() => setCreating(true)}>Create one</button>, or try the Orbit Lab sample from New project.</>}</p>}
+          </div>
+
+          <nav className="launch-actions" aria-label="Start something">
+            <button onClick={() => setCreating(true)}>New project <kbd>{mod}+N</kbd></button>
+            <button onClick={() => { void openFolder() }}>Open folder <kbd>{mod}+O</kbd></button>
+            <button onClick={() => desktop ? setCloning(true) : props.notify('Cloning is available in the Still desktop app.')}>Clone</button>
+            <button onClick={() => desktop ? setConnecting(true) : props.notify('SSH is available in the Still desktop app.')}>Connect to server</button>
+            {!term && projects.length > 6 && <button onClick={() => setShowAll(value => !value)}>{showAll ? 'Fewer projects' : 'All ' + projects.length + ' projects'}</button>}
+          </nav>
         </div>
 
-        <div className="launch-list" ref={list} role="listbox" aria-label="Projects and actions">
-          {launchRows.map((row, index) => <div key={row.key} role="option" aria-selected={index === picked} className={'launch-row' + (index === picked ? ' is-picked' : '') + (row.kind === 'continue' ? ' is-continue' : '') + (row.missing ? ' missing' : '')}
-            onMouseEnter={() => setPicked(index)} onContextMenu={row.project ? event => showMenu(event, projectMenu(row.project!)) : undefined}>
-            <button className="project-open" onClick={row.run} disabled={row.missing}>
-              <span className="launch-kind">{row.label}</span>
-              <span className="launch-name">{row.name}</span>
-              <span className="launch-detail">{row.detail}</span>
-            </button>
-            {row.project && <IconButton glyph={Ellipsis} label={'Actions for ' + row.name} className="row-action" onClick={event => showMenu(event, projectMenu(row.project!), true)} />}
-          </div>)}
-          {state && !launchRows.length && <p className="calm-quiet">{term ? <>Nothing matches “{filter}”. Press Enter to create a project with that name.</> : <>No projects yet. <button className="link" onClick={() => setCreating(true)}>Create one</button>, or try the Orbit Lab sample from New project.</>}</p>}
-        </div>
-
-        <nav className="launch-actions" aria-label="Start something">
-          <button onClick={() => setCreating(true)}>New project <kbd>{mod}+N</kbd></button>
-          <button onClick={() => { void openFolder() }}>Open folder <kbd>{mod}+O</kbd></button>
-          <button onClick={() => desktop ? setCloning(true) : props.notify('Cloning is available in the Still desktop app.')}>Clone</button>
-          <button onClick={() => desktop ? setConnecting(true) : props.notify('SSH is available in the Still desktop app.')}>Connect to server</button>
-          {!term && projects.length > 6 && <button onClick={() => setShowAll(value => !value)}>{showAll ? 'Fewer projects' : 'All ' + projects.length + ' projects'}</button>}
-        </nav>
-
-        {!term && <section className="launch-today">
-          <span className="calm-label">Today</span>
-          {todays.length ? todays.map(entry => <button key={entry.id} className="calm-entry" onClick={() => { void open(entry.root, entry.path ? { path: entry.path, line: 1, time: entry.time } : undefined) }} title={entry.project}>
-            <time>{clock(entry.time)}</time><span>{entryText(entry)}</span>
-          </button>) : <p className="calm-quiet">Nothing yet today.</p>}
-          <button className="calm-more" onClick={() => setJournal(true)}>Open journal</button>
-        </section>}
+        {!term && <aside className="contents-margin" aria-label="Today and servers">
+          <section className="launch-today">
+            <span className="calm-label">Today</span>
+            {todays.length ? todays.map(entry => <button key={entry.id} className="calm-entry" onClick={() => { void open(entry.root, entry.path ? { path: entry.path, line: 1, time: entry.time } : undefined) }} title={entry.project}>
+              <time>{clock(entry.time)}</time><span>{entryText(entry)}</span>
+            </button>) : <p className="calm-quiet">Nothing yet today.</p>}
+            <button className="calm-more" onClick={() => setJournal(true)}>Open journal</button>
+          </section>
+          {desktop && hosts.length > 0 && <section className="launch-today contents-servers">
+            <span className="calm-label">Servers</span>
+            {hosts.slice(0, 5).map(host => <button key={host.id} className="calm-entry" onClick={() => setRemoteHost(host)} title={hostLabel(host)}>
+              <Icon glyph={Server} size={12} /><span>{host.name}</span>
+            </button>)}
+          </section>}
+        </aside>}
       </div>
     </main>
 
+    {deleting && <DeleteProjectDialog project={deleting} onClose={() => setDeleting(null)} onDeleted={() => { setDeleting(null); void refresh(); props.notify('Moved ' + deleting.name + ' to the trash.') }} notify={props.notify} />}
     {creating && <NewProjectDialog initialName={newName} root={state?.projectsRoot ?? null} homeDir={homeDir} onClose={() => { setCreating(false); setNewName('') }} notify={props.notify}
       onChooseRoot={() => { void chooseRoot() }} onCreated={(workspace, options) => {
         setCreating(false)
@@ -326,6 +347,7 @@ function NewProjectDialog({ root, homeDir, onClose, onCreated, onChooseRoot, not
     setError('')
     try {
       const workspace = await home.create(name.trim(), template, custom || null, git, readme, requirements)
+      forgetProject(workspace.root)
       update({ newProjectTemplate: template, newProjectGit: git, newProjectReadme: readme, ...(template === 'python' ? { newProjectRequirements: requirements } : {}) })
       onCreated(workspace, { venv: venv && template === 'python' })
     } catch (failure) { setError(String(failure)) } finally { setBusy(false) }
@@ -408,3 +430,25 @@ function CloneDialog({ root, homeDir, onClose, onCloned, initialUrl = '' }: { ro
   </Modal>
 }
 
+
+/** Deleting a project moves its folder to the trash. Typing the project's name confirms it. */
+function DeleteProjectDialog({ project, onClose, onDeleted, notify }: { project: ProjectSummary; onClose: () => void; onDeleted: () => void; notify: (message: unknown) => void }) {
+  const [typed, setTyped] = useState('')
+  const [busy, setBusy] = useState(false)
+  const matches = typed === project.name
+  async function remove() {
+    if (!matches || busy) return
+    setBusy(true)
+    try { await home.remove(project.path); forgetProject(project.path); onDeleted() } catch (error) { notify(error); setBusy(false) }
+  }
+  return <Modal title={'Delete ' + project.name + '?'} onClose={onClose} className="delete-sheet">
+    <p className="sheet-text">The folder <code>{project.path}</code> and everything in it go to the system trash. You can restore it from there.</p>
+    <label className="field-label" htmlFor="delete-confirm">Type <b>{project.name}</b> to confirm</label>
+    <input id="delete-confirm" className="field field-lg" value={typed} onChange={event => setTyped(event.target.value)} autoFocus spellCheck={false} autoComplete="off"
+      onKeyDown={event => { if (event.key === 'Enter') void remove() }} placeholder={project.name} />
+    <div className="sheet-actions">
+      <button className="paper-btn" onClick={onClose}>Cancel</button>
+      <button className="paper-btn danger" disabled={!matches || busy} onClick={() => { void remove() }}>{busy ? 'Deleting…' : 'Delete project'}</button>
+    </div>
+  </Modal>
+}

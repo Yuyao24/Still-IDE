@@ -65,6 +65,8 @@ struct Session<'a> {
     stack: Vec<(String, String, u32)>,
     watches: Vec<String>,
     breakpoints: Vec<(String, u32)>,
+    /// Conditions and log messages, by file and line.
+    options: std::collections::HashMap<(String, u32), (Option<String>, Option<String>)>,
     reason: String,
     detail: String,
     ended: bool,
@@ -241,6 +243,15 @@ impl Session<'_> {
     }
 }
 
+fn breakpoint_options(value: &Value) -> std::collections::HashMap<(String, u32), (Option<String>, Option<String>)> {
+    let text = |item: &Value, key: &str| item[key].as_str().map(str::trim).filter(|value| !value.is_empty()).map(str::to_owned);
+    value.as_array().into_iter().flatten().filter_map(|item| {
+        let key = (item["file"].as_str()?.to_owned(), item["line"].as_u64()? as u32);
+        let (condition, log) = (text(item, "condition"), text(item, "log"));
+        (condition.is_some() || log.is_some()).then_some((key, (condition, log)))
+    }).collect()
+}
+
 fn breakpoint_list(value: &Value) -> Vec<(String, u32)> {
     value.as_array().into_iter().flatten().filter_map(|item| Some((item["file"].as_str()?.to_owned(), item["line"].as_u64()? as u32))).filter(|(file, _)| file.ends_with(".java")).collect()
 }
@@ -274,7 +285,7 @@ pub fn run(job: &Job, app: AppHandle, id: String, cwd: &Path, file: &Path, path:
     job.emit("command", format!("$ jdb {}{}\n", compiled.class, if args.is_empty() { String::new() } else { format!(" {}", shell_words::join(args)) }));
     let mut child = crate::process::command(&jdb, cwd)
         .args(["-J-Dfile.encoding=UTF-8", "-J-Duser.language=en", "-classpath", "bin", "-sourcepath"]).arg(&compiled.source_paths)
-        .arg(&compiled.class).args(args)
+        .arg(&compiled.class).args(args).envs(job.env_vars())
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
         .spawn().map_err(|error| if error.kind() == std::io::ErrorKind::NotFound { "jdb was not found. It comes with the JDK; check that JAVA_HOME points at a JDK.".to_owned() } else { err(error) })?;
     let stdin = child.stdin.take().ok_or("jdb takes no input.")?;
@@ -291,18 +302,24 @@ pub fn run(job: &Job, app: AppHandle, id: String, cwd: &Path, file: &Path, path:
     let mut session = Session {
         job, app: app.clone(), id: id.clone(), stdin, out, sources: java_sources(cwd), jdb_frame: 1, stack: Vec::new(),
         watches: setup["watches"].as_array().into_iter().flatten().filter_map(|item| item.as_str().map(str::to_owned)).collect(),
-        breakpoints: Vec::new(), reason: String::new(), detail: String::new(), ended: false,
+        breakpoints: Vec::new(), options: breakpoint_options(&setup["breakpoints"]), reason: String::new(), detail: String::new(), ended: false,
     };
     // jdb's first prompt, then breakpoints (deferred until the class loads) and run.
     let _ = session.ask("");
     session.set_breakpoints(breakpoint_list(&setup["breakpoints"]), cwd, true)?;
-    session.ask("catch uncaught java.lang.Throwable")?;
+    match setup["pauseOn"].as_str().unwrap_or("uncaught") {
+        "all" => { session.ask("catch all java.lang.Throwable")?; }
+        "none" => {}
+        _ => { session.ask("catch uncaught java.lang.Throwable")?; }
+    }
     if setup["stopOnEntry"].as_bool().unwrap_or(false) { session.ask(&format!("stop in {}.main", compiled.class))?; }
     let _ = app.emit("debug-event", json!({ "id": id, "event": "started" }));
     session.send("run")?;
     let event = Regex::new(r#"^(?:> )?(Breakpoint hit|Step completed|Exception occurred|Method entered): (?:(.+?) \((?:un)?caught\))?"thread=[^"]*", ([\w$.<>]+)\(\), line=([\d,]+)"#).unwrap();
     let mut paused = false;
     let mut skip_source = false;
+    // Where the last breakpoint hit was (class, line), to apply its condition or log message.
+    let mut hit: Option<(String, u32)> = None;
     // jdb puts a blank line before each event; hold blank lines until it's clear which they are.
     let mut blanks = 0usize;
     'outer: loop {
@@ -316,6 +333,11 @@ pub fn run(job: &Job, app: AppHandle, id: String, cwd: &Path, file: &Path, path:
                     if !is_event { for _ in 0..std::mem::take(&mut blanks) { session.output("") } } else { blanks = 0 }
                     if let Some(found) = event.captures(&line) {
                         session.reason = match &found[1] { "Breakpoint hit" | "Method entered" => "breakpoint", "Exception occurred" => "exception", _ => "step" }.to_owned();
+                        hit = (&found[1] == "Breakpoint hit").then(|| {
+                            let method = found[3].to_owned();
+                            let class = method.rsplit_once('.').map(|(class, _)| class.to_owned()).unwrap_or_default();
+                            (class, found[4].replace(',', "").parse().unwrap_or(0))
+                        });
                         session.detail = found.get(2).map(|exception| format!("{} (uncaught)", exception.as_str())).unwrap_or_default();
                         skip_source = true;
                     } else if line.trim_start_matches("> ").trim() == "The application exited" || line.contains("The application has been disconnected") {
@@ -329,9 +351,28 @@ pub fn run(job: &Job, app: AppHandle, id: String, cwd: &Path, file: &Path, path:
                 Ok(Out::Prompt(prompt)) => {
                     if skip_source && prompt != "> " {
                         skip_source = false;
-                        paused = true;
                         session.jdb_frame = 1;
                         session.stack.clear();
+                        // Conditional breakpoints and logpoints: jdb has neither, so check here and carry on.
+                        let options = hit.take().and_then(|(class, line)| {
+                            let outer = class.split('$').next().unwrap_or(&class).to_owned();
+                            let simple = outer.rsplit('.').next().unwrap_or(&outer).to_owned();
+                            let path = session.file_for(&class, &format!("{simple}.java"))?;
+                            session.options.get(&(path, line)).cloned()
+                        });
+                        if let Some((condition, log)) = options {
+                            if let Some(condition) = condition {
+                                let (value, ok) = session.evaluate(&condition);
+                                if !ok || value.trim() != "true" { session.send("cont")?; continue; }
+                            }
+                            if let Some(message) = log {
+                                let filled = Regex::new(r"\{([^{}]+)\}").unwrap().replace_all(&message, |found: &regex::Captures| session.evaluate(&found[1]).0.trim_matches('"').to_owned()).into_owned();
+                                session.output(&filled);
+                                session.send("cont")?;
+                                continue;
+                            }
+                        }
+                        paused = true;
                         session.report(usize::MAX)?;
                     }
                 }
@@ -342,7 +383,7 @@ pub fn run(job: &Job, app: AppHandle, id: String, cwd: &Path, file: &Path, path:
             while let Ok(command) = commands.try_recv() {
                 match command["op"].as_str().unwrap_or("") {
                     "stop" => break 'outer,
-                    "breakpoints" => session.set_breakpoints(breakpoint_list(&command["items"]), cwd, false)?,
+                    "breakpoints" => { session.options = breakpoint_options(&command["items"]); session.set_breakpoints(breakpoint_list(&command["items"]), cwd, false)? }
                     "watches" => session.watches = command["items"].as_array().into_iter().flatten().filter_map(|item| item.as_str().map(str::to_owned)).collect(),
                     _ => {}
                 }
@@ -368,7 +409,7 @@ pub fn run(job: &Job, app: AppHandle, id: String, cwd: &Path, file: &Path, path:
                 let index = session.stack.len().saturating_sub(session.jdb_frame);
                 session.report(index)?;
             }
-            "breakpoints" => session.set_breakpoints(breakpoint_list(&command["items"]), cwd, true)?,
+            "breakpoints" => { session.options = breakpoint_options(&command["items"]); session.set_breakpoints(breakpoint_list(&command["items"]), cwd, true)? }
             "eval" => {
                 let expression = command["expression"].as_str().unwrap_or("").to_owned();
                 let (value, ok) = session.evaluate(&expression);

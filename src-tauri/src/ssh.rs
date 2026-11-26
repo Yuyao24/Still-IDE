@@ -1293,6 +1293,7 @@ pub fn ssh_debug_start(
     watches: Vec<String>,
     stop_on_entry: bool,
     args: Option<String>,
+    pause_on: Option<String>,
 ) -> Result<()> {
     use base64::Engine;
     if !path.ends_with(".py") {
@@ -1312,7 +1313,7 @@ pub fn ssh_debug_start(
         code = quote(&format!("import base64;exec(compile(base64.b64decode('{driver}'),'<still-debug>','exec'))")),
         file = quote(&full),
     ));
-    let setup = serde_json::json!({ "breakpoints": breakpoints, "watches": watches, "stopOnEntry": stop_on_entry });
+    let setup = serde_json::json!({ "breakpoints": breakpoints, "watches": watches, "stopOnEntry": stop_on_entry, "pauseOn": pause_on.unwrap_or_else(|| "uncaught".into()) });
     let (sender, commands) = std::sync::mpsc::channel::<serde_json::Value>();
     app.state::<crate::debug::Debuggers>().0.lock().map_err(err)?.insert(id.clone(), sender);
     let label = format!("$ ssh {} debug {path}{}\n", host.name, quoted_args);
@@ -1377,6 +1378,118 @@ pub fn ssh_debug_start(
         if let Ok(mut input) = slot.lock() { input.take(); }
         if let Ok(mut map) = events.state::<crate::debug::Debuggers>().0.lock() { map.remove(&session_id); }
         let _ = events.emit("debug-event", serde_json::json!({ "id": session_id, "event": "ended" }));
+        Ok((code, Vec::new()))
+    })
+}
+
+/// A binary file on the server (a PDF or an image), as base64.
+#[tauri::command]
+pub async fn ssh_read_binary(app: AppHandle, store: State<'_, Store>, id: String, root: String, path: String) -> Result<String> {
+    let host = find_host(&store, &id)?;
+    blocking(move || {
+        let full = remote_path(&root, &path)?;
+        let script = format!("f={}; s=$(wc -c < \"$f\") || exit 1; if [ \"$s\" -gt 67108864 ]; then echo 'Still shows files up to 64 MB.' >&2; exit 3; fi; base64 < \"$f\" | tr -d '\\n\\r'", quote(&full));
+        let out = exec(&app, &host, &script, None, 120)?;
+        Ok(String::from_utf8_lossy(&out).trim().to_owned())
+    })
+    .await
+}
+
+// ---- Language servers and tests for projects on a server ----
+
+/// Starts the language server for a language on the server, over SSH; it reads and writes LSP
+/// on stdin/stdout like a local one. If none is installed there, it exits at once with NOSERVER.
+#[tauri::command]
+pub fn ssh_lsp_start(app: AppHandle, store: State<Store>, servers: State<crate::lsp::Servers>, id: String, root: String, language: String) -> Result<crate::lsp::Started> {
+    let host = find_host(&store, &id)?;
+    let key = format!("{language}:{}:{root}", host.id);
+    if let Some(started) = crate::lsp::running(&servers, &key) { return Ok(started) }
+    let choices = match language.as_str() {
+        "python" => "basedpyright-langserver:--stdio pyright-langserver:--stdio pylsp: jedi-language-server:",
+        "java" => "jdtls:",
+        "typescript" => "typescript-language-server:--stdio",
+        "rust" => "rust-analyzer:",
+        "go" => "gopls:",
+        "cpp" => "clangd:",
+        _ => return Err("No language server for that language.".into()),
+    };
+    let script = format!(
+        "cd -- {root} && PATH=\"$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/go/bin:$HOME/.cargo/bin:$PATH\"; for choice in {choices}; do program=${{choice%%:*}}; option=${{choice#*:}}; if command -v \"$program\" >/dev/null 2>&1; then exec \"$program\" $option; fi; done; echo NOSERVER >&2; exit 3",
+        root = quote(&root), choices = choices,
+    );
+    let mut ssh_args = base_args(&app, &host, true)?;
+    ssh_args.push("--".into());
+    ssh_args.push(destination(&host));
+    ssh_args.push(script);
+    let mut cmd = command(program(), &std::env::temp_dir());
+    cmd.args(&ssh_args);
+    use_prompts(&app, &mut cmd, &host);
+    crate::lsp::spawn(&app, &servers, key, &format!("{language} server on {}", host.name), cmd)
+}
+
+/// Runs pytest on the server; its output streams to the Output pane and the JUnit report comes
+/// back after a marker line, to fill the Tests panel.
+#[tauri::command]
+pub fn ssh_tests_run(app: AppHandle, store: State<Store>, jobs: State<Jobs>, id: String, host_id: String, root: String, target: Option<String>) -> Result<()> {
+    let host = find_host(&store, &host_id)?;
+    let target = target.filter(|value| !value.trim().is_empty());
+    if target.as_deref().is_some_and(|value| value.starts_with('-')) { return Err("Unknown test.".into()) }
+    let report = format!("/tmp/still-junit-{}.xml", std::process::id());
+    let script = format!(
+        "cd -- {root} && python3 -m pytest -q --tb=short -o junit_family=xunit1 -p no:cacheprovider --junitxml={report}{target}; code=$?; printf '\\036STILL-JUNIT\\n'; cat {report} 2>/dev/null; rm -f {report}; exit $code",
+        root = quote(&root), report = quote(&report),
+        target = target.as_deref().map(|value| value.split_whitespace().map(|part| format!(" {}", quote(part))).collect::<String>()).unwrap_or_default(),
+    );
+    let mut ssh_args = base_args(&app, &host, true)?;
+    ssh_args.push("--".into());
+    ssh_args.push(destination(&host));
+    ssh_args.push(script);
+    let events = app.clone();
+    let prompts_app = app.clone();
+    let label = format!("$ ssh {} python3 -m pytest{}\n", host.name, target.as_deref().map(|value| format!(" {value}")).unwrap_or_default());
+    let report_id = id.clone();
+    jobs.start(app, id, true, move |job| {
+        job.emit("command", label);
+        let mut cmd = command(program(), &std::env::temp_dir());
+        cmd.args(&ssh_args);
+        use_prompts(&prompts_app, &mut cmd, &host);
+        let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(err)?;
+        let mut stdout = child.stdout.take().ok_or("no output")?;
+        let stderr = child.stderr.take().ok_or("no output")?;
+        let marker = "\u{1e}STILL-JUNIT\n";
+        let (code, xml) = thread::scope(|scope| {
+            scope.spawn(|| crate::process::stream(stderr, job, "stderr", false));
+            let reader = scope.spawn(|| {
+                let mut buffer = [0u8; 8192];
+                let mut seen = String::new();
+                let mut xml = String::new();
+                let mut after = false;
+                loop {
+                    let size = match stdout.read(&mut buffer) { Ok(0) | Err(_) => break, Ok(size) => size };
+                    let chunk = String::from_utf8_lossy(&buffer[..size]).into_owned();
+                    if after { xml.push_str(&chunk); continue }
+                    seen.push_str(&chunk);
+                    if let Some(at) = seen.find(marker) {
+                        if at > 0 { job.emit("stdout", seen[..at].to_owned()); }
+                        xml.push_str(&seen[at + marker.len()..]);
+                        after = true;
+                    } else if !seen.contains('\u{1e}') || seen.len() > 64 * 1024 {
+                        job.emit("stdout", std::mem::take(&mut seen));
+                    }
+                }
+                if !after && !seen.is_empty() { job.emit("stdout", seen); }
+                xml
+            });
+            let code = loop {
+                if job.is_cancelled() { let _ = child.kill(); let _ = child.wait(); break 130 }
+                if let Ok(Some(status)) = child.try_wait() { break status.code().unwrap_or(1) }
+                thread::sleep(Duration::from_millis(25));
+            };
+            (code, reader.join().unwrap_or_default())
+        });
+        let mut results = Vec::new();
+        crate::tests::parse_junit(&xml, &mut results);
+        crate::tests::emit_report(&events, report_id, "pytest".into(), results);
         Ok((code, Vec::new()))
     })
 }

@@ -270,6 +270,34 @@ pub fn forget_project(store: State<Store>, path: String) -> Result<()> {
     })
 }
 
+/// Moves a project folder to the system trash (so it can be restored) and takes it off Home.
+/// Only folders Home knows as projects; never a home folder or a drive's root.
+#[tauri::command]
+pub fn delete_project(store: State<Store>, path: String) -> Result<()> {
+    let folder = std::path::PathBuf::from(&path);
+    let canonical = folder.canonicalize().map_err(err)?;
+    if !canonical.is_dir() {
+        return Err("That project folder no longer exists.".into());
+    }
+    if canonical.parent().is_none() || dirs_home().is_some_and(|home| home == canonical) {
+        return Err("Still won't delete that folder.".into());
+    }
+    let (root, known) = store.read(|config| (config.projects_root.clone(), config.projects.iter().any(|record| record.path == path)))?;
+    let in_library = root.as_ref().is_some_and(|root| std::path::Path::new(root).canonicalize().is_ok_and(|root| canonical.starts_with(&root) && canonical != root));
+    if !known && !in_library {
+        return Err("Still only deletes projects listed on Home.".into());
+    }
+    trash::delete(&canonical).map_err(|error| format!("Couldn't move the project to the trash: {error}"))?;
+    store.update(|config| {
+        config.projects.retain(|record| record.path != path);
+        Ok(())
+    })
+}
+
+fn dirs_home() -> Option<std::path::PathBuf> {
+    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(std::path::PathBuf::from).and_then(|home| home.canonicalize().ok())
+}
+
 #[tauri::command]
 pub fn pin_project(store: State<Store>, path: String, pinned: bool) -> Result<()> {
     store.update(|config| {

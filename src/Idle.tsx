@@ -69,11 +69,24 @@ export function Idle({ sources, onWake, sessionStats, leaving }: { sources: Idle
     }
   }, [onWake, leaving])
 
-  const columns = useMemo(() => {
-    const texts = usable.length ? usable.map(source => source.text) : ['']
-    return [0, 1, 2].map(column => {
-      const text = texts[column % texts.length].split('\n').slice(0, 80).join('\n')
-      return text + '\n\n' + text
+  // Snippets from your open files float up behind, scattered at different depths: nearer ones
+  // larger, clearer and quicker, further ones small and faint.
+  const floaters = useMemo(() => {
+    if (!usable.length) return []
+    let seed = 7
+    const random = () => { seed = (seed * 16807) % 2147483647; return (seed - 1) / 2147483646 }
+    // Four lanes across the screen, each with snippets spaced out along it, so they rarely overlap.
+    const lanes = 4, perLane = 3
+    return Array.from({ length: lanes * perLane }, (_, index) => {
+      const lane = index % lanes, slot = Math.floor(index / lanes)
+      const depth = random()
+      const source = usable[index % usable.length]
+      const duration = 160 - depth * 70
+      return {
+        key: index, lines: excerpt(source, index * 3 + 1).lines.slice(0, 3 + Math.floor(random() * 3)),
+        x: 3 + lane * 24 + random() * 6, size: 10.5 + depth * 3.5, alpha: 6 + depth * 10,
+        duration, delay: -((slot + lane * 0.37 + random() * 0.2) / perLane) * duration,
+      }
     })
   }, [usable.length])
   const source = usable.length ? usable[turn % usable.length] : null
@@ -82,7 +95,7 @@ export function Idle({ sources, onWake, sessionStats, leaving }: { sources: Idle
 
   return <div className={'idle' + (leaving ? ' is-leaving' : '')} role="dialog" aria-label="Idle screen. Press any key to return." aria-hidden={leaving || undefined}>
     <div className="idle-drift" aria-hidden="true">
-      {columns.map((text, index) => <div key={index}><pre style={{ animationDuration: [100, 150, 120][index] + 's' }}>{text}</pre></div>)}
+      {floaters.map(item => <pre key={item.key} style={{ left: item.x + '%', fontSize: item.size + 'px', color: `color-mix(in srgb, var(--ink) ${item.alpha.toFixed(1)}%, var(--editor))`, animationDuration: item.duration + 's', animationDelay: item.delay + 's' }}>{item.lines.join('\n')}</pre>)}
     </div>
     <div className="idle-veil" aria-hidden="true" />
     <span className="idle-hint">Press any key to resume</span>

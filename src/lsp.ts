@@ -8,7 +8,7 @@ import {
   serverCompletionSource, signatureHelp, type Transport, type WorkspaceFile,
 } from '@codemirror/lsp-client'
 import { ChangeSet, StateEffect, StateField, Text, type Extension } from '@codemirror/state'
-import { type EditorView, type Panel, keymap, showDialog, showPanel } from '@codemirror/view'
+import { Decoration, type DecorationSet, type EditorView, type Panel, ViewPlugin, type ViewUpdate, WidgetType, keymap, showDialog, showPanel } from '@codemirror/view'
 import type { Diagnostic as EditorDiagnostic } from '@codemirror/lint'
 import { relint } from './relint'
 import type { CompletionContext, CompletionResult, CompletionSource } from '@codemirror/autocomplete'
@@ -44,6 +44,8 @@ export function fromUri(root: string, uri: string): string | null {
 
 export interface LspHost {
   root: string
+  /** For a project on a server: the saved host's id (the server runs there, over SSH). */
+  remote?: string | null
   /** Opens a project file in the editor (for go to definition in another file). */
   open: (path: string) => Promise<void>
   /** Changes a file that has no editor showing it: an open tab in the background, or the file on disk. */
@@ -156,7 +158,8 @@ export function serverDiagnostics(view: EditorView): EditorDiagnostic[] | null {
     let to = map(positionIn(entry.doc, item.range.end))
     if (to <= from) to = Math.min(doc.length, from + 1)
     const severity = item.severity === 2 ? 'warning' : item.severity === 3 ? 'info' : 'error'
-    found.push({ from, to, severity, message: item.message + (item.code !== undefined && item.code !== '' ? ` (${item.code})` : ''), source: item.source ?? 'server' })
+    found.push({ from, to, severity, message: item.message + (item.code !== undefined && item.code !== '' ? ` (${item.code})` : ''), source: item.source ?? 'server',
+      actions: plugin.client.serverCapabilities?.codeActionProvider ? [{ name: 'Quick fix…', apply: () => { window.dispatchEvent(new CustomEvent('still-quick-fix')) } }] : undefined })
   }
   return found
 }
@@ -181,7 +184,9 @@ function sanitize(html: string) {
 
 /** Starts (or reuses) the server for a language. Resolves to null when none is installed. */
 export async function startServer(host: LspHost, language: string, onExit: (log: string) => void): Promise<Server | null> {
-  const started = await invoke<{ id: string; name: string } | null>('lsp_start', { rootPath: host.root, language })
+  const started = host.remote
+    ? await invoke<{ id: string; name: string }>('ssh_lsp_start', { id: host.remote, root: host.root, language })
+    : await invoke<{ id: string; name: string } | null>('lsp_start', { rootPath: host.root, language })
   if (!started) return null
   const rootUri = toUri(host.root, '')
   const canonical = (uri: string) => { const path = fromUri(host.root, uri); return path === null ? uri : toUri(host.root, path) }
@@ -198,7 +203,11 @@ export async function startServer(host: LspHost, language: string, onExit: (log:
           opened = true
           value.params.rootPath = host.root
           value.params.workspaceFolders = [{ uri: rootUri, name: folderName }]
-          value.params.capabilities.workspace = { ...(value.params.capabilities.workspace ?? {}), workspaceFolders: true, configuration: true }
+          value.params.capabilities.workspace = { ...(value.params.capabilities.workspace ?? {}), workspaceFolders: true, configuration: true, applyEdit: true, workspaceEdit: { documentChanges: true }, symbol: {} }
+          value.params.capabilities.textDocument = { ...(value.params.capabilities.textDocument ?? {}), inlayHint: {},
+            codeAction: { codeActionLiteralSupport: { codeActionKind: { valueSet: ['', 'quickfix', 'refactor', 'refactor.extract', 'refactor.inline', 'refactor.rewrite', 'source', 'source.organizeImports', 'source.fixAll'] } }, isPreferredSupport: true, resolveSupport: { properties: ['edit'] }, dataSupport: true } }
+          // typescript-language-server only sends hints it's asked for.
+          if (language === 'typescript') value.params.initializationOptions = { ...(value.params.initializationOptions ?? {}), preferences: { includeInlayParameterNameHints: 'literals', includeInlayFunctionLikeReturnTypeHints: true, includeInlayVariableTypeHints: false } }
           message = JSON.stringify(value)
         }
       } catch { /* send as it is */ }
@@ -212,7 +221,6 @@ export async function startServer(host: LspHost, language: string, onExit: (log:
       case 'workspace/workspaceFolders': return [{ uri: rootUri, name: folderName }]
       case 'client/registerCapability': case 'client/unregisterCapability': case 'window/workDoneProgress/create': case 'window/showMessageRequest': return null
       case 'workspace/diagnostic/refresh': case 'workspace/semanticTokens/refresh': case 'workspace/inlayHint/refresh': case 'workspace/codeLens/refresh': return null
-      case 'workspace/applyEdit': return { applied: false }
       default: return undefined
     }
   }
@@ -226,6 +234,13 @@ export async function startServer(host: LspHost, language: string, onExit: (log:
       if (text.includes('"method"') && text.includes('"id"')) {
         try {
           const value = JSON.parse(text)
+          if (value && 'id' in value && 'method' in value && value.method === 'workspace/applyEdit' && client) {
+            // The server asks for an edit (after a quick fix's command, say).
+            void applyWorkspaceEdit(client.workspace as StillWorkspace, value.params?.edit ?? {}, 'input.fix')
+              .then(() => send(JSON.stringify({ jsonrpc: '2.0', id: value.id, result: { applied: true } })))
+              .catch(error => send(JSON.stringify({ jsonrpc: '2.0', id: value.id, result: { applied: false, failureReason: String(error) } })))
+            return
+          }
           if (value && 'id' in value && 'method' in value) {
             const result = answer(value.method, value.params)
             if (result !== undefined) { send(JSON.stringify({ jsonrpc: '2.0', id: value.id, result })); return }
@@ -247,6 +262,9 @@ export async function startServer(host: LspHost, language: string, onExit: (log:
     timeout: 15000,
     sanitizeHTML: sanitize,
     workspace: lspClient => new StillWorkspace(lspClient, host),
+    // Diagnostics are handled below rather than by the client's own extension, so say we take them:
+    // some servers (typescript-language-server) only publish them to clients that do.
+    extensions: [{ clientCapabilities: { textDocument: { publishDiagnostics: { versionSupport: true, relatedInformation: true } } } }],
     notificationHandlers: {
       'textDocument/publishDiagnostics': (lspClient, params: { uri: string; diagnostics: Published['items'] }) => {
         const file = lspClient.workspace.getFile(params.uri) as StillFile | null
@@ -279,6 +297,98 @@ export async function startServer(host: LspHost, language: string, onExit: (log:
   }
 }
 
+type WorkspaceEdit = { changes?: Record<string, LspEdit[]>; documentChanges?: { textDocument?: { uri: string }; edits?: LspEdit[]; kind?: string }[] }
+/** Applies a server's edit: open editors change in place (undoable), background tabs change and
+ *  stay unsaved, and files that aren't open are changed on disk. Returns how many files changed. */
+async function applyWorkspaceEdit(workspace: StillWorkspace, edit: WorkspaceEdit, userEvent: string) {
+  const byUri = new Map<string, LspEdit[]>()
+  for (const [uri, edits] of Object.entries(edit.changes ?? {})) byUri.set(uri, edits)
+  for (const change of edit.documentChanges ?? []) if (change.textDocument && change.edits) byUri.set(change.textDocument.uri, [...(byUri.get(change.textDocument.uri) ?? []), ...change.edits])
+  let count = 0
+  for (const [uri, edits] of byUri) {
+    if (!edits.length) continue
+    const target = (workspace.getFile(uri) as StillFile | null)?.getView()
+    if (target) {
+      const doc = target.state.doc
+      target.dispatch({ changes: edits.map(item => ({ from: positionIn(doc, item.range.start), to: positionIn(doc, item.range.end), insert: item.newText })), userEvent })
+      count++
+      continue
+    }
+    const path = fromUri(workspace.host.root, uri)
+    if (path === null) continue
+    try { await workspace.host.editFile(path, text => applyEdits(text, edits)); count++ } catch (error) { workspace.host.notify("Couldn't change " + path + ': ' + String(error)) }
+  }
+  return count
+}
+
+// ---- Quick fixes: the server's code actions for the caret's line ----
+export interface QuickFix { title: string; kind: string; preferred: boolean; run: () => Promise<void> }
+export async function quickFixes(view: EditorView): Promise<QuickFix[] | null> {
+  const plugin = LSPPlugin.get(view)
+  if (!plugin?.client.serverCapabilities?.codeActionProvider) return null
+  const workspace = plugin.client.workspace as StillWorkspace
+  plugin.client.sync()
+  const range = view.state.selection.main
+  const line = view.state.doc.lineAt(range.head)
+  const start = plugin.toPosition(range.empty ? line.from : range.from), end = plugin.toPosition(range.empty ? line.to : range.to)
+  const diagnostics = (published.get(plugin.uri)?.items ?? []).filter(item => item.range.start.line <= end.line && item.range.end.line >= start.line)
+  type Command = { title: string; command: string; arguments?: unknown[] }
+  type Action = { title: string; kind?: string; isPreferred?: boolean; edit?: WorkspaceEdit; command?: Command | string; arguments?: unknown[]; data?: unknown; disabled?: unknown }
+  const found = await plugin.client.request<object, Action[] | null>('textDocument/codeAction', { textDocument: { uri: plugin.uri }, range: { start, end }, context: { diagnostics, triggerKind: 1 } })
+  const execute = async (command: Command) => { await plugin.client.request('workspace/executeCommand', { command: command.command, arguments: command.arguments }) }
+  return (found ?? []).filter(action => !action.disabled).map(action => ({
+    title: action.title, kind: action.kind ?? '', preferred: Boolean(action.isPreferred),
+    run: async () => {
+      // A bare Command, or a CodeAction with an edit and/or a command (resolved first when the server wants that).
+      if (typeof action.command === 'string') { await execute({ title: action.title, command: action.command, arguments: action.arguments }); return }
+      let full = action
+      if (!full.edit && !full.command && plugin.client.serverCapabilities?.codeActionProvider && typeof plugin.client.serverCapabilities.codeActionProvider === 'object' && plugin.client.serverCapabilities.codeActionProvider.resolveProvider) {
+        full = await plugin.client.request<Action, Action>('codeAction/resolve', action)
+      }
+      if (full.edit) await applyWorkspaceEdit(workspace, full.edit, 'input.fix')
+      if (full.command && typeof full.command === 'object') await execute(full.command)
+    },
+  })).sort((a, b) => Number(b.preferred) - Number(a.preferred) || Number(b.kind.startsWith('quickfix')) - Number(a.kind.startsWith('quickfix')))
+}
+
+// ---- Inlay hints: parameter names and inferred types, drawn faintly in the code ----
+class HintWidget extends WidgetType {
+  constructor(readonly text: string, readonly left: boolean, readonly right: boolean) { super() }
+  eq(other: HintWidget) { return other.text === this.text && other.left === this.left && other.right === this.right }
+  toDOM() { const node = document.createElement('span'); node.className = 'cm-inlay-hint' + (this.left ? ' pad-left' : '') + (this.right ? ' pad-right' : ''); node.textContent = this.text; return node }
+  ignoreEvent() { return true }
+}
+const inlayHints = ViewPlugin.fromClass(class {
+  decorations: DecorationSet = Decoration.none
+  timer: ReturnType<typeof setTimeout> | undefined
+  asked = 0
+  constructor(readonly view: EditorView) { this.schedule(300) }
+  update(update: ViewUpdate) {
+    if (update.docChanged) this.decorations = this.decorations.map(update.changes)
+    if (update.docChanged || update.viewportChanged) this.schedule(update.docChanged ? 700 : 250)
+  }
+  schedule(delay: number) { clearTimeout(this.timer); this.timer = setTimeout(() => { void this.load() }, delay) }
+  async load() {
+    const plugin = LSPPlugin.get(this.view)
+    if (!plugin?.client.serverCapabilities?.inlayHintProvider) return
+    const { from, to } = this.view.viewport
+    const asked = ++this.asked
+    plugin.client.sync()
+    const doc = this.view.state.doc
+    type Hint = { position: { line: number; character: number }; label: string | { value: string }[]; paddingLeft?: boolean; paddingRight?: boolean }
+    let hints: Hint[] | null = null
+    try { hints = await plugin.client.request<object, Hint[] | null>('textDocument/inlayHint', { textDocument: { uri: plugin.uri }, range: { start: plugin.toPosition(from), end: plugin.toPosition(to) } }) } catch { return }
+    if (asked !== this.asked || this.view.state.doc !== doc) return
+    const ranges = (hints ?? []).map(hint => {
+      const text = typeof hint.label === 'string' ? hint.label : hint.label.map(part => part.value).join('')
+      return Decoration.widget({ widget: new HintWidget(text.length > 40 ? text.slice(0, 39) + '…' : text, Boolean(hint.paddingLeft), Boolean(hint.paddingRight)), side: 1 }).range(positionIn(doc, hint.position))
+    }).sort((a, b) => a.from - b.from)
+    this.decorations = Decoration.set(ranges, true)
+    this.view.dispatch({ effects: [] })
+  }
+  destroy() { clearTimeout(this.timer) }
+}, { decorations: plugin => plugin.decorations })
+
 /** Rename across the project: open editors change in place (undoable), background tabs change
  *  and stay unsaved, and files that aren't open are changed on disk. */
 function renameEverywhere(view: EditorView) {
@@ -299,24 +409,7 @@ function renameEverywhere(view: EditorView) {
       response = await plugin.client.request<object, Response>('textDocument/rename', { textDocument: { uri: plugin.uri }, position: plugin.toPosition(word.from), newName: name })
     } catch (error) { workspace.host.notify("Couldn't rename: " + ((error as { message?: string }).message ?? String(error))); return }
     if (!response) { workspace.host.notify('Nothing to rename here.'); return }
-    const byUri = new Map<string, LspEdit[]>()
-    for (const [uri, edits] of Object.entries(response.changes ?? {})) byUri.set(uri, edits)
-    for (const change of response.documentChanges ?? []) if (change.textDocument && change.edits) byUri.set(change.textDocument.uri, [...(byUri.get(change.textDocument.uri) ?? []), ...change.edits])
-    let count = 0
-    for (const [uri, edits] of byUri) {
-      if (!edits.length) continue
-      const file = workspace.getFile(uri) as StillFile | null
-      const target = file?.getView()
-      if (target) {
-        const doc = target.state.doc
-        target.dispatch({ changes: edits.map(edit => ({ from: positionIn(doc, edit.range.start), to: positionIn(doc, edit.range.end), insert: edit.newText })), userEvent: 'rename' })
-        count++
-        continue
-      }
-      const path = fromUri(workspace.host.root, uri)
-      if (path === null) continue
-      try { await workspace.host.editFile(path, text => applyEdits(text, edits)); count++ } catch (error) { workspace.host.notify("Couldn't change " + path + ': ' + String(error)) }
-    }
+    const count = await applyWorkspaceEdit(workspace, response, 'rename')
     workspace.host.notify('Renamed ' + current + ' to ' + name + (count > 1 ? ' in ' + count + ' files.' : '.'))
     view.focus()
   })
@@ -442,10 +535,21 @@ const closeReferences = (view: EditorView) => {
   return true
 }
 
+/** Symbols anywhere in the project matching a query (functions, classes…), from the server. */
+export async function workspaceSymbols(server: Server, root: string, query: string): Promise<{ name: string; kind: number; container: string; path: string; line: number; column: number }[]> {
+  type Symbol = { name: string; kind: number; containerName?: string; location: { uri: string; range?: LspEdit['range'] } }
+  const found = await server.client.request<object, Symbol[] | null>('workspace/symbol', { query })
+  return (found ?? []).flatMap(symbol => {
+    const path = fromUri(root, symbol.location.uri)
+    if (path === null) return []
+    return [{ name: symbol.name, kind: symbol.kind, container: symbol.containerName ?? '', path, line: (symbol.location.range?.start.line ?? 0) + 1, column: (symbol.location.range?.start.character ?? 0) + 1 }]
+  }).slice(0, 80)
+}
+
 /** What an editor needs to talk to the server about its file. */
-export function serverExtension(server: Server, uri: string, languageId: string): Extension {
+export function serverExtension(server: Server, uri: string, languageId: string, hints = true): Extension {
   return [
-    server.client.plugin(uri, languageId), hoverTooltips({ hoverTime: 450 }), signatureHelp(), referencesField,
+    server.client.plugin(uri, languageId), hoverTooltips({ hoverTime: 450 }), signatureHelp(), referencesField, hints ? inlayHints : [],
     keymap.of([{ key: 'Shift-F12', run: findAllReferences, preventDefault: true }, { key: 'Escape', run: closeReferences }]),
   ]
 }

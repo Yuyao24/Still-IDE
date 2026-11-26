@@ -275,7 +275,7 @@ impl Jobs {
         *active = Some((id.clone(), cancelled.clone(), input.clone()));
         let state = self.clone();
         thread::spawn(move || {
-            let job = Job { app, id, cancelled, interactive, input };
+            let job = Job { app, id, cancelled, interactive, input, env: Mutex::new(Vec::new()) };
             let started = std::time::Instant::now();
             let (code, diagnostics) = match operation(&job) {
                 Ok(result) => result,
@@ -307,6 +307,29 @@ pub struct Job {
     cancelled: Arc<AtomicBool>,
     interactive: bool,
     input: Input,
+    /// Environment variables for every program this job starts (the project's .env and the run's own).
+    env: Mutex<Vec<(String, String)>>,
+}
+
+/// Variables from a .env file (KEY=VALUE lines; `export`, comments and quotes allowed) and from
+/// the run configuration (same format), the run configuration winning.
+pub fn project_env(cwd: &Path, dotenv: bool, extra: Option<&str>) -> Vec<(String, String)> {
+    let parse = |text: &str| -> Vec<(String, String)> {
+        text.lines().filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') { return None }
+            let line = line.strip_prefix("export ").unwrap_or(line);
+            let (key, value) = line.split_once('=')?;
+            let key = key.trim();
+            if key.is_empty() || !key.chars().all(|char| char.is_ascii_alphanumeric() || char == '_') { return None }
+            let value = value.trim();
+            let value = if value.len() >= 2 && ((value.starts_with('"') && value.ends_with('"')) || (value.starts_with('\'') && value.ends_with('\''))) { &value[1..value.len() - 1] } else { value.split(" #").next().unwrap_or(value).trim() };
+            Some((key.to_owned(), value.replace("\\n", "\n")))
+        }).collect()
+    };
+    let mut vars = if dotenv { std::fs::read_to_string(cwd.join(".env")).map(|text| parse(&text)).unwrap_or_default() } else { Vec::new() };
+    if let Some(extra) = extra { vars.extend(parse(extra)); }
+    vars
 }
 
 pub fn stream(mut reader: impl Read, job: &Job, kind: &'static str, capture: bool) -> String {
@@ -344,6 +367,14 @@ impl Job {
         self.input.clone()
     }
 
+    pub fn use_env(&self, vars: Vec<(String, String)>) {
+        if let Ok(mut env) = self.env.lock() { *env = vars; }
+    }
+
+    pub fn env_vars(&self) -> Vec<(String, String)> {
+        self.env.lock().map(|env| env.clone()).unwrap_or_default()
+    }
+
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Relaxed)
     }
@@ -358,6 +389,9 @@ impl Job {
         }
         if self.interactive {
             cmd.stdin(Stdio::piped());
+        }
+        for (key, value) in self.env_vars() {
+            cmd.env(key, value);
         }
         let mut child = cmd
             .stdout(Stdio::piped())
@@ -544,6 +578,8 @@ pub fn run_file(
     id: String,
     build_only: bool,
     args: Option<String>,
+    env: Option<String>,
+    dotenv: Option<bool>,
 ) -> Result<()> {
     let cwd = root(&root_path)?;
     let file = resolve(&cwd, &path)?;
@@ -551,7 +587,9 @@ pub fn run_file(
         return Err("Select a source file to run.".into());
     }
     let args = parse_args(args)?;
+    let vars = project_env(&cwd, dotenv.unwrap_or(true), env.as_deref());
     jobs.start(app, id, true, move |job| {
+        job.use_env(vars);
         let input = Path::new(".").join(relative(&path)?);
         let extension = file.extension().and_then(|part| part.to_str()).unwrap_or_default().to_lowercase();
         match extension.as_str() {

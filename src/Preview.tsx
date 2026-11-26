@@ -3,12 +3,15 @@ import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import { highlightToHtml } from './Editor'
 
-export type DocKind = 'markdown' | 'text'
+export type DocKind = 'markdown' | 'text' | 'tex' | 'svg' | 'notebook'
 
 export function docKind(path: string): DocKind | null {
   const extension = path.split('.').at(-1)?.toLowerCase()
   if (extension === 'md' || extension === 'markdown' || extension === 'mdx') return 'markdown'
   if (extension === 'txt' || extension === 'text') return 'text'
+  if (extension === 'tex' || extension === 'latex' || extension === 'ltx') return 'tex'
+  if (extension === 'svg') return 'svg'
+  if (extension === 'ipynb') return 'notebook'
   return null
 }
 

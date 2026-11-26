@@ -3,7 +3,7 @@ import { Check, CircleDashed, FlaskConical, Play, X } from 'lucide-react'
 import { Icon } from './ui'
 
 export interface TestResult { name: string; group: string; file: string | null; line: number | null; status: 'passed' | 'failed' | 'error' | 'skipped'; message: string; seconds: number }
-export interface TestReport { tool: string; results: TestResult[]; time: number }
+export interface TestReport { tool: string; results: TestResult[]; time: number; coverage?: Record<string, { covered: number[]; missed: number[] }> | null }
 export interface FoundTest { line: number; id: string; name: string }
 
 /** Tests defined in a file: pytest/unittest functions and methods, or JUnit @Test methods. */
@@ -52,9 +52,10 @@ export function resultFor(report: TestReport | null, path: string, test: FoundTe
   return 'passed'
 }
 
-export function TestsPanel({ report, running, onRun, onJump, canRun, why }: {
+export function TestsPanel({ report, running, onRun, onJump, canRun, why, coverage, onCoverage }: {
   report: TestReport | null; running: boolean; canRun: boolean; why?: string
   onRun: (target: 'all' | 'failed' | 'file') => void; onJump: (result: TestResult) => void
+  coverage: boolean; onCoverage: (value: boolean) => void
 }) {
   const [onlyFailed, setOnlyFailed] = useState(false)
   const results = report?.results ?? []
@@ -74,6 +75,7 @@ export function TestsPanel({ report, running, onRun, onJump, canRun, why }: {
         {running ? 'Running tests…' : !report ? (canRun ? 'Run the tests to see results here. ▶ beside a test runs just that one.' : why) : `${passed} passed · ${failed.length} failed${skipped ? ' · ' + skipped + ' skipped' : ''} · ${seconds.toFixed(2)} s · ${report.tool}`}
       </span>
       {report && failed.length > 0 && <label className="tests-filter"><input type="checkbox" checked={onlyFailed} onChange={event => setOnlyFailed(event.target.checked)} /> Only failures</label>}
+      <label className={'tests-filter' + (report && failed.length > 0 ? ' is-next' : '')} title="Measure which lines the tests run (needs pytest-cov) and mark them in the editor"><input type="checkbox" checked={coverage} onChange={event => onCoverage(event.target.checked)} /> Coverage{report?.coverage ? ' · ' + coveragePercent(report.coverage) + '%' : ''}</label>
     </div>
     <div className="tests-list">
       {[...groups].map(([group, items]) => <section key={group}>
@@ -89,4 +91,10 @@ export function TestsPanel({ report, running, onRun, onJump, canRun, why }: {
       {report && !results.length && <p className="dbg-empty tests-empty"><Icon glyph={FlaskConical} size={13} /> No tests were found. Python test files are named test_*.py; Java tests need Maven or Gradle.</p>}
     </div>
   </div>
+}
+
+function coveragePercent(coverage: Record<string, { covered: number[]; missed: number[] }>) {
+  let covered = 0, total = 0
+  for (const file of Object.values(coverage)) { covered += file.covered.length; total += file.covered.length + file.missed.length }
+  return total ? Math.round(covered / total * 100) : 0
 }

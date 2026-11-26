@@ -21,11 +21,32 @@ pub struct TestResult {
     seconds: f64,
 }
 
+#[derive(Serialize, Clone, Default)]
+pub struct Coverage {
+    covered: Vec<u32>,
+    missed: Vec<u32>,
+}
+
 #[derive(Serialize, Clone)]
 struct TestReport {
     id: String,
     tool: String,
     results: Vec<TestResult>,
+    /// Lines run and not run by the tests, per file (pytest with pytest-cov).
+    coverage: Option<std::collections::HashMap<String, Coverage>>,
+}
+
+/// Reads coverage.py's JSON report: { files: { path: { executed_lines, missing_lines } } }.
+fn parse_coverage(json: &str, cwd: &Path) -> std::collections::HashMap<String, Coverage> {
+    let mut found = std::collections::HashMap::new();
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else { return found };
+    let lines = |item: &serde_json::Value, key: &str| item[key].as_array().map(|list| list.iter().filter_map(|line| line.as_u64().map(|line| line as u32)).collect()).unwrap_or_default();
+    for (path, item) in value["files"].as_object().into_iter().flatten() {
+        let full = cwd.join(path);
+        let relative = full.strip_prefix(cwd).map(|path| path.to_string_lossy().replace('\\', "/")).unwrap_or_else(|_| path.replace('\\', "/"));
+        found.insert(relative, Coverage { covered: lines(item, "executed_lines"), missed: lines(item, "missing_lines") });
+    }
+    found
 }
 
 fn unescape(text: &str) -> String {
@@ -40,7 +61,7 @@ fn attribute(tag: &str, name: &str) -> Option<String> {
 }
 
 /// Reads <testcase> entries from a JUnit XML report (pytest, Maven Surefire and Gradle all write it).
-fn parse_junit(xml: &str, results: &mut Vec<TestResult>) {
+pub fn parse_junit(xml: &str, results: &mut Vec<TestResult>) {
     let mut rest = xml;
     while let Some(start) = rest.find("<testcase") {
         rest = &rest[start..];
@@ -79,6 +100,11 @@ fn parse_junit(xml: &str, results: &mut Vec<TestResult>) {
     }
 }
 
+/// Sends a test report to the window (also used for tests run on a server).
+pub fn emit_report(app: &AppHandle, id: String, tool: String, results: Vec<TestResult>) {
+    let _ = app.emit("test-results", TestReport { id, tool, results, coverage: None });
+}
+
 fn report_dir() -> PathBuf {
     std::env::temp_dir().join(format!("still-tests-{}", std::process::id()))
 }
@@ -86,8 +112,11 @@ fn report_dir() -> PathBuf {
 /// Runs tests. `target` is empty for all tests, a file path, or a test id (`path::name`,
 /// `path::Class::name` for Python, `Class#method` for Java).
 #[tauri::command]
-pub fn tests_run(app: AppHandle, jobs: State<Jobs>, root_path: String, id: String, target: Option<String>, language: String) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+pub fn tests_run(app: AppHandle, jobs: State<Jobs>, root_path: String, id: String, target: Option<String>, language: String, dotenv: Option<bool>, coverage: Option<bool>) -> Result<()> {
     let cwd = root(&root_path)?;
+    let vars = crate::process::project_env(&cwd, dotenv.unwrap_or(true), None);
+    let want_coverage = coverage.unwrap_or(false);
     let target = target.filter(|value| !value.trim().is_empty());
     if let Some(value) = &target {
         let path_part = value.split("::").next().unwrap_or("");
@@ -97,6 +126,7 @@ pub fn tests_run(app: AppHandle, jobs: State<Jobs>, root_path: String, id: Strin
     let events = app.clone();
     let report_id = id.clone();
     jobs.start(app, id, true, move |job| {
+        job.use_env(vars);
         let reports = report_dir();
         let _ = std::fs::remove_dir_all(&reports);
         std::fs::create_dir_all(&reports).map_err(err)?;
@@ -104,21 +134,29 @@ pub fn tests_run(app: AppHandle, jobs: State<Jobs>, root_path: String, id: Strin
         let (code, tool) = if language == "java" {
             run_java(job, &cwd, target.as_deref(), &mut results)?
         } else {
-            run_python(job, &cwd, target.as_deref(), &reports, &mut results)?
+            run_python(job, &cwd, target.as_deref(), &reports, &mut results, want_coverage)?
         };
-        let _ = events.emit("test-results", TestReport { id: report_id, tool, results });
+        let coverage = std::fs::read_to_string(reports.join("coverage.json")).ok().map(|json| parse_coverage(&json, &cwd));
+        let _ = events.emit("test-results", TestReport { id: report_id, tool, results, coverage });
         let _ = std::fs::remove_dir_all(&reports);
         Ok((code, Vec::new()))
     })
 }
 
-fn run_python(job: &crate::process::Job, cwd: &Path, target: Option<&str>, reports: &Path, results: &mut Vec<TestResult>) -> Result<(i32, String)> {
+fn run_python(job: &crate::process::Job, cwd: &Path, target: Option<&str>, reports: &Path, results: &mut Vec<TestResult>, coverage: bool) -> Result<(i32, String)> {
     let (interpreter, _, _) = python(cwd).ok_or("Python 3 was not found on PATH or in .venv.")?;
     let has_pytest = command(&interpreter, cwd).args(["-c", "import pytest"]).output().is_ok_and(|out| out.status.success());
     if has_pytest {
         let report = reports.join("pytest.xml");
         let mut cmd = command(&interpreter, cwd);
         cmd.env("PYTHONIOENCODING", "utf-8").args(["-m", "pytest", "-q", "--tb=short", "-o", "junit_family=xunit1", "-p", "no:cacheprovider"]).arg(format!("--junitxml={}", report.to_string_lossy()));
+        if coverage {
+            if command(&interpreter, cwd).args(["-c", "import pytest_cov"]).output().is_ok_and(|out| out.status.success()) {
+                cmd.arg("--cov=.").arg(format!("--cov-report=json:{}", reports.join("coverage.json").to_string_lossy())).arg("--cov-report=");
+            } else {
+                job.emit("stderr", "Coverage needs pytest-cov: pip install pytest-cov\n".into());
+            }
+        }
         if let Some(value) = target { cmd.arg(value); }
         job.emit("command", format!("$ python -m pytest -q{}\n", target.map(|value| format!(" {value}")).unwrap_or_default()));
         let (code, _) = job.run(&mut cmd, false)?;

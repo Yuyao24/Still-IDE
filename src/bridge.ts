@@ -49,6 +49,13 @@ export const fileName = (path: string) => path.split('/').at(-1) || path
 export const parentPath = (path: string) => path.split('/').slice(0, -1).join('/')
 export const normalize = (text: string) => text.replace(/\r\n?/g, '\n')
 export const demo: Workspace = { root: 'orbit-lab', name: 'Orbit Lab', sample: true }
+
+/** Forgets what Still remembered for a project folder (breakpoints, watches, run settings, open
+ *  files, canvas layout), so a new project created in the same place starts clean. */
+export function forgetProject(root: string) {
+  const prefixes = ['still.breakpoints.', 'still.breakpointOptions.', 'still.watches.', 'still.runconfig.', 'still.session.', 'still.canvas.']
+  try { for (const prefix of prefixes) localStorage.removeItem(prefix + root) } catch { /* storage unavailable */ }
+}
 const demoContents: Record<string, string> = {
   'src/app.py': appSource, 'src/Main.java': javaSource, 'tests/test_orbit.py': orbitTest,
   '.gitignore': gitignore, 'README.md': readme, 'requirements.txt': requirements,
@@ -114,6 +121,8 @@ export const home = {
   setRoot: (path: string) => invoke<string>('set_projects_root', { path }),
   open: async (path: string): Promise<Workspace> => desktop ? invoke('open_project', { path }) : demo,
   forget: (path: string) => invoke<void>('forget_project', { path }),
+  /** Moves the project folder to the system trash and takes it off Home. */
+  remove: (path: string) => invoke<void>('delete_project', { path }),
   pin: (path: string, pinned: boolean) => invoke<void>('pin_project', { path, pinned }),
   create: (name: string, templateKind: string, parent: string | null, git: boolean, readme = true, requirements = true) => invoke<Workspace>('create_project', { name, templateKind, parent, git, readme, requirements }),
   clone: (id: string, url: string, name: string | null, parent: string | null) => invoke<string>('clone_project', { id, url, name, parent }),
@@ -176,6 +185,8 @@ export interface FileSystem {
   list: (path?: string) => Promise<Entry[]>
   files: () => Promise<Entry[]>
   read: (path: string) => Promise<string>
+  /** A binary file (PDF, image) as base64. */
+  readBinary: (path: string) => Promise<string>
   save: (path: string, contents: string, previous: string) => Promise<void>
   create: (path: string) => Promise<void>
   createFolder: (path: string) => Promise<void>
@@ -195,6 +206,7 @@ export function fileSystem(workspace: Workspace): FileSystem {
       list: (path = '') => call('ssh_list', { path }),
       files: () => call('ssh_files', {}),
       read: async path => normalize(await call<string>('ssh_read', { path })),
+      readBinary: path => call<string>('ssh_read_binary', { path }),
       save: (path, contents) => call('ssh_write', { path, contents }),
       create: path => call('ssh_fs', { op: 'touch', path, target: null }),
       createFolder: path => call('ssh_fs', { op: 'mkdir', path, target: null }),
@@ -207,6 +219,7 @@ export function fileSystem(workspace: Workspace): FileSystem {
     list: (path = '') => invoke('list_directory', { rootPath, path }),
     files: () => invoke('list_files', { rootPath }),
     read: async path => normalize(await invoke<string>('read_file', { rootPath, path })),
+    readBinary: path => invoke<string>('read_binary', { rootPath, path }),
     save: (path, contents, previous) => invoke('save_file', { rootPath, path, contents, previous }),
     create: path => invoke('create_file', { rootPath, path }),
     createFolder: path => invoke('create_folder', { rootPath, path }),
@@ -219,6 +232,7 @@ export function fileSystem(workspace: Workspace): FileSystem {
     list: async (path = '') => demoTree(path),
     files: async () => Object.keys(disk()).map(path => ({ path, name: fileName(path), directory: false })),
     read: async path => normalize(disk()[path] ?? ''),
+    readBinary: async () => { throw new Error('PDFs and images open in the Still desktop app.') },
     save: async (path, contents) => write({ ...disk(), [path]: contents }),
     create: async path => api.create(rootPath, path),
     createFolder: async () => { throw new Error('Folders are available in the Still desktop app.') },
@@ -272,6 +286,10 @@ export const api = {
     ? invoke('detect_runtimes', { rootPath }) : { python: null, pythonVenv: false, java: null, shell: 'Shell' },
   branches: (rootPath: string) => invoke<Branches>('git_branches', { rootPath }),
   checkout: (rootPath: string, branch: string, create: boolean) => invoke<void>('git_checkout', { rootPath, branch, create }),
+  stash: (rootPath: string, action: 'push' | 'pop' | 'apply' | 'drop' | 'list', index?: number, message?: string) => invoke<{ index: number; message: string; when: string }[]>('git_stash', { rootPath, action, index: index ?? null, message: message ?? null }),
+  applyPatch: (rootPath: string, patch: string, cached: boolean, reverse = false) => invoke<void>('git_apply_patch', { rootPath, patch, cached, reverse }),
+  remoteUrl: (rootPath: string) => invoke<string>('git_remote_url', { rootPath }),
+  checkoutPr: (rootPath: string, number: number) => invoke<string>('git_checkout_pr', { rootPath, number }),
   stageAll: async (rootPath: string, unstage: boolean) => {
     if (desktop) return invoke<void>('git_stage_all', { rootPath, unstage })
     if (unstage) staged.clear()
@@ -352,6 +370,11 @@ export function fileTemplate(path: string): string {
 
 export interface BlameLine { line: number; hash: string; author: string; time: number; summary: string }
 export interface FileCommit { hash: string; subject: string; author: string; time: number; path: string }
+export interface TexResult { pdf: string | null; engine: string | null; seconds: number; errors: { line: number; message: string }[]; log: string }
+export const tex = {
+  compile: (rootPath: string, path: string) => invoke<TexResult>('tex_compile', { rootPath, path }),
+}
+
 export const history = {
   save: (rootPath: string, path: string, contents: string) => desktop ? invoke<void>('history_save', { rootPath, path, contents }) : Promise.resolve(),
   list: async (rootPath: string, path: string): Promise<{ id: string; time: number; size: number }[]> => desktop ? invoke('history_list', { rootPath, path }) : [],

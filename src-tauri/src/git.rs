@@ -437,3 +437,87 @@ pub async fn git_init(root_path: String) -> Result<()> {
     .await
     .map_err(err)?
 }
+
+#[derive(Serialize)]
+pub struct Stash {
+    index: u32,
+    message: String,
+    when: String,
+}
+
+/// Stashes: put changes aside (`push`, untracked files too), bring the latest back (`pop`),
+/// or apply / drop a particular one. Returns the list after the action.
+#[tauri::command]
+pub async fn git_stash(root_path: String, action: String, index: Option<u32>, message: Option<String>) -> Result<Vec<Stash>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let cwd = root(&root_path)?;
+        let target = format!("stash@{{{}}}", index.unwrap_or(0));
+        match action.as_str() {
+            "push" => {
+                let mut cmd = git(&cwd);
+                cmd.args(["stash", "push", "--include-untracked"]);
+                if let Some(message) = message.as_deref().map(str::trim).filter(|value| !value.is_empty()) { cmd.args(["-m", message]); }
+                check(cmd.output().map_err(err)?)?;
+            }
+            "pop" => { check(git(&cwd).args(["stash", "pop", &target]).output().map_err(err)?)?; }
+            "apply" => { check(git(&cwd).args(["stash", "apply", &target]).output().map_err(err)?)?; }
+            "drop" => { check(git(&cwd).args(["stash", "drop", &target]).output().map_err(err)?)?; }
+            "list" => {}
+            _ => return Err("Unknown stash action.".into()),
+        }
+        let listing = text(git(&cwd).args(["stash", "list", "--format=%gd%x1f%s%x1f%cr"]))?;
+        Ok(listing.lines().filter_map(|line| {
+            let mut parts = line.split('\u{1f}');
+            let reference = parts.next()?;
+            let index = reference.trim_start_matches("stash@{").trim_end_matches('}').parse().ok()?;
+            Some(Stash { index, message: parts.next().unwrap_or("").to_owned(), when: parts.next().unwrap_or("").to_owned() })
+        }).collect())
+    })
+    .await
+    .map_err(err)?
+}
+
+/// Applies a patch for one change: to the index (stage it), or in reverse to the index (unstage it).
+#[tauri::command]
+pub async fn git_apply_patch(root_path: String, patch: String, cached: bool, reverse: bool) -> Result<()> {
+    tauri::async_runtime::spawn_blocking(move || {
+        use std::io::Write;
+        let cwd = root(&root_path)?;
+        let mut cmd = git(&cwd);
+        cmd.args(["apply", "--unidiff-zero", "--whitespace=nowarn", "--recount"]);
+        if cached { cmd.arg("--cached"); }
+        if reverse { cmd.arg("--reverse"); }
+        cmd.arg("-").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn().map_err(err)?;
+        if let Some(mut stdin) = child.stdin.take() { stdin.write_all(patch.as_bytes()).map_err(err)?; }
+        check(child.wait_with_output().map_err(err)?)?;
+        Ok(())
+    })
+    .await
+    .map_err(err)?
+}
+
+/// The `origin` remote's URL (empty when there is none).
+#[tauri::command]
+pub async fn git_remote_url(root_path: String) -> Result<String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let cwd = root(&root_path)?;
+        Ok(git(&cwd).args(["remote", "get-url", "origin"]).output().ok().filter(|out| out.status.success()).map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned()).unwrap_or_default())
+    })
+    .await
+    .map_err(err)?
+}
+
+/// Fetches a GitHub pull request into a local branch `pr-<number>` and switches to it.
+#[tauri::command]
+pub async fn git_checkout_pr(root_path: String, number: u32) -> Result<String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let cwd = root(&root_path)?;
+        let branch = format!("pr-{number}");
+        check(git(&cwd).args(["fetch", "origin", &format!("pull/{number}/head:{branch}"), "--force"]).output().map_err(err)?)?;
+        check(git(&cwd).args(["checkout", &branch]).output().map_err(err)?)?;
+        Ok(branch)
+    })
+    .await
+    .map_err(err)?
+}

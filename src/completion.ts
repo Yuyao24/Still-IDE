@@ -163,6 +163,15 @@ const builtinSnippets: Snippet[] = [
   { language: 'javascript', prefix: 'if', description: 'if / else', body: 'if (${condition}) {\n\t${}\n} else {\n\t${}\n}' },
   { language: 'javascript', prefix: 'try', description: 'try / catch', body: 'try {\n\t${}\n} catch (${error}) {\n\t${console.error(error)}\n}' },
   { language: 'javascript', prefix: 'imp', description: 'import', body: "import ${name} from '${module}'" },
+  { language: 'latex', prefix: 'begin', description: 'environment', body: '\\begin{${env}}\n\t${}\n\\end{${env}}' },
+  { language: 'latex', prefix: 'doc', description: 'document skeleton', body: '\\documentclass{article}\n\\usepackage{amsmath}\n\n\\title{${Title}}\n\\author{${Author}}\n\n\\begin{document}\n\\maketitle\n\n${}\n\n\\end{document}' },
+  { language: 'latex', prefix: 'sec', description: 'section', body: '\\section{${title}}\n${}' },
+  { language: 'latex', prefix: 'eq', description: 'equation', body: '\\begin{equation}\n\t${}\n\\end{equation}' },
+  { language: 'latex', prefix: 'align', description: 'aligned equations', body: '\\begin{align}\n\t${a} &= ${b} \\\\\n\\end{align}' },
+  { language: 'latex', prefix: 'item', description: 'itemize list', body: '\\begin{itemize}\n\t\\item ${}\n\\end{itemize}' },
+  { language: 'latex', prefix: 'enum', description: 'numbered list', body: '\\begin{enumerate}\n\t\\item ${}\n\\end{enumerate}' },
+  { language: 'latex', prefix: 'fig', description: 'figure', body: '\\begin{figure}[h]\n\t\\centering\n\t\\includegraphics[width=0.8\\linewidth]{${file}}\n\t\\caption{${caption}}\n\t\\label{fig:${label}}\n\\end{figure}' },
+  { language: 'latex', prefix: 'frac', description: 'fraction', body: '\\frac{${a}}{${b}}' },
 ]
 let customSnippets: Snippet[] = []
 /** Snippets from Settings → Editor → Snippets. */
@@ -215,7 +224,9 @@ export function smartCompletions(languageName: string): CompletionSource {
       for (const snippet of snippetsFor(languageName)) {
         if (seen.has(snippet.prefix) || !(snippet.prefix.startsWith(typed) || snippet.prefix.toLowerCase().startsWith(lower)) || (!typed && !context.explicit)) continue
         seen.add(snippet.prefix)
-        const option = snippetCompletion(snippet.body, { label: snippet.prefix, detail: snippet.description, type: 'snippet' })
+        // A LaTeX command typed after its backslash: don't add a second one.
+        const body = snippet.body.startsWith('\\') && context.state.sliceDoc(from - 1, from) === '\\' ? snippet.body.slice(1) : snippet.body
+        const option = snippetCompletion(body, { label: snippet.prefix, detail: snippet.description, type: 'snippet' })
         const exact = snippet.prefix === typed ? 1.2 : 0
         scored.set(snippet.prefix + ' snippet', { ...option, ['source' as never]: 'snippet', score: 1.55 + exact - snippet.prefix.length * 0.004 } as Completion & { score: number })
       }

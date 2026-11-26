@@ -119,6 +119,23 @@ const Card = memo(function Card({ node, x, y, html, active, selected, changed, d
 })
 
 /** The full canvas, filling the window. */
+/** The dot grid keeps an even density at any zoom, as graphing tools do with grid lines: dots on
+ *  screen stay 22–44px apart, and a finer set fades in between them as you zoom in (and out as you
+ *  zoom out), so changing level never pops. */
+function dotGrid(camera: { x: number; y: number; k: number }) {
+  let spacing = 22 * camera.k
+  while (spacing < 22) spacing *= 2
+  while (spacing >= 44) spacing /= 2
+  const fine = Math.max(0, Math.min(1, (spacing - 22) / 22))
+  const dot = (alpha: number) => `radial-gradient(color-mix(in srgb, var(--muted) ${alpha.toFixed(1)}%, transparent) 1px, transparent 1.2px)`
+  const position = `${camera.x}px ${camera.y}px`
+  return {
+    backgroundImage: `${dot(34)}, ${dot(34 * fine * fine)}`,
+    backgroundSize: `${spacing}px ${spacing}px, ${spacing / 2}px ${spacing / 2}px`,
+    backgroundPosition: `${position}, ${position}`,
+  }
+}
+
 export function CanvasView({ graph, error, root, project, active, changed, onOpen, onClose }: ViewProps) {
   const [scope, setScope] = useState<Scope>('all')
   const [saved, setSaved] = useState(() => load(root))
@@ -299,7 +316,7 @@ export function CanvasView({ graph, error, root, project, active, changed, onOpe
     </header>
     <div ref={desk} className="cv-desk" onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up}
       onDoubleClick={event => { const id = (event.target as Element).closest<HTMLElement>('[data-card]')?.dataset.card; if (id) onOpen(id) }}
-      style={{ backgroundSize: `${22 * camera.k}px ${22 * camera.k}px`, backgroundPosition: `${camera.x}px ${camera.y}px` }}>
+      style={dotGrid(camera)}>
       {!graph && <p className="graph-note">{error || 'Laying out your files…'}</p>}
       {graph && !shown.nodes.length && <p className="graph-note">{scope === 'changed' ? 'No changed files.' : 'No files to show yet.'}</p>}
       <div className={'cv-world' + (far ? ' is-far' : '')} style={{ transform: world }}>
