@@ -49,6 +49,8 @@ interface ExplorerProps {
   onJump: (line: number) => void
   onContext: (event: MouseEvent, entry: Entry | null) => void
   onKey: (event: KeyboardEvent, entry: Entry) => void
+  /** Drag a file or folder onto a folder to move it there. */
+  onMove?: (entry: Entry, folder: string) => void
 }
 
 export function Explorer(props: ExplorerProps) {
@@ -56,14 +58,60 @@ export function Explorer(props: ExplorerProps) {
   const [rootOpen, setRootOpen] = useState(true)
   useEffect(() => setRootOpen(true), [props.workspace?.root])
   const changes = useMemo(() => new Map(props.changes.changes.map(change => [change.path, change])), [props.changes])
+  // ---- Dragging a row onto a folder (pointer events, so it works the same in every webview) ----
+  const [drag, setDrag] = useState<{ entry: Entry; x: number; y: number; folder: string | null } | null>(null)
+  const suppressClick = useRef(false)
+  const propsRef = useRef(props)
+  propsRef.current = props
+  function rowPointerDown(event: React.PointerEvent, entry: Entry) {
+    if (event.button !== 0 || !props.onMove) return
+    const start = { x: event.clientX, y: event.clientY }
+    let current: { entry: Entry; x: number; y: number; folder: string | null } | null = null
+    let hover: { folder: string; since: number } | null = null
+    const folderAt = (x: number, y: number) => {
+      const row = document.elementFromPoint(x, y)?.closest<HTMLElement>('[data-folder]')
+      if (!row || !row.closest('.tree-scroll')) return null
+      const folder = row.dataset.folder ?? ''
+      // Not into itself, its own folder, or somewhere inside it.
+      if (folder === entry.path || folder.startsWith(entry.path + '/') || folder === parentPath(entry.path)) return null
+      return folder
+    }
+    const move = (next: PointerEvent) => {
+      if (!current && Math.hypot(next.clientX - start.x, next.clientY - start.y) < 6) return
+      const folder = folderAt(next.clientX, next.clientY)
+      current = { entry, x: next.clientX, y: next.clientY, folder }
+      setDrag(current)
+      // Hovering a closed folder for a moment opens it.
+      const row = document.elementFromPoint(next.clientX, next.clientY)?.closest<HTMLElement>('[data-folder-row]')
+      const path = row?.dataset.folderRow
+      if (path && path !== hover?.folder) hover = { folder: path, since: Date.now() }
+      else if (path && hover && Date.now() - hover.since > 650 && !propsRef.current.expanded.has(path)) { propsRef.current.onExpand(path); hover = { folder: path, since: Infinity } }
+      if (!path) hover = null
+    }
+    const finish = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); window.removeEventListener('keydown', key, true); setDrag(null) }
+    const up = () => {
+      finish()
+      if (!current) return
+      suppressClick.current = true
+      setTimeout(() => { suppressClick.current = false }, 0)
+      if (current.folder !== null) propsRef.current.onMove?.(entry, current.folder)
+    }
+    const key = (next: globalThis.KeyboardEvent) => { if (next.key === 'Escape') { next.preventDefault(); next.stopPropagation(); current = null; finish() } }
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', up)
+    window.addEventListener('keydown', key, true)
+  }
   function rows(path: string, depth: number) {
     return props.directories[path]?.map((item): React.ReactNode => {
       const expanded = props.expanded.has(item.path)
       const change = changes.get(item.path)
       const mark = change?.worktree === '?' ? 'U' : (change?.worktree.trim() || change?.index.trim())
       return <div key={item.path}>
-        <button type="button" className={'tree-row' + (props.active === item.path ? ' is-active' : '')}
+        <button type="button" className={'tree-row' + (props.active === item.path ? ' is-active' : '') + (drag && drag.folder !== null && item.directory && drag.folder === item.path ? ' is-drop' : '') + (drag?.entry.path === item.path ? ' is-dragged' : '')}
           style={{ paddingLeft: 11 + depth * 15, paddingRight: 9 }} title={item.path}
+          data-folder={item.directory ? item.path : parentPath(item.path)} data-folder-row={item.directory ? item.path : undefined}
+          onPointerDown={event => rowPointerDown(event, item)}
+          onClickCapture={event => { if (suppressClick.current) { event.preventDefault(); event.stopPropagation() } }}
           aria-expanded={item.directory ? expanded : undefined}
           aria-current={props.active === item.path ? 'true' : undefined}
           onContextMenu={event => { event.preventDefault(); props.onContext(event, item) }}
@@ -91,12 +139,15 @@ export function Explorer(props: ExplorerProps) {
     </div>
     <div className="tree-scroll" onContextMenu={event => { if (event.target === event.currentTarget) { event.preventDefault(); props.onContext(event, null) } }}>
       {props.workspace && <>
-        <button className="project-row" onClick={() => setRootOpen(open => !open)} aria-expanded={rootOpen} title={props.workspace.remote ? props.workspace.hostName + ':' + props.workspace.root : props.workspace.root}
+        <button className={'project-row' + (drag?.folder === '' ? ' is-drop' : '')} data-folder="" onClick={() => setRootOpen(open => !open)} aria-expanded={rootOpen} title={props.workspace.remote ? props.workspace.hostName + ':' + props.workspace.root : props.workspace.root}
           onContextMenu={event => { event.preventDefault(); props.onContext(event, null) }}>
           <Icon glyph={rootOpen ? ChevronDown : ChevronRight} size={12} /><Icon glyph={props.workspace.remote ? Server : Folder} className="project-folder" />
           <span className="truncate">{props.workspace.name}</span>
         </button>
         {rootOpen && rows('', 0)}
+        {drag && <div className="tree-drag-ghost" style={{ left: drag.x + 12, top: drag.y + 10 }}>
+          {drag.entry.name}{drag.folder !== null ? <span> → {drag.folder ? drag.folder.split('/').at(-1) : props.workspace.name}</span> : null}
+        </div>}
         {rootOpen && props.directories['']?.length === 0 && <p className="help px-5 py-1">This folder is empty.</p>}
       </>}
     </div>

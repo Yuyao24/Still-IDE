@@ -168,24 +168,30 @@ export function SvgView({ text }: { text: string }) {
 }
 
 // ---- LaTeX ----
-export interface TexResult { pdf: string | null; engine: string | null; seconds: number; errors: { line: number; message: string }[]; log: string }
+export interface TexResult { pdf: string | null; engine: string | null; seconds: number; errors: { line: number; message: string }[]; log: string; notes?: string[] }
 
 export function TexPreview({ text, result, compiling, onJump }: { text: string; result: TexResult | null; compiling: boolean; onJump: (line: number) => void }) {
   const pdf = useMemo(() => result?.pdf ? fromBase64(result.pdf) : null, [result?.pdf])
   const rough = useMemo(() => result && !result.engine ? texToHtml(text) : '', [text, result])
+  const failed = Boolean(result && result.engine && !pdf)
   return <div className="tex-view">
-    <div className={'tex-status' + (result?.errors.length ? ' is-error' : '')}>
+    <div className={'tex-status' + (result?.errors.length || failed ? ' is-error' : '')}>
       {compiling ? 'Compiling…'
         : !result ? 'Save to compile.'
-          : !result.engine ? 'No TeX found: showing a quick reading view. Install MiKTeX, TeX Live or Tectonic for the real PDF.'
+          : !result.engine ? 'No TeX found: showing a quick reading view. Install MiKTeX, TeX Live or Tectonic for the real PDF (if you just installed one, save again).'
             : result.errors.length ? `${result.errors.length} ${result.errors.length === 1 ? 'error' : 'errors'} · ${result.engine}`
-              : `Compiled with ${result.engine} in ${result.seconds.toFixed(1)} s`}
+              : !pdf ? `${result.engine} stopped without making a PDF`
+                : `Compiled with ${result.engine} in ${result.seconds.toFixed(1)} s`}
     </div>
+    {result?.notes?.length ? <div className="tex-notes">{result.notes.map((note, index) => <p key={index}>{note}</p>)}</div> : null}
     {result?.errors.length ? <div className="tex-errors">{result.errors.slice(0, 20).map((item, index) => <button key={index} onClick={() => onJump(item.line)}><b>{item.line ? 'Line ' + item.line : 'TeX'}</b> {item.message}</button>)}</div> : null}
     {result && !result.engine
       ? <div className="doc-preview"><article className="doc-body doc-markdown tex-rough" dangerouslySetInnerHTML={{ __html: rough }} /></div>
       : pdf ? <PdfView data={pdf} label="the compiled PDF" />
-        : <p className="doc-message">{compiling || !result ? 'Compiling…' : 'No PDF yet. Fix the errors above and save.'}</p>}
+        : compiling || !result ? <p className="doc-message">Compiling…</p>
+          : result.errors.length ? <p className="doc-message">No PDF yet. Fix the errors above and save.</p>
+            // No errors Still could read: show what TeX said, so the reason is visible.
+            : <div className="tex-log"><p className="doc-message">Here is the end of what {result.engine} printed:</p><pre>{result.log || '(nothing)'}</pre></div>}
   </div>
 }
 

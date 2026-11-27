@@ -1,21 +1,25 @@
 // A small picture of the whole file, each word a coloured stroke, with a box for the part on
 // screen. Click or drag to move through the file.
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import { minimapTokens } from './Editor'
 
 const colorVars: Record<string, string> = { keyword: '--keyword', string: '--string', number: '--number', type: '--type', function: '--function', variable: '--variable', comment: '--comment', property: '--property', operator: '--operator', tag: '--tag', attribute: '--attribute' }
 
-export function Minimap({ path, text, viewport, onScroll }: {
+type View = { top: number; height: number; lines: number }
+export function Minimap({ path, text, viewports, pane, onScroll }: {
   path: string | null; text: string
-  viewport: { top: number; height: number; lines: number } | null
+  /** Where each pane's editor is scrolled; the minimap follows the focused one without re-rendering the window. */
+  viewports: { get: (pane: string) => View | null; subscribe: (listener: () => void) => () => void }
+  pane: string
   onScroll: (fraction: number) => void
 }) {
+  const viewport = useSyncExternalStore(viewports.subscribe, () => viewports.get(pane))
   const host = useRef<HTMLDivElement>(null)
   const canvas = useRef<HTMLCanvasElement>(null)
   const [size, setSize] = useState({ width: 240, height: 600 })
   // Recolouring waits for typing to pause.
   const [settled, setSettled] = useState(text)
-  useEffect(() => { const timer = setTimeout(() => setSettled(text), 250); return () => clearTimeout(timer) }, [text])
+  useEffect(() => { const timer = setTimeout(() => setSettled(text), 120); return () => clearTimeout(timer) }, [text])
   const runs = useMemo(() => path ? minimapTokens(settled, path) : [], [settled, path])
   const lines = Math.max(1, settled.split('\n').length)
 

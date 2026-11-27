@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { type Theme, applySyntax, applyTheme, findTheme, presets , resolve as resolveTheme } from './themes'
 import { desktop } from './bridge'
 import { type Snippet, setCustomSnippets } from './completion'
+import { setSpellWords } from './spell'
 
 export interface Settings {
   theme: string
@@ -69,6 +70,11 @@ export interface Settings {
   autoFString: boolean
   continueComments: boolean
   hotExit: boolean
+  shellIntegration: boolean
+  spellCheck: boolean
+  /** When a file moves or is renamed, offer to update the imports that point at it. */
+  updateImports: boolean
+  spellWords: string[]
   /** Keep the header of the function or class you're in pinned at the top of the editor. */
   stickyScroll: boolean
   /** Load the project's .env file into runs, debugging and tests. */
@@ -163,6 +169,10 @@ export const defaults: Settings = {
   autoFString: true,
   continueComments: false,
   hotExit: true,
+  shellIntegration: true,
+  spellCheck: true,
+  updateImports: true,
+  spellWords: [],
   stickyScroll: true,
   loadDotEnv: true,
   pauseOnExceptions: 'uncaught',
@@ -202,6 +212,7 @@ function merge(value: unknown): Settings {
   // Version 2: word suggestions became smart and on by default; AI completion is its own setting.
   if (!stored.settingsVersion || stored.settingsVersion < 2) { merged.autocomplete = true; merged.settingsVersion = 2 }
   if (!Array.isArray(merged.customThemes)) merged.customThemes = []
+  if (!Array.isArray(merged.spellWords)) merged.spellWords = []
   return merged
 }
 
@@ -283,6 +294,7 @@ export function applySettings(settings: Settings, systemDark: boolean) {
   classes.toggle('reduce-motion', settings.reduceMotion)
   watchKeyRepeat()
   setCustomSnippets(settings.customSnippets)
+  setSpellWords(Array.isArray(settings.spellWords) ? settings.spellWords : [])
   return theme
 }
 

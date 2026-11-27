@@ -12,13 +12,13 @@ use tauri::{AppHandle, Emitter, State};
 
 #[derive(Serialize, Clone, Default)]
 pub struct TestResult {
-    name: String,
-    group: String,
-    file: Option<String>,
-    line: Option<u32>,
-    status: String,
-    message: String,
-    seconds: f64,
+    pub name: String,
+    pub group: String,
+    pub file: Option<String>,
+    pub line: Option<u32>,
+    pub status: String,
+    pub message: String,
+    pub seconds: f64,
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -32,12 +32,17 @@ struct TestReport {
     id: String,
     tool: String,
     results: Vec<TestResult>,
-    /// Lines run and not run by the tests, per file (pytest with pytest-cov).
+    /// Lines run and not run by the tests, per file (pytest-cov for Python, JaCoCo for Java).
     coverage: Option<std::collections::HashMap<String, Coverage>>,
 }
 
+/// Sends the results (and coverage) of a test run to the window (also for runs on a server or in a container).
+pub(crate) fn emit_report(app: &AppHandle, id: String, tool: String, results: Vec<TestResult>, coverage: Option<std::collections::HashMap<String, Coverage>>) {
+    let _ = app.emit("test-results", TestReport { id, tool, results, coverage });
+}
+
 /// Reads coverage.py's JSON report: { files: { path: { executed_lines, missing_lines } } }.
-fn parse_coverage(json: &str, cwd: &Path) -> std::collections::HashMap<String, Coverage> {
+pub(crate) fn parse_coverage(json: &str, cwd: &Path) -> std::collections::HashMap<String, Coverage> {
     let mut found = std::collections::HashMap::new();
     let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else { return found };
     let lines = |item: &serde_json::Value, key: &str| item[key].as_array().map(|list| list.iter().filter_map(|line| line.as_u64().map(|line| line as u32)).collect()).unwrap_or_default();
@@ -100,10 +105,6 @@ pub fn parse_junit(xml: &str, results: &mut Vec<TestResult>) {
     }
 }
 
-/// Sends a test report to the window (also used for tests run on a server).
-pub fn emit_report(app: &AppHandle, id: String, tool: String, results: Vec<TestResult>) {
-    let _ = app.emit("test-results", TestReport { id, tool, results, coverage: None });
-}
 
 fn report_dir() -> PathBuf {
     std::env::temp_dir().join(format!("still-tests-{}", std::process::id()))
@@ -131,12 +132,13 @@ pub fn tests_run(app: AppHandle, jobs: State<Jobs>, root_path: String, id: Strin
         let _ = std::fs::remove_dir_all(&reports);
         std::fs::create_dir_all(&reports).map_err(err)?;
         let mut results = Vec::new();
+        let mut java_coverage = None;
         let (code, tool) = if language == "java" {
-            run_java(job, &cwd, target.as_deref(), &mut results)?
+            run_java(job, &cwd, target.as_deref(), &reports, &mut results, want_coverage.then_some(&mut java_coverage))?
         } else {
             run_python(job, &cwd, target.as_deref(), &reports, &mut results, want_coverage)?
         };
-        let coverage = std::fs::read_to_string(reports.join("coverage.json")).ok().map(|json| parse_coverage(&json, &cwd));
+        let coverage = java_coverage.or_else(|| std::fs::read_to_string(reports.join("coverage.json")).ok().map(|json| parse_coverage(&json, &cwd)));
         let _ = events.emit("test-results", TestReport { id: report_id, tool, results, coverage });
         let _ = std::fs::remove_dir_all(&reports);
         Ok((code, Vec::new()))
@@ -188,26 +190,64 @@ fn run_python(job: &crate::process::Job, cwd: &Path, target: Option<&str>, repor
     Ok((code, "unittest".into()))
 }
 
-fn run_java(job: &crate::process::Job, cwd: &Path, target: Option<&str>, results: &mut Vec<TestResult>) -> Result<(i32, String)> {
+/// JaCoCo through the build without changing it: Maven runs the plugin's goals by name; Gradle
+/// gets an init script that applies the jacoco plugin and asks for the XML report.
+pub(crate) const JACOCO: &str = "org.jacoco:jacoco-maven-plugin:0.8.12";
+pub(crate) const GRADLE_JACOCO: &str = r#"
+allprojects { project ->
+    project.pluginManager.withPlugin('java') {
+        project.pluginManager.apply('jacoco')
+        project.tasks.named('test').configure { finalizedBy project.tasks.named('jacocoTestReport') }
+        project.tasks.named('jacocoTestReport').configure {
+            reports {
+                try { xml.required = true } catch (ignored) { xml.enabled = true }
+            }
+        }
+    }
+}
+"#;
+
+fn run_java(job: &crate::process::Job, cwd: &Path, target: Option<&str>, reports: &Path, results: &mut Vec<TestResult>, coverage: Option<&mut Option<std::collections::HashMap<String, Coverage>>>) -> Result<(i32, String)> {
     let gradle_wrapper = cwd.join(if cfg!(windows) { "gradlew.bat" } else { "gradlew" });
+    let want = coverage.is_some();
     let (mut cmd, tool, report_dirs) = if cwd.join("pom.xml").is_file() {
         let maven = find(cwd, "mvn").ok_or("Maven (mvn) was not found on PATH.")?;
         let mut cmd = command(maven, cwd);
-        cmd.args(["-q", "-B", "test"]);
+        cmd.args(["-q", "-B"]);
+        if want { cmd.arg(format!("{JACOCO}:prepare-agent")); }
+        cmd.arg("test");
+        // The report even when a test fails, so you see what ran.
+        if want { cmd.arg(format!("{JACOCO}:report")).arg("-Dmaven.test.failure.ignore=true"); }
         if let Some(value) = target { cmd.arg(format!("-Dtest={value}")).arg("-Dsurefire.failIfNoSpecifiedTests=false"); }
         (cmd, "maven", vec![cwd.join("target/surefire-reports")])
     } else if cwd.join("build.gradle").is_file() || cwd.join("build.gradle.kts").is_file() {
         let gradle = if gradle_wrapper.is_file() { gradle_wrapper } else { find(cwd, "gradle").ok_or("Gradle was not found. Add the Gradle wrapper (gradlew) to the project.")? };
         let mut cmd = command(gradle, cwd);
         cmd.args(["test", "--console=plain"]);
+        if want {
+            let script = reports.join("still-jacoco.gradle");
+            std::fs::write(&script, GRADLE_JACOCO).map_err(err)?;
+            cmd.arg("--init-script").arg(&script).arg("--continue");
+        }
         if let Some(value) = target { cmd.arg("--tests").arg(value.replace('#', ".")); }
         (cmd, "gradle", vec![cwd.join("build/test-results/test")])
     } else {
         return Err("Java tests run through Maven (pom.xml) or Gradle (build.gradle). Add one to this project to run JUnit tests.".into());
     };
     for dir in &report_dirs { let _ = std::fs::remove_dir_all(dir); }
-    job.emit("command", format!("$ {tool} test{}\n", target.map(|value| format!(" {value}")).unwrap_or_default()));
+    let xml_reports = jacoco_reports(cwd);
+    for report in &xml_reports { let _ = std::fs::remove_file(report); }
+    job.emit("command", format!("$ {tool} test{}{}\n", target.map(|value| format!(" {value}")).unwrap_or_default(), if want { " (with JaCoCo coverage)" } else { "" }));
     let (code, _) = job.run(&mut cmd, false)?;
+    if let Some(slot) = coverage {
+        let mut found = std::collections::HashMap::new();
+        let sources = java_sources(cwd);
+        for report in jacoco_reports(cwd) {
+            if let Ok(xml) = std::fs::read_to_string(&report) { parse_jacoco(&xml, &sources, &mut found); }
+        }
+        if found.is_empty() { job.emit("stderr", "No JaCoCo report was made, so there's no coverage this time.\n".into()); }
+        *slot = Some(found);
+    }
     for dir in report_dirs {
         for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
             if entry.path().extension().is_some_and(|ext| ext == "xml") {
@@ -216,6 +256,68 @@ fn run_java(job: &crate::process::Job, cwd: &Path, target: Option<&str>, results
         }
     }
     Ok((code, tool.into()))
+}
+
+/// Where Maven and Gradle put JaCoCo's XML report, for this project and its modules.
+pub(crate) fn jacoco_reports(cwd: &Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut folders = vec![cwd.to_path_buf()];
+    for entry in std::fs::read_dir(cwd).into_iter().flatten().flatten() {
+        if entry.path().is_dir() && (entry.path().join("pom.xml").is_file() || entry.path().join("build.gradle").is_file() || entry.path().join("build.gradle.kts").is_file()) { folders.push(entry.path()); }
+    }
+    for folder in folders {
+        for report in ["target/site/jacoco/jacoco.xml", "build/reports/jacoco/test/jacocoTestReport.xml"] { found.push(folder.join(report)); }
+    }
+    found
+}
+
+/// Java files in the project by their package path ("com/shop/Cart.java" → "src/main/java/com/shop/Cart.java").
+pub(crate) fn java_sources(cwd: &Path) -> std::collections::HashMap<String, String> {
+    let mut found = std::collections::HashMap::new();
+    let mut pending = vec![cwd.to_path_buf()];
+    let mut seen = 0;
+    while let Some(folder) = pending.pop() {
+        for entry in std::fs::read_dir(&folder).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if path.is_dir() {
+                if !name.starts_with('.') && !matches!(name.as_str(), "target" | "build" | "node_modules" | "out" | "bin") { pending.push(path); }
+            } else if name.ends_with(".java") {
+                seen += 1;
+                let Ok(text) = std::fs::read_to_string(&path) else { continue };
+                let package = text.lines().find_map(|line| line.trim().strip_prefix("package ").map(|rest| rest.trim_end_matches(';').trim().replace('.', "/"))).unwrap_or_default();
+                let key = if package.is_empty() { name.clone() } else { format!("{package}/{name}") };
+                let relative = path.strip_prefix(cwd).map(|item| item.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+                found.entry(key).or_insert(relative);
+            }
+            if seen > 5000 { return found; }
+        }
+    }
+    found
+}
+
+/// JaCoCo's XML: <package name="com/shop"><sourcefile name="Cart.java"><line nr="5" mi="0" ci="3" …/>.
+pub(crate) fn parse_jacoco(xml: &str, sources: &std::collections::HashMap<String, String>, found: &mut std::collections::HashMap<String, Coverage>) {
+    let mut package = String::new();
+    let mut file: Option<String> = None;
+    for tag in xml.split('<').skip(1) {
+        let tag = tag.split('>').next().unwrap_or("");
+        if tag.starts_with("package ") { package = attribute(tag, "name").unwrap_or_default(); }
+        else if tag.starts_with("sourcefile ") {
+            let name = attribute(tag, "name").unwrap_or_default();
+            let key = if package.is_empty() { name } else { format!("{package}/{name}") };
+            file = sources.get(&key).cloned();
+        } else if tag.starts_with("/sourcefile") { file = None; }
+        else if tag.starts_with("line ") {
+            let Some(path) = &file else { continue };
+            let number = attribute(tag, "nr").and_then(|value| value.parse::<u32>().ok());
+            let covered = attribute(tag, "ci").and_then(|value| value.parse::<u32>().ok()).unwrap_or(0);
+            let missed = attribute(tag, "mi").and_then(|value| value.parse::<u32>().ok()).unwrap_or(0);
+            let Some(number) = number else { continue };
+            let entry = found.entry(path.clone()).or_default();
+            if covered > 0 { entry.covered.push(number) } else if missed > 0 { entry.missed.push(number) }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -230,5 +332,16 @@ mod check {
         assert_eq!(results[1].status, "failed");
         assert_eq!(results[1].line, Some(7));
         assert!(results[1].message.contains("AssertionError"));
+    }
+
+    #[test]
+    fn reads_jacoco() {
+        let xml = r#"<report name="cart"><package name="com/shop"><class name="com/shop/Cart"/><sourcefile name="Cart.java"><line nr="3" mi="0" ci="3" mb="0" cb="0"/><line nr="5" mi="0" ci="4" mb="0" cb="0"/><line nr="9" mi="2" ci="0" mb="2" cb="0"/></sourcefile></package></report>"#;
+        let sources = std::collections::HashMap::from([("com/shop/Cart.java".to_owned(), "src/main/java/com/shop/Cart.java".to_owned())]);
+        let mut found = std::collections::HashMap::new();
+        super::parse_jacoco(xml, &sources, &mut found);
+        let cart = &found["src/main/java/com/shop/Cart.java"];
+        assert_eq!(cart.covered, vec![3, 5]);
+        assert_eq!(cart.missed, vec![9]);
     }
 }

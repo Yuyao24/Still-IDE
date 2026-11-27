@@ -14,7 +14,7 @@ function colors(theme: Theme) {
   }
 }
 
-export interface TerminalSession { id: string; label: string; ssh?: string; remotePath?: string; exited?: boolean }
+export interface TerminalSession { id: string; label: string; ssh?: string; remotePath?: string; exited?: boolean; /** A shell in the project's dev container. */ container?: boolean }
 
 interface Props {
   session: TerminalSession
@@ -80,7 +80,7 @@ export default function Terminal({ session, root, visible, theme, fontSize, font
         unlisten.push(await listen<{ id: string; code: number | null }>('terminal-exit', ({ payload }) => {
           if (!disposed && payload.id === id) {
             started = false
-            terminal.writeln('\r\n\x1b[2m' + (session.ssh ? 'Connection closed.' : 'Shell exited.') + ' Open a new terminal to continue.\x1b[0m')
+            terminal.writeln('\r\n\x1b[2m' + (session.ssh ? 'Connection closed.' : session.container ? 'The container shell exited.' : 'Shell exited.') + ' Open a new terminal to continue.\x1b[0m')
             callbacks.current.onExit(id)
           }
         }))
@@ -89,7 +89,7 @@ export default function Terminal({ session, root, visible, theme, fontSize, font
         started = true
         await invoke('terminal_start', {
           id, rootPath: root, cols: terminal.cols, rows: terminal.rows, shell: settings.shell || null,
-          sshHost: session.ssh ?? null, remotePath: session.remotePath ?? null,
+          sshHost: session.ssh ?? null, remotePath: session.remotePath ?? null, container: session.container ?? null,
         })
         if (!disposed && container.clientWidth) terminal.focus()
       } catch (error) {

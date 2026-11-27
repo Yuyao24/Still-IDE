@@ -79,6 +79,10 @@ export interface DialogState {
   label: string
   danger?: boolean
   action: (value: string) => void
+  /** A second choice beside Cancel (e.g. "Just move" next to "Move and update imports"). */
+  secondary?: { label: string; action: () => void }
+  /** Lines listed under the description (the files a change touches). */
+  list?: string[]
 }
 
 export function Dialog({ dialog, close }: { dialog: DialogState; close: () => void }) {
@@ -94,6 +98,7 @@ export function Dialog({ dialog, close }: { dialog: DialogState; close: () => vo
       <div className="side-head border-b border-line"><h2 className="font-medium">{dialog.title}</h2><IconButton glyph={X} label="Close dialog" onClick={close} /></div>
       <div className="p-3">
         {dialog.description && <p className="mb-2 text-muted">{dialog.description}</p>}
+        {dialog.list && <ul className="dialog-list">{dialog.list.slice(0, 8).map(item => <li key={item}>{item}</li>)}{dialog.list.length > 8 && <li className="text-muted">and {dialog.list.length - 8} more</li>}</ul>}
         {dialog.input !== undefined && <input className="field" aria-label={dialog.inputLabel ?? 'Workspace-relative file path'} value={value} onChange={event => setValue(event.target.value)} autoFocus
           placeholder={dialog.placeholder ?? 'src/example.py'} spellCheck={false} onFocus={event => {
             const dot = event.target.value.lastIndexOf('.')
@@ -101,7 +106,8 @@ export function Dialog({ dialog, close }: { dialog: DialogState; close: () => vo
             if (dot > slash + 1) event.target.setSelectionRange(slash + 1, dot)
           }} />}
         <div className="mt-3 flex justify-end gap-2">
-          <button type="button" className="text-btn" onClick={close} autoFocus={dialog.input === undefined}>Cancel</button>
+          <button type="button" className="text-btn" onClick={close} autoFocus={dialog.input === undefined && !dialog.secondary}>Cancel</button>
+          {dialog.secondary && <button type="button" className="text-btn" onClick={() => { close(); dialog.secondary!.action() }}>{dialog.secondary.label}</button>}
           <button type="submit" className={'text-btn primary' + (dialog.danger ? ' danger' : '')} disabled={dialog.input !== undefined && !value.trim()}>
             {dialog.danger && <Icon glyph={Trash2} size={13} />}{dialog.label}
           </button>

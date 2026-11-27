@@ -143,7 +143,7 @@ export function TestsPanel({ report, running, onRun, onRunId, onJump, canRun, wh
       </span>
       {report && failed.length > 0 && <label className="tests-filter"><input type="checkbox" checked={onlyFailed} onChange={event => setOnlyFailed(event.target.checked)} /> Only failures</label>}
       <label className={'tests-filter' + (report && failed.length > 0 ? ' is-next' : '')} title="Run the tests again each time you save a file"><input type="checkbox" checked={watch} disabled={!canRun && !watch} onChange={event => onWatch(event.target.checked)} /> Watch</label>
-      <label className="tests-filter is-next" title="Measure which lines the tests run (needs pytest-cov) and mark them in the editor"><input type="checkbox" checked={coverage} onChange={event => onCoverage(event.target.checked)} /> Coverage{report?.coverage ? ' · ' + coveragePercent(report.coverage) + '%' : ''}</label>
+      <label className="tests-filter is-next" title="Measure which lines the tests run and mark them in the editor (pytest-cov for Python; JaCoCo for Java, fetched by Maven or Gradle)"><input type="checkbox" checked={coverage} onChange={event => onCoverage(event.target.checked)} /> Coverage{report?.coverage ? ' · ' + coveragePercent(report.coverage) + '%' : ''}</label>
     </div>
     <div className="tests-list">
       {nodes.map(node => row(node, 0))}

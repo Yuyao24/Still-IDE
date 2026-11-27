@@ -347,7 +347,7 @@ function NewProjectDialog({ root, homeDir, onClose, onCreated, onChooseRoot, not
     setError('')
     try {
       const workspace = await home.create(name.trim(), template, custom || null, git, readme, requirements)
-      forgetProject(workspace.root)
+      await forgetProject(workspace.root)
       update({ newProjectTemplate: template, newProjectGit: git, newProjectReadme: readme, ...(template === 'python' ? { newProjectRequirements: requirements } : {}) })
       onCreated(workspace, { venv: venv && template === 'python' })
     } catch (failure) { setError(String(failure)) } finally { setBusy(false) }
@@ -439,7 +439,7 @@ function DeleteProjectDialog({ project, onClose, onDeleted, notify }: { project:
   async function remove() {
     if (!matches || busy) return
     setBusy(true)
-    try { await home.remove(project.path); forgetProject(project.path); onDeleted() } catch (error) { notify(error); setBusy(false) }
+    try { await home.remove(project.path); await forgetProject(project.path); onDeleted() } catch (error) { notify(error); setBusy(false) }
   }
   return <Modal title={'Delete ' + project.name + '?'} onClose={onClose} className="delete-sheet">
     <p className="sheet-text">The folder <code>{project.path}</code> and everything in it go to the system trash. You can restore it from there.</p>

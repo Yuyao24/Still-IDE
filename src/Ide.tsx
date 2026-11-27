@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
@@ -7,7 +7,7 @@ import {
   Check, Circle, CircleAlert, CodeXml, Columns2, Copy, FilePlus2, Files, FolderOpen, FolderPlus,
   FolderSearch, GitBranch, GitCompareArrows, GitPullRequestArrow, Hammer, House, Moon, Package,  Pencil, Play, Plus,
   RefreshCw, Rows2, Search, Server, Settings2, Square, SquareTerminal, Sun, TerminalSquare, Trash2, WrapText, X,
-  Camera, Eye, PenLine, LayoutGrid, Maximize2, Minimize2, Network, BookOpen, Sparkles, Bug, FlaskConical, ArrowLeftRight, AlignLeft,
+  Camera, Eye, PenLine, LayoutGrid, Maximize2, Minimize2, Network, BookOpen, Sparkles, Bug, FlaskConical, ArrowLeftRight, AlignLeft, Flame, Wand2, Database as DatabaseIcon,
 } from 'lucide-react'
 import {
   api, backups, clipboard, desktop, editorSupport, fileName, fileTemplate, history, type BlameLine, type FileCommit, fileSystem, home, mod, normalize, parentPath, pickFolder, ssh, textHash,
@@ -15,7 +15,7 @@ import {
   type SshHost, type SshOverview, type Workspace,
   tex, type TexResult,
 } from './bridge'
-import Editor, { defaultIndent, highlightToHtml, language, type CodeCapture, type Cursor, type EditorHandle, type EditorMemory, type EditorOptions, type LiveIssue } from './Editor'
+import Editor, { defaultIndent, highlightToHtml, language, refactorHook, type CodeCapture, type Cursor, type EditorHandle, type EditorMemory, type EditorOptions, type LiveIssue } from './Editor'
 import CodeShot from './CodeShot'
 import { Preview, docKind, type DocKind } from './Preview'
 import { ImageView, PdfView, SvgView, TexPreview, binaryKind, fromBase64, type BinaryKind } from './DocViewers'
@@ -25,6 +25,11 @@ import { Notebook } from './Notebook'
 import { PullRequests } from './PullRequests'
 import { GitGraph } from './GitGraph'
 import { MergeEditor, conflictCount } from './MergeEditor'
+import { spellHook } from './spell'
+import { ProfilePanel, type ProfileData } from './Profile'
+import { importUpdatesForMove, type ImportUpdate } from './imports'
+import { containers, type ContainerInfo } from './bridge'
+import { DatabasePanel } from './Database'
 import { bindings, comboOf } from './keymap'
 import { Chunk } from '@codemirror/merge'
 import { Text } from '@codemirror/state'
@@ -54,7 +59,7 @@ import { Dialog, Output, Problems, SplitGrip, type DialogState, type OutputEntry
 import { Icon, IconButton, LayoutIcon, Menu, relativeTime, useSlider, type MenuEntry, type MenuItem, type MenuState } from './ui'
 
 type Side = 'explorer' | 'search' | 'git' | 'packages' | 'remote'
-type Drawer = 'terminal' | 'output' | 'problems' | 'debug' | 'tests'
+type Drawer = 'terminal' | 'output' | 'problems' | 'debug' | 'tests' | 'profile' | 'database'
 type DocView = 'edit' | 'split' | 'preview'
 type Tab = { id: string; path: string; contents: string; saved: string; memory?: EditorMemory; diff?: Diff; staged?: boolean; line?: number; view?: DocView; binary?: BinaryKind }
 type RightView = 'canvas' | 'chat' | 'minimap'
@@ -106,6 +111,8 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const { settings, theme, update } = useSettings()
   const settingsRef = useRef(settings)
   settingsRef.current = settings
+  // Add to dictionary (from a misspelled word's tooltip) keeps the word in Settings.
+  spellHook.add = word => { if (!settingsRef.current.spellWords.includes(word.toLowerCase())) update({ spellWords: [...settingsRef.current.spellWords, word.toLowerCase()] }) }
   const fs = useMemo(() => fileSystem(workspace), [workspace])
   const remote = Boolean(workspace.remote)
   const [tabs, setTabs] = useState<Tab[]>([])
@@ -175,9 +182,17 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   })
   const [rightWidth, setRightWidth] = useState(() => Number(localStorage.getItem('still.island.rightWidth')) || 320)
   const [chatEverOpen, setChatEverOpen] = useState(false)
-  const [viewport, setViewport] = useState<{ top: number; height: number; lines: number } | null>(null)
-  // The top line each pane's editor shows (a side-by-side preview follows it).
-  const [topLines, setTopLines] = useState<Record<string, number>>({})
+  // Where each pane's editor is scrolled, for the minimap and a side-by-side preview. Kept outside
+  // React state: scrolling would otherwise re-render the whole window on every frame.
+  const viewports = useMemo(() => {
+    const values = new Map<string, ViewportInfo>()
+    const listeners = new Set<() => void>()
+    return {
+      get: (pane: string) => values.get(pane) ?? null,
+      set: (pane: string, value: ViewportInfo) => { values.set(pane, value); listeners.forEach(listener => listener()) },
+      subscribe: (listener: () => void) => { listeners.add(listener); return () => { listeners.delete(listener) } },
+    }
+  }, [])
   const graphOpen = rightOpen && rightView === 'canvas'
   const [focusMode, setFocusMode] = useState(false)
   const [focusOutput, setFocusOutput] = useState(false)
@@ -274,7 +289,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const editorOptions: EditorOptions = {
     wrap: settings.wordWrap, lineNumbers: settings.lineNumbers, highlightLine: settings.highlightLine, tabSize, layout: settings.diffLayout, autocomplete: settings.autocomplete,
     occurrences: settings.occurrences, whitespace: settings.whitespace, indentGuides: settings.indentGuides, closeBrackets: settings.closeBrackets, scrollPastEnd: settings.scrollPastEnd,
-    errors: settings.errors, changes: settings.gitGutter, cursorBlink: settings.cursorBlink, folding: settings.folding, blameColumn, constructors: settings.fillConstructors, docTemplates: settings.docTemplates, fStrings: settings.autoFString, continueComments: settings.continueComments, sticky: settings.stickyScroll, inlayHints: settings.inlayHints,
+    errors: settings.errors, changes: settings.gitGutter, cursorBlink: settings.cursorBlink, folding: settings.folding, blameColumn, constructors: settings.fillConstructors, docTemplates: settings.docTemplates, fStrings: settings.autoFString, continueComments: settings.continueComments, spellCheck: settings.spellCheck, sticky: settings.stickyScroll, inlayHints: settings.inlayHints,
   }
   // Prose (Markdown, text) wraps and skips indent guides and error checks.
   const optionsFor = (tab: Tab): EditorOptions => {
@@ -409,11 +424,17 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     try { setServers(await ssh.hosts()) } catch (error) { notify(error) }
   }
 
-  async function directory(path: string, id = generation.current) {
+  async function directory(path: string, id = generation.current, quiet = false) {
     try {
       const result = await fs.list(path)
-      if (generation.current === id) setDirectories(previous => ({ ...previous, [path]: result }))
-    } catch (error) { if (generation.current === id) notify(error) }
+      if (generation.current !== id) return
+      // Only re-render when something changed (the tree also refreshes on its own).
+      setDirectories(previous => {
+        const before = previous[path]
+        if (before && before.length === result.length && before.every((entry, index) => entry.path === result[index].path && entry.directory === result[index].directory)) return previous
+        return { ...previous, [path]: result }
+      })
+    } catch (error) { if (generation.current === id && !quiet) notify(error) }
   }
 
   async function refreshFiles(folders: Iterable<string> = latest.current.expanded, id = generation.current) {
@@ -765,6 +786,8 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
 
   async function openFile(path: string) {
     const id = generation.current
+    // A SQLite file opens in the Database tab.
+    if (/\.(db|sqlite|sqlite3|db3)$/i.test(path) && desktop && !remote) { setDbFocus(previous => ({ path, nonce: (previous?.nonce ?? 0) + 1 })); showDrawer('database'); return }
     if (latest.current.tabs.some(tab => tab.id === path)) {
       activate(path)
       const jump = pendingJump.current
@@ -929,21 +952,59 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
 
   function renameEntry(entry: Entry) {
     setDialog({
-      title: 'Rename', input: entry.path, inputLabel: 'New path', placeholder: entry.path, label: 'Rename',
-      action: to => {
-        if (to === entry.path) return
-        void fs.rename(entry.path, to).then(() => {
+      title: 'Rename or move', description: 'Type a new name, or a path in another folder to move it there.', input: entry.path, inputLabel: 'New path', placeholder: entry.path, label: 'Rename',
+      action: to => { void moveEntry(entry, to.replace(/^\/+|\/+$/g, '')) },
+    })
+  }
+
+  /** Moves or renames a file or folder; if code imports it, offers to update those imports too. */
+  async function moveEntry(entry: Entry, to: string) {
+    if (!to || to === entry.path) return
+    if (to.startsWith(entry.path + '/')) { notify('A folder can’t move inside itself.'); return }
+    let updates: ImportUpdate[] = []
+    if (settings.updateImports && (entry.directory || /\.(py|java|m?[jt]sx?|c[jt]s)$/.test(entry.path))) {
+      try {
+        const files = (await fs.files()).filter(item => !item.directory).map(item => item.path)
+        const read = async (path: string) => latest.current.tabs.find(tab => tab.path === path && !tab.diff)?.contents ?? fs.read(path)
+        updates = await importUpdatesForMove(files, read, entry.path, to, entry.directory)
+      } catch (error) { console.warn('Working out import changes failed', error) }
+    }
+    const verb = parentPath(to) === parentPath(entry.path) ? 'Rename' : 'Move'
+    if (!updates.length) { finishMove(entry, to, []); return }
+    const others = updates.filter(update => update.path !== to && !update.path.startsWith(to + '/'))
+    setDialog({
+      title: verb + ' ' + entry.name,
+      description: others.length ? `${others.length === 1 ? 'One file imports' : others.length + ' files import'} ${entry.directory ? 'from this folder' : 'it'}. Update ${others.length === 1 ? 'its imports' : 'their imports'} to the new place?` : 'Update the imports inside it to match the new place?',
+      list: updates.map(update => update.path),
+      label: verb + ' and update imports',
+      secondary: { label: 'Just ' + verb.toLowerCase(), action: () => finishMove(entry, to, []) },
+      action: () => finishMove(entry, to, updates),
+    })
+  }
+
+  function finishMove(entry: Entry, to: string, updates: ImportUpdate[]) {
+        void fs.rename(entry.path, to).then(async () => {
           const moved = (path: string) => path === entry.path ? to : path.startsWith(entry.path + '/') ? to + path.slice(entry.path.length) : null
           setTabs(previous => previous.map(tab => {
             const next = moved(tab.path)
             return next && !tab.diff ? { ...tab, id: next, path: next } : tab
           }))
           setSelected(previous => moved(previous) ?? previous)
+          setExpanded(previous => new Set([...previous].map(path => moved(path) ?? path).concat(parentPath(to)).filter(Boolean)))
           void refreshFiles(new Set([...latest.current.expanded].map(path => moved(path) ?? path).concat(parentPath(to)).filter(Boolean)))
+          tellServers([{ path: entry.path, type: 'deleted' }, { path: to, type: 'created' }])
+          // Files are saved with their new imports; a tab with unsaved work keeps it and just takes
+          // the change, so nothing you typed is written before you save it.
+          let failed = 0
+          for (const update of updates) {
+            const open = latest.current.tabs.find(tab => !tab.diff && (tab.path === update.path || moved(tab.path) === update.path))
+            const dirty = open && open.contents !== open.saved
+            try { if (!dirty) await fs.save(update.path, update.after, open?.saved ?? update.before) } catch { failed++; continue }
+            if (open) setTabs(previous => previous.map(tab => tab.id === open.id || tab.id === update.path ? { ...tab, contents: update.after, saved: dirty ? tab.saved : update.after } : tab))
+          }
+          if (updates.length) { tellServers(updates.map(update => ({ path: update.path, type: 'changed' as const }))); notify(`Updated imports in ${updates.length - failed} file${updates.length - failed === 1 ? '' : 's'}${failed ? `; ${failed} couldn’t be changed` : ''}.`) }
           void refreshGit()
         }).catch(notify)
-      },
-    })
   }
 
   function deleteEntry(entry: Entry) {
@@ -1239,12 +1300,20 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   reloadRef.current = reloadFromDisk
   useEffect(() => {
     // Coming back to Still after editing elsewhere picks up the changes (local projects; a remote
-    // one would mean a round trip per tab, so Refresh in Files does it there).
+    // one would mean a round trip per tab, so Refresh in Files does it there): the files open in
+    // tabs, and files and folders added or removed in File Explorer or another program.
     if (remote) return
-    const onFocus = () => reloadRef.current()
+    const onFocus = () => { reloadRef.current(); treeRef.current() }
     window.addEventListener('focus', onFocus)
-    return () => window.removeEventListener('focus', onFocus)
+    // While Still is in front, the tree also checks for changes every few seconds.
+    const timer = setInterval(() => { if (document.visibilityState === 'visible' && document.hasFocus()) treeRef.current() }, 3000)
+    return () => { window.removeEventListener('focus', onFocus); clearInterval(timer) }
   }, [])
+  const treeRef = useRef(() => {})
+  treeRef.current = () => {
+    const id = generation.current
+    for (const path of ['', ...latest.current.expanded]) void directory(path, id, true)
+  }
   function stashChanges() {
     setDialog({ title: 'Stash changes', description: 'Puts your uncommitted changes (new files too) aside and leaves the working tree clean. Bring them back from Git → Stashes.', input: '', placeholder: 'Half-done login form', inputLabel: 'Note (optional)', label: 'Stash',
       action: value => { void (async () => { await storeAll(); await runStash('push', undefined, value) })() } })
@@ -1300,7 +1369,8 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     'prev-tab': () => { const index = tabs.findIndex(tab => tab.id === selected); if (tabs.length) activate(tabs[(index - 1 + tabs.length) % tabs.length].id) },
     split: () => splitRight(), run: () => { void run() }, debug: () => { void startDebug() }, tests: () => { void runTests(null) },
     format: () => { void formatDocument() }, rename: () => { editor.current?.command('rename') }, definition: () => { void goToDefinition() },
-    references: () => { editor.current?.command('references') }, quickfix: () => { void showQuickFixes() }, 'goto-line': () => { editor.current?.command('gotoLine') },
+    references: () => { editor.current?.command('references') }, quickfix: () => { void showQuickFixes() },
+    refactor: () => { void showRefactors() }, 'extract-variable': () => { editor.current?.refactor('extract-variable') }, 'extract-method': () => { editor.current?.refactor('extract-method') }, 'goto-line': () => { editor.current?.command('gotoLine') },
     comment: () => { editor.current?.command('comment') }, terminal: () => { if (drawerOpen) setDrawerOpen(false); else showDrawer('terminal', true) },
     'side.files': () => showSide('explorer', true), 'side.search': () => showSide('search', true), 'side.git': () => { if (!remote) showSide('git', true) },
     commit: () => { if (!remote) { showSide('git'); if (commit.trim()) gitAction('commit') } }, push: () => { if (!remote) gitAction('push') }, pull: () => { if (!remote) gitAction('pull') },
@@ -1335,6 +1405,17 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     if (!fixes.length) { notify('No quick fixes here.'); return }
     setMenu({ x: point.x, y: point.y, items: fixes.slice(0, 14).map(fix => ({ label: fix.title, action: () => { void fix.run().catch(notify) } })) })
   }
+  /** Ctrl+Shift+R: extract variable or function, and the language server's refactorings. */
+  async function showRefactors(at?: { x: number; y: number }) {
+    const handle = editor.current
+    if (!handle || !active || active.diff) return
+    const point = at ?? handle.caretPoint() ?? { x: 400, y: 300 }
+    let items: Awaited<ReturnType<EditorHandle['refactors']>> = []
+    try { items = await handle.refactors() } catch (error) { notify(error); return }
+    if (!items.length) { notify(handle.selection() ? 'No refactorings for this selection. Select a whole expression to extract a variable' + (mode === 'Python' ? ', or whole lines to extract a function.' : '.') : 'Select an expression or some lines first, then refactor.'); return }
+    setMenu({ x: point.x, y: point.y, items: items.slice(0, 16).map(item => ({ label: item.title, action: () => { void Promise.resolve(item.run()).catch(notify) } })) })
+  }
+  useEffect(() => { refactorHook.notify = message => notify(message) })
   useEffect(() => {
     const open = () => { void showQuickFixes() }
     window.addEventListener('still-quick-fix', open)
@@ -1357,6 +1438,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       ...(!readOnly ? [
         { label: 'Go to definition', shortcut: 'F12', disabled: !word, action: () => { void goToDefinition() } },
         ...(hasServer ? [{ label: 'Find all references', shortcut: 'Shift+F12', disabled: !word, action: () => { handle?.command('references') } }, { label: 'Quick fix…', shortcut: 'Alt+Enter', action: () => { void showQuickFixes({ x: event.clientX, y: event.clientY }) } }] : []),
+        { label: 'Refactor…', shortcut: mod + '+Shift+R', disabled: !selectedText && !hasServer, action: () => { void showRefactors({ x: event.clientX, y: event.clientY }) } },
         { label: hasServer ? (word ? 'Rename “' + word.text.slice(0, 24) + '”' : 'Rename symbol') : word ? 'Rename “' + word.text.slice(0, 24) + '” in this file' : 'Rename in this file', shortcut: 'F2', disabled: !word, action: () => { handle?.command('rename') } },
         { label: 'Select next match', shortcut: mod + '+D', disabled: !word && !selectedText, action: () => { handle?.command('selectNext') } },
       ] : []),
@@ -1388,10 +1470,12 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   function newSession(sshHost?: SshHost, remotePath?: string) {
     const id = crypto.randomUUID()
     const shellName = (settings.terminalShell || runtimes?.shell || 'shell').split(/[\\/]/).at(-1)!.replace(/\.exe$/i, '')
-    const base = sshHost ? sshHost.name : shellName
+    const inContainer = !sshHost && containerOn
+    if (inContainer && container?.state !== 'running') { notify('Start the dev container first (Dev container in the status bar).'); }
+    const base = sshHost ? sshHost.name : inContainer ? 'container' : shellName
     const taken = sessionsRef.current.filter(item => item.label === base || item.label.startsWith(base + ' ')).length
     const label = taken ? base + ' ' + (taken + 1) : base
-    const session: TerminalSession = sshHost ? { id, label, ssh: sshHost.id, remotePath } : { id, label }
+    const session: TerminalSession = sshHost ? { id, label, ssh: sshHost.id, remotePath } : inContainer ? { id, label, container: true } : { id, label }
     sessionsRef.current = [...sessionsRef.current, session]
     setSessions(sessionsRef.current)
     setActiveSession(id)
@@ -1489,6 +1573,102 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     }).then(unlisten => { if (cancelled) unlisten(); else stop = unlisten })
     return () => { cancelled = true; stop?.() }
   }, [])
+  // ---- Database tab: stays mounted once opened, so SQL and results survive switching tabs ----
+  const [dbFocus, setDbFocus] = useState<{ path: string; nonce: number } | null>(null)
+  const [dbVisited, setDbVisited] = useState(false)
+  useEffect(() => { if (drawer === 'database') setDbVisited(true) }, [drawer])
+
+  // ---- Dev container: run, test and open terminals inside the project's container ----
+  const [container, setContainer] = useState<ContainerInfo | null>(null)
+  const containerKey = 'still.container.use.' + workspace.root
+  const [containerUse, setContainerUse] = useState(() => { try { return localStorage.getItem(containerKey) === '1' } catch { return false } })
+  const containerOn = Boolean(containerUse && container?.config && !remote && desktop)
+  const afterContainer = useRef<(() => void) | null>(null)
+  const containerStarting = useRef(false)
+  const refreshContainer = useCallback(async () => {
+    if (!desktop || remote) { setContainer(null); return }
+    try { setContainer(await containers.status(workspace.root)) } catch { setContainer(null) }
+  }, [workspace.root, remote])
+  // Look again when a .devcontainer folder appears or goes, and when the window comes back.
+  const hasDevcontainer = Boolean(directories['']?.some(entry => entry.name === '.devcontainer' || entry.name === '.devcontainer.json'))
+  useEffect(() => { void refreshContainer() }, [refreshContainer, hasDevcontainer])
+  useEffect(() => {
+    if (!desktop || remote) return
+    const focus = () => { void refreshContainer() }
+    window.addEventListener('focus', focus)
+    return () => window.removeEventListener('focus', focus)
+  }, [refreshContainer])
+  useEffect(() => {
+    if (!desktop || remote) return
+    let stop: UnlistenFn | null = null, cancelled = false
+    void listen('container-changed', () => { void refreshContainer() }).then(unlisten => { if (cancelled) unlisten(); else stop = unlisten })
+    return () => { cancelled = true; stop?.() }
+  }, [refreshContainer])
+  // Once the container is up, do what was waiting for it (a run or tests).
+  useEffect(() => {
+    if (container?.state === 'running' && afterContainer.current && !job) { const next = afterContainer.current; afterContainer.current = null; setTimeout(next, 50) }
+    if (!job && container && container.state !== 'running' && afterContainer.current && !containerStarting.current) afterContainer.current = null
+  }, [container, job])
+  // Mention the dev container once per project.
+  useEffect(() => {
+    if (!container?.config) return
+    const seen = 'still.container.seen.' + workspace.root
+    try { if (localStorage.getItem(seen)) return; localStorage.setItem(seen, '1') } catch { return }
+    toast('This project has a dev container. Use “Dev container” in the status bar to run, test and open terminals inside it.')
+  }, [container?.config])
+  function chooseContainer(value: boolean) {
+    setContainerUse(value)
+    try { localStorage.setItem(containerKey, value ? '1' : '0') } catch { /* private window */ }
+  }
+  async function startContainer(rebuild: boolean) {
+    if (!container?.config) return
+    if (!container.docker) { notify(container.note ?? 'Docker is not available.'); afterContainer.current = null; return }
+    containerStarting.current = true
+    try { await launch('run', rebuild ? 'rebuild' : 'container', 'container_up', { rootPath: workspace.root, rebuild }) }
+    finally { containerStarting.current = false }
+    if (focusMode) setFocusOutput(true); else showDrawer('output')
+  }
+  function containerMenu(event: ReactMouseEvent) {
+    if (!container) return
+    const box = (event.currentTarget as HTMLElement).getBoundingClientRect()
+    const running = container.state === 'running'
+    const items: MenuEntry[] = [
+      containerOn
+        ? { label: 'Run on this computer instead', action: () => chooseContainer(false) }
+        : { label: 'Use the dev container', action: () => { chooseContainer(true); if (!running) void startContainer(false) } },
+      'separator',
+      ...(running ? [{ label: 'Stop the container', action: () => { void containers.stop(workspace.root).then(refreshContainer).catch(notify) } }]
+        : [{ label: container.state === 'stopped' ? 'Start the container' : 'Build and start the container', disabled: Boolean(job), action: () => { void startContainer(false) } }]),
+      { label: 'Rebuild the container', disabled: Boolean(job), action: () => { void startContainer(true) } },
+      { label: 'New terminal in the container', disabled: !running, action: () => { setDrawer('terminal'); setDrawerOpen(true); const session = { id: crypto.randomUUID(), label: 'container', container: true }; sessionsRef.current = [...sessionsRef.current, session]; setSessions(sessionsRef.current); setActiveSession(session.id) } },
+      'separator',
+      { label: 'Open ' + container.config, action: () => { void openFile(container.config) } },
+    ]
+    setMenu({ x: box.left, y: box.top, items })
+  }
+
+  // ---- Profiler: run a Python file under the sampler, then show the flame graph ----
+  const [profile, setProfile] = useState<{ data: ProfileData; path: string } | null>(null)
+  const [profiling, setProfiling] = useState(false)
+  useEffect(() => {
+    if (!desktop) return
+    let stop: UnlistenFn | null = null, cancelled = false
+    void listen<{ id: string; path: string; data: string }>('profile-result', ({ payload }) => {
+      try { setProfile({ data: JSON.parse(payload.data) as ProfileData, path: payload.path }) } catch (error) { notify(error) }
+      setProfiling(false)
+      setDrawer('profile'); setDrawerOpen(true)
+    }).then(unlisten => { if (cancelled) unlisten(); else stop = unlisten })
+    return () => { cancelled = true; stop?.() }
+  }, [])
+  useEffect(() => { if (!job) setProfiling(false) }, [job])
+  const profileWhy = !desktop ? 'Profiling runs in the Still desktop app.' : remote ? 'Profiling works for projects on this computer for now.' : mode !== 'Python' ? 'Open a Python file to profile it.' : undefined
+  async function startProfile() {
+    if (!active || profileWhy || activeJob.current) { if (profileWhy) notify(profileWhy); return }
+    await store(active)
+    setProfiling(true)
+    setDrawer('profile'); setDrawerOpen(true)
+    await launch('run', 'profile', 'profile_start', { rootPath: workspace.root, path: active.path, args: runArgs[active.path] || null, env: runEnv[active.path] || null, dotenv: settings.loadDotEnv }, { path: active.path })
+  }
   // Language servers: one per language in use, started when a file of that language is open.
   const [langServers, setLangServers] = useState<Record<string, LanguageServer | 'starting' | 'none'>>({})
   const [serverNonce, setServerNonce] = useState(0)
@@ -1588,7 +1768,9 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     await storeAll()
     setTestsRunning(true)
     if (remote) await launch('run', 'test', 'ssh_tests_run', { hostId: workspace.remote, root: workspace.root, target })
-    else await launch('run', 'test', 'tests_run', { rootPath: workspace.root, target, language, dotenv: settings.loadDotEnv, coverage: settings.testCoverage && language === 'python' })
+    else if (containerOn && container?.state !== 'running') { setTestsRunning(false); afterContainer.current = () => { void runTests(target, language, quiet) }; await startContainer(false); return }
+    else if (containerOn) await launch('run', 'test', 'container_tests', { rootPath: workspace.root, target, language, coverage: settings.testCoverage })
+    else await launch('run', 'test', 'tests_run', { rootPath: workspace.root, target, language, dotenv: settings.loadDotEnv, coverage: settings.testCoverage })
     if (!quiet || drawerOpen) { setDrawer('tests'); setDrawerOpen(true) }
     if (!activeJob.current) setTestsRunning(false)
   }
@@ -1666,6 +1848,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     const keys = (event: KeyboardEvent) => {
       if (event.shiftKey && event.altKey && !event.ctrlKey && !event.metaKey && event.code === 'KeyF' && !document.querySelector('.modal-backdrop, .settings-backdrop')) { event.preventDefault(); void formatDocument(); return }
       if (event.altKey && !event.shiftKey && !event.ctrlKey && !event.metaKey && event.key === 'Enter' && (event.target as Element | null)?.closest?.('.cm-editor') && !(event.target as Element).closest('.nb') && !document.querySelector('.modal-backdrop, .settings-backdrop')) { event.preventDefault(); void showQuickFixes(); return }
+      if ((event.ctrlKey || event.metaKey) && event.shiftKey && !event.altKey && event.code === 'KeyR' && (event.target as Element | null)?.closest?.('.cm-editor') && !(event.target as Element).closest('.nb') && !document.querySelector('.modal-backdrop, .settings-backdrop')) { event.preventDefault(); event.stopPropagation(); void showRefactors(); return }
       if (!/^F(5|9|10|11)$/.test(event.key) || event.ctrlKey || event.metaKey || event.altKey || document.querySelector('.modal-backdrop, .settings-backdrop')) return
       event.preventDefault()
       const current = debugRef.current
@@ -1714,6 +1897,10 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       const args = (config ? config.args : runArgs[active.path]) || null
       const env = (config ? config.env : runEnv[active.path]) || null
       if (remote) await launch('run', 'run', 'ssh_run', { hostId: workspace.remote, root: workspace.root, path: active.path, args, env, dotenv: settings.loadDotEnv }, { path: active.path })
+      else if (containerOn && !buildOnly) {
+        if (container?.state !== 'running') { afterContainer.current = () => { void run(false, config) }; await startContainer(false); return }
+        await launch('run', 'run', 'container_run', { rootPath: workspace.root, path: active.path, args, env, dotenv: settings.loadDotEnv }, { path: active.path })
+      }
       else await launch('run', buildOnly ? 'build' : 'run', 'run_file', { rootPath: workspace.root, path: active.path, buildOnly, args, env, dotenv: settings.loadDotEnv }, { path: active.path })
     } catch (error) { notify(error) }
     finally { setRunningRequest(false) }
@@ -1914,6 +2101,8 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       if (event.altKey || !(['k', 'p', 's', 'w', 'b', 'j', 'o', 't', 'enter', 'tab', ',', 'arrowup', '.', '\\'].includes(key) || shiftOnly)) return
       if ((overview || graphView) && !['k', 'p', '.'].includes(key)) return
       if (key === 'enter' && palette !== null) return
+      // Ctrl+Enter in a text box (SQL, a commit message, the assistant) belongs to that box, not Run.
+      if (key === 'enter' && (event.target as Element | null)?.closest?.('textarea, input, select')) return
       event.preventDefault()
       if (key === 'p' || key === 'k') { palette !== null ? closePalette() : openPalette(event.shiftKey ? '>' : ''); return }
       if (palette !== null) return
@@ -2073,6 +2262,12 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       ...(active && !active.diff && conflictCount(active.contents) ? [{ id: 'merge', label: 'Git: resolve conflicts in the merge editor', icon: GitBranch, action: () => { setMergeFor(active.id); setFullView('merge') } }] : []),
     ] : []),
     { id: 'run-config', label: 'Run configuration…', icon: Play, action: askArguments },
+    ...(active && !active.diff && !active.binary ? [
+      { id: 'refactor', label: 'Refactor…', icon: Wand2, action: () => { void showRefactors() } },
+      { id: 'extract-variable', label: 'Extract variable…', icon: Wand2, action: () => { editor.current?.refactor('extract-variable') } },
+      ...(mode === 'Python' ? [{ id: 'extract-method', label: 'Extract function…', icon: Wand2, action: () => { editor.current?.refactor('extract-method') } }] : []),
+    ] : []),
+    ...(!profileWhy ? [{ id: 'profile', label: 'Profile this file (flame graph)', icon: Flame, action: () => { void startProfile() } }] : []),
     ...(!testsWhy ? [
       { id: 'tests-all', label: 'Run all tests', icon: FlaskConical, action: () => runTestsFrom('all') },
       { id: 'tests-file', label: 'Run the tests in this file', icon: FlaskConical, action: () => runTestsFrom('file') },
@@ -2129,6 +2324,8 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     { key: 'problems', label: 'Problems', glyph: CircleAlert },
     { key: 'tests', label: 'Tests', glyph: FlaskConical },
     { key: 'debug', label: 'Debug', glyph: Bug },
+    { key: 'profile', label: 'Profile', glyph: Flame },
+    { key: 'database', label: 'Database', glyph: DatabaseIcon },
   ] as const
   const remoteActions = {
     onTerminal: (target: SshHost) => { setDrawer('terminal'); setDrawerOpen(true); newSession(target) },
@@ -2166,8 +2363,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       handle: (handle: EditorHandle | null) => paneHandle(pane, handle),
       onFocus: () => focusPane(pane),
       onViewport: (next: { top: number; height: number; lines: number; topLine: number }) => {
-        if (focusedRef.current === pane) setViewport(next)
-        setTopLines(previous => previous[pane] === next.topLine ? previous : { ...previous, [pane]: next.topLine })
+        viewports.set(pane, next)
       },
       onCursor: (next: Cursor) => { if (focusedRef.current === pane) setCursor(next) },
       onBlur: () => { if (settings.autoSave === 'blur') void store(latest.current.tabs.find(item => item.id === tab.id)).catch(notify) },
@@ -2207,8 +2403,9 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     if (kind === 'tex') return <TexPreview text={tab.contents} result={texResults[tab.path] ?? null} compiling={texBusy.includes(tab.path)}
       onJump={line => { focusPane(pane); requestAnimationFrame(() => handles.current[pane]?.jump(line)) }} />
     if (kind === 'svg') return <SvgView text={tab.contents} />
-    return <Preview text={tab.contents} kind={kind} onLink={openLink} syncLine={split ? topLines[pane] ?? 1 : undefined}
-      onJumpLine={split ? line => { focusPane(pane); requestAnimationFrame(() => handles.current[pane]?.jump(line)) } : undefined} />
+    if (split) return <FollowingPreview viewports={viewports} pane={pane} text={tab.contents} kind={kind} onLink={openLink}
+      onJumpLine={line => { focusPane(pane); requestAnimationFrame(() => handles.current[pane]?.jump(line)) }} />
+    return <Preview text={tab.contents} kind={kind} onLink={openLink} />
   }
   function paneContent(tab: Tab, pane: string) {
     if (tab.binary === 'pdf') return <PdfView data={binaries[tab.path] ?? null} label={fileName(tab.path)} />
@@ -2379,7 +2576,8 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
         <div className="side-body" key={'side-' + shownSide}>
         {shownSide === 'explorer' && <Explorer workspace={workspace} directories={directories} expanded={expanded} active={active?.path} changes={status} symbols={symbols}
           onOpen={path => { void openFile(path) }} onExpand={toggleFolder} onNew={() => newFile()} onNewFolder={() => newFolder()} onWorkspace={chooseFolder}
-          onRefresh={() => { void refreshFiles(); reloadFromDisk() }} onJump={line => editor.current?.jump(line)} onContext={explorerMenu} onKey={explorerKey} />}
+          onRefresh={() => { void refreshFiles(); reloadFromDisk() }} onJump={line => editor.current?.jump(line)} onContext={explorerMenu} onKey={explorerKey}
+          onMove={(entry, folder) => { void moveEntry(entry, (folder ? folder + '/' : '') + entry.name) }} />}
         {shownSide === 'search' && <SearchPanel search={fs.search} remote={remote} focusKey={searchFocus} seed={searchSeed} onOpen={(path, line, column, length) => jumpTo({ path, line, column, length })} />}
         {shownSide === 'git' && <SourceControl status={status} busy={Boolean(job) || gitBusy} error={gitError} commit={commit} log={log} onCommitText={setCommit}
           onDiff={(change, index) => { void openDiff(change, index) }} onStage={(change, index) => { void updateStage(change, index) }} onAction={gitAction}
@@ -2488,7 +2686,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
             <Chat settings={{ provider: settings.aiProvider, model: settings.aiModel, effort: settings.aiEffort, ollamaUrl: settings.ollamaUrl, ollamaModel: settings.ollamaModel, githubModel: settings.githubModel, autoApproveEdits: settings.aiAutoApprove }}
               host={agentHost} projectKey={(workspace.remote ?? '') + workspace.root} focusKey={chatFocus} onSettings={() => onSettings('ai')} onClose={() => setRightOpen(false)} />
           </div>}
-          {rightView === 'minimap' && <Minimap path={active && !active.binary ? active.path : null} text={active && !active.binary ? active.diff?.after ?? active.contents : ''} viewport={viewport}
+          {rightView === 'minimap' && <Minimap path={active && !active.binary ? active.path : null} text={active && !active.binary ? active.diff?.after ?? active.contents : ''} viewports={viewports} pane={focused}
             onScroll={fraction => editor.current?.scrollTo(fraction)} />}
         </div>
       </aside>}
@@ -2534,6 +2732,12 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
           {drawer === 'output' && <Output entries={output} sample={sampleRun}
             onInput={job?.kind === 'run' ? text => { void invoke('job_input', { id: job.id, text }).catch(notify) } : undefined} />}
           {drawer === 'problems' && <Problems items={problems} jump={jumpTo} />}
+          {(drawer === 'database' || dbVisited) && <div className="drawer-keep" hidden={drawer !== 'database'}>
+            <DatabasePanel root={workspace.root} remote={remote} focus={dbFocus} notify={message => toast(message)}
+              files={async () => (await fs.files()).filter(item => !item.directory).map(item => item.path)} readFile={path => fs.read(path)} />
+          </div>}
+          {drawer === 'profile' && <ProfilePanel data={profile?.data ?? null} path={profile?.path ?? null} running={profiling} canRun={!profileWhy && !job} why={profileWhy}
+            onRun={() => { void startProfile() }} onOpen={(file, line) => { if (/^([A-Za-z]:)?[\\/]/.test(file)) notify('That function is in ' + file + ', outside the project.'); else jumpTo({ path: file, line }) }} />}
           {drawer === 'tests' && <TestsPanel report={testReport} running={testsRunning} canRun={!testsWhy && !job} why={testsWhy} onRun={runTestsFrom} onJump={jumpToTest} coverage={settings.testCoverage} onCoverage={value => update({ testCoverage: value })}
             onRunId={id => { void runTests(id, id.includes('#') || id.endsWith('.java') || !/\.py(::|$)/.test(id) && testLanguage === 'java' ? 'java' : 'python') }}
             watch={testWatch} onWatch={value => { setTestWatch(value); if (value) notify('Watching: the tests run again each time you save.') }} />}
@@ -2576,6 +2780,9 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
         {problemCount} {problemCount === 1 ? 'error' : 'errors'} · {warningCount} {warningCount === 1 ? 'warning' : 'warnings'}
       </button>
       {maximized && <button className="status-item status-strong" onClick={() => setMaximized(null)}>Fullscreen · Esc or {mod}+Shift+M to restore</button>}
+      {container?.config && <button className={'status-item' + (containerOn ? ' status-strong' : '')} onClick={containerMenu} title={container.note ?? (container.name + ' · ' + container.config)}>
+        <span className={'status-dot' + (container.state === 'running' ? '' : ' inactive')} />Dev container{containerOn ? (container.state === 'running' ? ' · in use' : ' · not started') : container.state === 'running' ? ' · running' : ''}
+      </button>}
       {job && <button className="status-item" onClick={() => showDrawer('output')}><span className="status-dot busy" />{job.kind === 'run' ? 'Running' : job.kind === 'git' ? 'Git ' + job.action : 'Packages'}…</button>}
       {settings.autoSave !== 'off' && <span className="status-item status-optional" title="Auto save is on">Auto save</span>}
       <div className="flex-1" />
@@ -2627,7 +2834,8 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       <div className="full-side island side">
         <Explorer workspace={workspace} directories={directories} expanded={expanded} active={filePreview?.path ?? active?.path} changes={status} symbols={[]}
           onOpen={path => { void fs.read(path).then(text => setFilePreview({ path, text })).catch(notify) }} onExpand={toggleFolder} onNew={() => newFile()} onNewFolder={() => newFolder()} onWorkspace={chooseFolder}
-          onRefresh={() => { void refreshFiles(); reloadFromDisk() }} onJump={() => {}} onContext={explorerMenu} onKey={explorerKey} />
+          onRefresh={() => { void refreshFiles(); reloadFromDisk() }} onJump={() => {}} onContext={explorerMenu} onKey={explorerKey}
+          onMove={(entry, folder) => { void moveEntry(entry, (folder ? folder + '/' : '') + entry.name) }} />
       </div>
       <div className="full-main">
         {filePreview ? <>
@@ -2706,6 +2914,15 @@ function usePresence(open: boolean, ms = 260) {
 }
 
 /** A fullscreen view over the workspace (Files, Git), like the canvas and the journal. */
+type ViewportInfo = { top: number; height: number; lines: number; topLine: number }
+type Viewports = { get: (pane: string) => ViewportInfo | null; subscribe: (listener: () => void) => () => void }
+
+/** A side-by-side Markdown preview that follows its editor's scrolling. */
+function FollowingPreview({ viewports, pane, ...props }: { viewports: Viewports; pane: string } & Omit<React.ComponentProps<typeof Preview>, 'syncLine'>) {
+  const line = useSyncExternalStore(viewports.subscribe, () => viewports.get(pane)?.topLine ?? 1)
+  return <Preview {...props} syncLine={line} />
+}
+
 function FullView({ title, project, onClose, children }: { title: string; project: string; onClose: () => void; children: React.ReactNode }) {
   useEffect(() => {
     const key = (event: KeyboardEvent) => {

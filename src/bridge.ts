@@ -70,6 +70,7 @@ export const launcher = {
   target: () => desktop ? invoke<{ path: string; directory: boolean } | null>('launch_target').catch(() => null) : Promise.resolve(null),
   installCli: () => invoke<string>('install_cli'),
   explorerMenu: (enable: boolean) => invoke<string>('explorer_menu', { enable }),
+  shellIntegration: (enable: boolean) => invoke<string>('shell_integration', { enable }),
   writeText: (path: string, contents: string) => invoke<void>('write_text_file', { path, contents }),
   readText: (path: string) => invoke<string>('read_text_file', { path }),
 }
@@ -77,9 +78,14 @@ export const demo: Workspace = { root: 'orbit-lab', name: 'Orbit Lab', sample: t
 
 /** Forgets what Still remembered for a project folder (breakpoints, watches, run settings, open
  *  files, canvas layout), so a new project created in the same place starts clean. */
-export function forgetProject(root: string) {
-  const prefixes = ['still.breakpoints.', 'still.breakpointOptions.', 'still.watches.', 'still.runconfig.', 'still.session.', 'still.canvas.']
-  try { for (const prefix of prefixes) localStorage.removeItem(prefix + root) } catch { /* storage unavailable */ }
+export async function forgetProject(root: string): Promise<void> {
+  const prefixes = ['still.breakpoints.', 'still.breakpointOptions.', 'still.watches.', 'still.runconfig.', 'still.session.', 'still.canvas.', 'still.container.use.', 'still.container.seen.', 'still.db.']
+  try {
+    for (const prefix of prefixes) localStorage.removeItem(prefix + root)
+    for (const key of Object.keys(localStorage)) if (key.startsWith('still.db.sql.' + root + '.')) localStorage.removeItem(key)
+  } catch { /* storage unavailable */ }
+  // Unsaved edits kept for an old project in the same place mustn't come back into the new one.
+  await backups.write('|' + root, []).catch(() => {})
 }
 const demoContents: Record<string, string> = {
   'src/app.py': appSource, 'src/Main.java': javaSource, 'tests/test_orbit.py': orbitTest,
@@ -416,4 +422,11 @@ export const history = {
   showAt: (rootPath: string, rev: string, path: string) => invoke<string>('git_show_at', { rootPath, rev, path }),
   graph: (rootPath: string, limit?: number) => invoke<import('./GitGraph').GraphCommit[]>('git_graph', { rootPath, limit: limit ?? null }),
   commitDetail: (rootPath: string, hash: string) => invoke<{ message: string; author: string; date: string; parent: string | null; files: { path: string; oldPath: string | null; status: string; additions: number | null; deletions: number | null }[] }>('git_commit_detail', { rootPath, hash }),
+}
+
+/** A project's dev container (.devcontainer/devcontainer.json): what it is and whether it's running. */
+export interface ContainerInfo { config: string; name: string; docker: boolean; state: 'none' | 'stopped' | 'running'; id: string | null; workspace: string; image: string | null; note: string | null }
+export const containers = {
+  status: (rootPath: string) => invoke<ContainerInfo>('container_status', { rootPath }),
+  stop: (rootPath: string, remove = false) => invoke<void>('container_stop', { rootPath, remove }),
 }

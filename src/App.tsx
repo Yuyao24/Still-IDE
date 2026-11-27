@@ -75,9 +75,10 @@ export default function App() {
       const target = await launcher.target()
       if (target) {
         try {
-          const folder = target.directory ? target.path : target.path.split('/').slice(0, -1).join('/') || '/'
+          // Windows paths use backslashes; either kind of slash separates the folder from the file.
+          const folder = target.directory ? target.path : target.path.replace(/[\\/][^\\/]*$/, '') || '/'
           const workspace = await home.open(folder)
-          setView({ kind: 'workspace', workspace, options: target.directory ? undefined : { file: target.path.split('/').at(-1) } })
+          setView({ kind: 'workspace', workspace, options: target.directory ? undefined : { file: target.path.split(/[\\/]/).at(-1) } })
           return
         } catch { /* fall through to the usual start */ }
       }

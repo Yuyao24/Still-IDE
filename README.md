@@ -76,8 +76,37 @@ colours. Copy it or save it as a PNG.
 **Run.** Ctrl/Cmd + Enter runs the active file. Python uses the project's
 `.venv` (or `venv`, or `VIRTUAL_ENV`) and falls back to Python 3 on PATH. Java
 compiles with `javac -d bin` and shows compiler errors in the gutter and the
-Problems tab. Programs can read input: type into the box under the output.
+Problems tab. Tests run with pytest or JUnit (Maven or Gradle), with
+coverage marked in the gutter: pytest-cov for Python and JaCoCo for Java. Programs can read input: type into the box under the output.
 Right-click Run to pass program arguments.
+
+**Refactor.** Ctrl/Cmd + Shift + R (or right-click → Refactor…) offers Extract
+variable for an expression and, in Python, Extract function for whole lines:
+Still works out the new function's parameters and return values (and makes it a
+method when the lines use `self`). Language servers add their own refactorings,
+such as Extract method in Java and TypeScript. Moving or renaming a file or
+folder (drag it onto a folder, or Rename to a new path) offers to update the
+imports that point at it in Python, JavaScript, TypeScript and Java, including
+Java package lines.
+
+**Profiler.** "Profile this file" runs a Python file under a sampling profiler
+and shows a flame graph (click to zoom, double-click to open the line) and the
+functions where the time went.
+
+**Database.** The Database tab lists SQLite files in the project and Postgres
+servers (a `DATABASE_URL` in `.env`, or ones you add). Pick a table to see its
+rows, or write SQL and run it with Ctrl/Cmd + Enter. Postgres passwords are kept
+in the system keychain.
+
+**Dev containers.** A project with `.devcontainer/devcontainer.json` shows "Dev
+container" in the status bar. Use it and Still builds or pulls the image, starts
+the container with the project mounted, runs `postCreateCommand`, and then runs
+files, tests and new terminals inside it. With the Dev Containers CLI installed,
+features and Docker Compose setups work too.
+
+**Spell check.** Comments, docstrings and written strings in code, and the text
+of Markdown, LaTeX and plain text files. Hover a dotted word for suggestions or
+Add to dictionary.
 
 **Terminal.** xterm.js on a native PTY, with as many sessions as you like.
 Your default shell, or pick zsh, bash, fish, PowerShell, Command Prompt, Git

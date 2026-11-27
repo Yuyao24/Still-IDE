@@ -44,9 +44,23 @@ pub struct HomeState {
 
 pub fn canonical(path: &Path) -> String {
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let text = path.to_string_lossy().into_owned();
-    // Strip the Windows verbatim prefix so paths compare and display cleanly.
-    text.strip_prefix(r"\\?\").map(String::from).unwrap_or(text)
+    plain(&path.to_string_lossy())
+}
+
+/// A Windows path without the verbatim prefix: `\\?\C:\x` → `C:\x`, and a network share
+/// `\\?\UNC\server\share` → `\\server\share` (not the broken `UNC\server…`).
+pub fn plain(text: &str) -> String {
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") { return format!(r"\\{rest}") }
+    text.strip_prefix(r"\\?\").map(String::from).unwrap_or_else(|| text.to_owned())
+}
+
+/// How two project paths are compared: on Windows, case and slashes don't matter.
+pub fn same_path(a: &str, b: &str) -> bool {
+    key(a) == key(b)
+}
+fn key(path: &str) -> String {
+    let path = plain(path.trim()).trim_end_matches(['/', '\\']).to_owned();
+    if cfg!(windows) { path.replace('/', "\\").to_lowercase() } else { path }
 }
 
 fn language(extension: &str) -> Option<&'static str> {
@@ -165,7 +179,7 @@ pub async fn home_state(app: AppHandle, store: State<'_, Store>) -> Result<HomeS
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let (root, records) = store.read(|config| (config.projects_root.clone(), config.projects.clone()))?;
-        let by_path: HashMap<String, &ProjectRecord> = records.iter().map(|record| (record.path.clone(), record)).collect();
+        let by_path: HashMap<String, &ProjectRecord> = records.iter().map(|record| (key(&record.path), record)).collect();
         let mut projects = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let root_path = root.as_deref().map(PathBuf::from).filter(|path| path.is_dir());
@@ -177,13 +191,14 @@ pub async fn home_state(app: AppHandle, store: State<'_, Store>) -> Result<HomeS
                         continue;
                     }
                     let path = canonical(&entry.path());
-                    seen.insert(path.clone());
-                    projects.push(summary(&entry.path(), "library", by_path.get(&path).copied()));
+                    seen.insert(key(&path));
+                    projects.push(summary(&entry.path(), "library", by_path.get(&key(&path)).copied()));
                 }
             }
         }
         for record in &records {
-            if seen.insert(record.path.clone()) {
+            // The same folder written another way (case, slashes, a network path) is one project.
+            if seen.insert(key(&record.path)) {
                 let path = PathBuf::from(&record.path);
                 let location = if root_path.as_ref().is_some_and(|root| path.starts_with(root)) { "library" } else { "external" };
                 projects.push(summary(&path, location, Some(record)));
@@ -247,10 +262,12 @@ pub fn set_projects_root(app: AppHandle, store: State<Store>, path: String) -> R
 
 fn record_open(store: &Store, path: &str) -> Result<()> {
     store.update(|config| {
-        match config.projects.iter_mut().find(|record| record.path == path) {
-            Some(record) => record.last_opened = Some(now()),
-            None => config.projects.push(ProjectRecord { path: path.to_owned(), last_opened: Some(now()), pinned: false }),
-        }
+        // Merge records that turn out to be the same folder (left by older versions), keeping the
+        // newest time and any pin, under the path as it's written now.
+        let (same, mut others): (Vec<ProjectRecord>, Vec<ProjectRecord>) = std::mem::take(&mut config.projects).into_iter().partition(|record| same_path(&record.path, path));
+        let pinned = same.iter().any(|record| record.pinned);
+        others.push(ProjectRecord { path: path.to_owned(), last_opened: Some(now()), pinned });
+        config.projects = others;
         Ok(())
     })
 }
@@ -265,7 +282,7 @@ pub fn open_project(store: State<Store>, path: String) -> Result<WorkspaceInfo> 
 #[tauri::command]
 pub fn forget_project(store: State<Store>, path: String) -> Result<()> {
     store.update(|config| {
-        config.projects.retain(|record| record.path != path);
+        config.projects.retain(|record| !same_path(&record.path, &path));
         Ok(())
     })
 }
@@ -282,14 +299,14 @@ pub fn delete_project(store: State<Store>, path: String) -> Result<()> {
     if canonical.parent().is_none() || dirs_home().is_some_and(|home| home == canonical) {
         return Err("Still won't delete that folder.".into());
     }
-    let (root, known) = store.read(|config| (config.projects_root.clone(), config.projects.iter().any(|record| record.path == path)))?;
+    let (root, known) = store.read(|config| (config.projects_root.clone(), config.projects.iter().any(|record| same_path(&record.path, &path))))?;
     let in_library = root.as_ref().is_some_and(|root| std::path::Path::new(root).canonicalize().is_ok_and(|root| canonical.starts_with(&root) && canonical != root));
     if !known && !in_library {
         return Err("Still only deletes projects listed on Home.".into());
     }
     trash::delete(&canonical).map_err(|error| format!("Couldn't move the project to the trash: {error}"))?;
     store.update(|config| {
-        config.projects.retain(|record| record.path != path);
+        config.projects.retain(|record| !same_path(&record.path, &path));
         Ok(())
     })
 }
@@ -301,7 +318,7 @@ fn dirs_home() -> Option<std::path::PathBuf> {
 #[tauri::command]
 pub fn pin_project(store: State<Store>, path: String, pinned: bool) -> Result<()> {
     store.update(|config| {
-        match config.projects.iter_mut().find(|record| record.path == path) {
+        match config.projects.iter_mut().find(|record| same_path(&record.path, &path)) {
             Some(record) => record.pinned = pinned,
             None => config.projects.push(ProjectRecord { path, last_opened: None, pinned }),
         }

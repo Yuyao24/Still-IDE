@@ -32,8 +32,45 @@ pub fn find(cwd: &Path, name: &str) -> Option<PathBuf> {
             return Some(found);
         }
     }
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).find_map(|dir| executable(&dir, name))
+    if let Some(path) = std::env::var_os("PATH") {
+        if let Some(found) = std::env::split_paths(&path).find_map(|dir| executable(&dir, name)) { return Some(found) }
+    }
+    extra_dirs().iter().find_map(|dir| executable(dir, name))
+}
+
+/// Folders that hold tools but may be missing from Still's own PATH. On Windows, PATH as it is
+/// now: Still's copy is from when it started, so a tool installed since (MiKTeX, Python, a JDK)
+/// wouldn't be found until a restart. On macOS, Homebrew and TeX, which apps opened from the Dock
+/// don't get. Read again at most once every 30 seconds.
+pub fn extra_dirs() -> Vec<PathBuf> {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static CACHE: Mutex<Option<(Instant, Vec<PathBuf>)>> = Mutex::new(None);
+    if let Ok(cache) = CACHE.lock() {
+        if let Some((when, dirs)) = cache.as_ref() { if when.elapsed() < Duration::from_secs(30) { return dirs.clone() } }
+    }
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    #[cfg(windows)]
+    {
+        for key in [r"HKCU\Environment", r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment"] {
+            let Ok(out) = command("reg", Path::new(".")).args(["query", key, "/v", "Path"]).output() else { continue };
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            let Some(line) = text.lines().find(|line| line.trim_start().starts_with("Path") || line.trim_start().starts_with("PATH")) else { continue };
+            let Some(value) = line.split("REG_EXPAND_SZ").nth(1).or_else(|| line.split("REG_SZ").nth(1)) else { continue };
+            // %SystemRoot%, %USERPROFILE%… expanded from the environment.
+            let expanded = regex::Regex::new(r"%([^%]+)%").unwrap().replace_all(value.trim(), |found: &regex::Captures| std::env::var(&found[1]).unwrap_or_default()).into_owned();
+            dirs.extend(expanded.split(';').filter(|part| !part.trim().is_empty()).map(|part| PathBuf::from(part.trim())));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    dirs.extend(["/opt/homebrew/bin", "/usr/local/bin", "/Library/TeX/texbin"].map(PathBuf::from));
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        dirs.push(PathBuf::from("/usr/local/bin"));
+        if let Some(home) = std::env::var_os("HOME") { dirs.push(PathBuf::from(home).join(".local").join("bin")); }
+    }
+    if let Ok(mut cache) = CACHE.lock() { *cache = Some((Instant::now(), dirs.clone())); }
+    dirs
 }
 
 /// Runs a command with `input` on stdin and returns stdout when it succeeds.

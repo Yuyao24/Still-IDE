@@ -37,6 +37,9 @@ import { useEffect, useLayoutEffect, useRef } from 'react'
 import { scopedOccurrences } from './occurrences'
 import { expandSnippetBefore, smartCompletions, sourceColumn } from './completion'
 import { smartTyping } from './smart'
+import { spellCheck, spellHook } from './spell'
+import { builtInRefactors, runRefactor } from './refactor'
+
 import { stickyScroll } from './sticky'
 import { lspLanguage, quickFixes, serverCommands, serverDiagnostics, serverExtension, withServer, type QuickFix, type Server } from './lsp'
 import { inlineSuggestions, type Suggest } from './ghost'
@@ -91,6 +94,10 @@ const look = EditorView.theme({
   '.cm-panel.cm-dialog input:focus': { borderColor: 'var(--ink)' },
   '.cm-panel.cm-dialog button': { font: '12px var(--font-ui)', padding: '3px 10px', border: '1px solid var(--line)', borderRadius: '0', background: 'transparent', color: 'var(--ink)', cursor: 'pointer' },
   '.cm-panel.cm-dialog button[name=close]': { border: 'none', color: 'var(--muted)', marginLeft: 'auto' },
+  '.cm-refactor-form': { display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' },
+  '.cm-refactor-form > label:first-child': { display: 'flex', alignItems: 'center', gap: '8px' },
+  '.cm-refactor-check': { display: 'flex', alignItems: 'center', gap: '4px', color: 'var(--secondary)' },
+  '.cm-refactor-check input': { accentColor: 'var(--ink)' },
   '.cm-lsp-message-error': { color: 'var(--red)' },
   '.cm-tests .cm-gutterElement': { padding: '0 2px 0 4px', cursor: 'pointer' },
   '.cm-test-marker': { display: 'inline-block', width: '12px', textAlign: 'center', fontSize: '10px', fontFamily: 'var(--font-sans)', color: 'var(--green)' },
@@ -248,6 +255,10 @@ const modes: { name: string; extensions: string[]; files?: string[]; indent?: nu
   { name: 'Properties', extensions: ['properties', 'ini', 'cfg', 'conf', 'env'], files: ['.gitignore', '.env', '.editorconfig'], load: () => StreamLanguage.define(properties) },
 ]
 
+/** Where refactorings report what they did (Ide sets it to its toasts). */
+export const refactorHook: { notify: (message: string) => void } = { notify: () => {} }
+const notifyRefactor = (message: string) => refactorHook.notify(message)
+
 function mode(path: string) {
   const name = path.split('/').at(-1) ?? path
   const extension = name.includes('.') ? name.split('.').at(-1)!.toLowerCase() : ''
@@ -269,6 +280,8 @@ export interface EditorOptions {
   fStrings?: boolean
   /** Enter inside a line comment continues it. */
   continueComments?: boolean
+  /** Spell check comments, docstrings and prose files. */
+  spellCheck?: boolean
   /** Keep the enclosing function or class header at the top while scrolling inside it. */
   sticky?: boolean
   /** Show the language server's inlay hints. */
@@ -318,6 +331,7 @@ function configure(options: EditorOptions, path: string): Extension {
     // A snippet's name then Tab expands it at once, like a live template, even before suggestions show.
     Prec.highest(keymap.of([{ key: 'Tab', run: view => completionStatus(view.state) === 'active' || hasNextSnippetField(view.state) ? false : expandSnippetBefore(view, snippetLanguage(path)) }])),
     stickyScroll(line => highlightToHtml(line, path.split('.').at(-1) ?? ''), options.sticky !== false),
+    options.spellCheck !== false ? spellCheck(mode(path)?.name ?? (/\.(txt|text|rst)$/i.test(path) ? 'Plain Text' : ''), word => spellHook.add(word)) : [],
     EditorState.tabSize.of(options.tabSize),
     indentUnit.of(' '.repeat(options.tabSize)),
     // Other uses of the word under the caret (or of the selected text) are marked.
@@ -760,6 +774,10 @@ export interface EditorHandle {
   scrollTo: (fraction: number) => void
   /** The language server's fixes for the caret's line (null when there's no server). */
   quickFixes: () => Promise<QuickFix[] | null>
+  /** Refactorings for the selection: Still's own (extract variable or function) and the language server's. */
+  refactors: () => Promise<{ title: string; run: () => void | Promise<void> }[]>
+  /** One of Still's refactorings by name, for its shortcut. */
+  refactor: (id: 'extract-variable' | 'extract-method') => void
   /** Where the caret is on screen, for a menu beside it. */
   caretPoint: () => { x: number; y: number } | null
   text: () => string
@@ -882,6 +900,16 @@ function handleFor(editor: EditorView, path: string): EditorHandle {
     selection: () => { const range = editor.state.selection.main; return range.empty ? '' : editor.state.sliceDoc(range.from, range.to) },
     reveal: () => editor.dispatch({ effects: EditorView.scrollIntoView(editor.state.selection.main.head, { y: 'center' }) }),
     quickFixes: () => quickFixes(editor),
+    refactors: async () => {
+      const language = mode(path)?.name ?? ''
+      const own = builtInRefactors(editor, language, notifyRefactor)
+      let server: QuickFix[] = []
+      try { server = (await quickFixes(editor, true)) ?? [] } catch { server = [] }
+      // The server's own extract-to-variable wins over Still's when it offers one.
+      const serverExtracts = server.some(item => /extract.*(constant|variable|local)/i.test(item.title))
+      return [...own.filter(item => !(serverExtracts && item.id === 'extract-variable')), ...server]
+    },
+    refactor: id => runRefactor(editor, mode(path)?.name ?? '', id, notifyRefactor),
     caretPoint: () => { const box = editor.coordsAtPos(editor.state.selection.main.head); return box ? { x: box.left, y: box.bottom + 4 } : null },
     scrollTo: fraction => { const scroller = editor.scrollDOM; scroller.scrollTop = fraction * (scroller.scrollHeight - scroller.clientHeight) },
     jump: (line, column = 1, length = 0) => {
@@ -1083,7 +1111,7 @@ export default function Editor(props: Props) {
   useEffect(() => {
     view.current?.dispatch({ effects: configuration.reconfigure(configure(props.options, props.path)) })
   }, [options.wrap, options.lineNumbers, options.highlightLine, options.tabSize, options.autocomplete, options.occurrences, options.whitespace,
-    options.indentGuides, options.closeBrackets, options.scrollPastEnd, options.cursorBlink, options.folding, options.blameColumn, options.constructors, options.sticky, options.docTemplates, options.fStrings, options.continueComments])
+    options.indentGuides, options.closeBrackets, options.scrollPastEnd, options.cursorBlink, options.folding, options.blameColumn, options.constructors, options.sticky, options.docTemplates, options.fStrings, options.continueComments, options.spellCheck])
 
   useEffect(() => {
     const editor = view.current

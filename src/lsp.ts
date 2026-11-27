@@ -323,20 +323,21 @@ async function applyWorkspaceEdit(workspace: StillWorkspace, edit: WorkspaceEdit
 
 // ---- Quick fixes: the server's code actions for the caret's line ----
 export interface QuickFix { title: string; kind: string; preferred: boolean; run: () => Promise<void> }
-export async function quickFixes(view: EditorView): Promise<QuickFix[] | null> {
+export async function quickFixes(view: EditorView, refactor = false): Promise<QuickFix[] | null> {
   const plugin = LSPPlugin.get(view)
   if (!plugin?.client.serverCapabilities?.codeActionProvider) return null
   const workspace = plugin.client.workspace as StillWorkspace
   plugin.client.sync()
   const range = view.state.selection.main
   const line = view.state.doc.lineAt(range.head)
-  const start = plugin.toPosition(range.empty ? line.from : range.from), end = plugin.toPosition(range.empty ? line.to : range.to)
+  // Refactorings act on exactly what's selected (or the caret); fixes on the whole line.
+  const start = plugin.toPosition(range.empty && !refactor ? line.from : range.from), end = plugin.toPosition(range.empty && !refactor ? line.to : range.to)
   const diagnostics = (published.get(plugin.uri)?.items ?? []).filter(item => item.range.start.line <= end.line && item.range.end.line >= start.line)
   type Command = { title: string; command: string; arguments?: unknown[] }
   type Action = { title: string; kind?: string; isPreferred?: boolean; edit?: WorkspaceEdit; command?: Command | string; arguments?: unknown[]; data?: unknown; disabled?: unknown }
-  const found = await plugin.client.request<object, Action[] | null>('textDocument/codeAction', { textDocument: { uri: plugin.uri }, range: { start, end }, context: { diagnostics, triggerKind: 1 } })
+  const found = await plugin.client.request<object, Action[] | null>('textDocument/codeAction', { textDocument: { uri: plugin.uri }, range: { start, end }, context: refactor ? { diagnostics: [], only: ['refactor'], triggerKind: 1 } : { diagnostics, triggerKind: 1 } })
   const execute = async (command: Command) => { await plugin.client.request('workspace/executeCommand', { command: command.command, arguments: command.arguments }) }
-  return (found ?? []).filter(action => !action.disabled).map(action => ({
+  return (found ?? []).filter(action => !action.disabled && (!refactor || (action.kind ?? '').startsWith('refactor'))).map(action => ({
     title: action.title, kind: action.kind ?? '', preferred: Boolean(action.isPreferred),
     run: async () => {
       // A bare Command, or a CodeAction with an edit and/or a command (resolved first when the server wants that).

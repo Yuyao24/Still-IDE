@@ -518,7 +518,11 @@ done"#;
 // session), so a terminal reuses the connection you already signed in on — no second
 // password or verification code. Standard library only; works with Python 3.5+.
 const RELAY_PY: &str = r#"
-import os, sys, pty, select, struct, fcntl, termios, signal, base64, threading, subprocess, tempfile
+import os, sys, pty, select, struct, fcntl, termios, signal, base64, threading, subprocess, tempfile, tty
+# The connection has a terminal (so SSH sends keystrokes at once); make it a plain byte pipe.
+if os.isatty(0):
+    try: tty.setraw(0)
+    except Exception: pass
 out_lock = threading.Lock()
 def send(line):
     with out_lock:
@@ -628,9 +632,19 @@ fn worker_slot(app: &AppHandle, id: &str) -> Option<std::sync::Arc<Mutex<Option<
 }
 
 fn start_worker(app: &AppHandle, host: &SshHost) -> Result<Worker> {
+    // With a terminal, OpenSSH sends each keystroke and each echo at once (TCP_NODELAY and
+    // low-delay QoS); without one it may hold small packets back, which makes terminals riding
+    // on this connection feel slow. The remote end switches the terminal to raw bytes first.
+    match start_worker_mode(app, host, true) {
+        Err(message) if message.starts_with("WORKER") => start_worker_mode(app, host, false),
+        other => other,
+    }
+}
+
+fn start_worker_mode(app: &AppHandle, host: &SshHost, tty: bool) -> Result<Worker> {
     let mut cmd: Command = command(program(), &std::env::temp_dir());
-    let launch = format!("if command -v python3 >/dev/null 2>&1; then exec python3 -u -c {}; else exec sh -c {}; fi", quote(RELAY_PY), quote(WORKER_LOOP));
-    cmd.args(base_args(app, host, true)?).arg("-T").arg("--").arg(destination(host)).arg(format!("sh -c {}", quote(&launch)));
+    let launch = format!("{}if command -v python3 >/dev/null 2>&1; then exec python3 -u -c {}; else exec sh -c {}; fi", if tty { "stty raw -echo -opost 2>/dev/null; " } else { "" }, quote(RELAY_PY), quote(WORKER_LOOP));
+    cmd.args(base_args(app, host, true)?).arg(if tty { "-tt" } else { "-T" }).arg("--").arg(destination(host)).arg(format!("sh -c {}", quote(&launch)));
     let attempt = use_prompts(app, &mut cmd, host);
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|error| match error.kind() {
@@ -650,6 +664,8 @@ fn start_worker(app: &AppHandle, host: &SshHost) -> Result<Worker> {
         use tauri::Emitter;
         for line in std::io::BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
+            // A terminal that kept its line endings adds \r; the protocol doesn't use it.
+            let line = line.trim_end_matches('\r').to_owned();
             // Terminal traffic from the relay goes straight to the terminal in the window.
             if let Some(rest) = line.strip_prefix("STILLT ") {
                 let mut parts = rest.splitn(3, ' ');
@@ -1736,7 +1752,7 @@ pub fn ssh_tests_run(app: AppHandle, store: State<Store>, jobs: State<Jobs>, id:
         });
         let mut results = Vec::new();
         crate::tests::parse_junit(&xml, &mut results);
-        crate::tests::emit_report(&events, report_id, "pytest".into(), results);
+        crate::tests::emit_report(&events, report_id, "pytest".into(), results, None);
         Ok((code, Vec::new()))
     })
 }

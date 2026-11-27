@@ -3,6 +3,8 @@
 mod backup;
 mod ai;
 mod check;
+mod container;
+mod db;
 mod debug;
 mod docs;
 mod history;
@@ -15,6 +17,7 @@ mod config;
 mod git;
 mod packages;
 mod process;
+mod profile;
 mod projects;
 mod ssh;
 mod terminal;
@@ -47,6 +50,7 @@ fn main() {
         .setup(|app| {
             let store = config::Store::load(app.handle());
             app.manage(store);
+            backup::ensure_shell_integration(app.handle());
             // The window starts hidden and the page shows it once it has painted in the theme's
             // colours (no white flash). If the page never does, show it anyway.
             let handle = app.handle().clone();
@@ -152,6 +156,16 @@ fn main() {
             ssh::ssh_search,
             ssh::ssh_run,
             ssh::ssh_debug_start,
+            profile::profile_start,
+            container::container_status,
+            container::container_up,
+            container::container_stop,
+            container::container_run,
+            container::container_tests,
+            db::db_tables,
+            db::db_query,
+            db::db_save_password,
+            db::db_forget_password,
             backup::backup_write,
             backup::backup_read,
             backup::launch_target,
@@ -159,6 +173,7 @@ fn main() {
             backup::read_text_file,
             backup::install_cli,
             backup::explorer_menu,
+            backup::shell_integration,
             git::git_graph,
             git::git_commit_detail,
             ssh::ssh_forward_start,

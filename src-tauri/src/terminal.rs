@@ -128,6 +128,7 @@ pub async fn terminal_start(
     shell: Option<String>,
     ssh_host: Option<String>,
     remote_path: Option<String>,
+    container: Option<bool>,
 ) -> Result<()> {
     let state = state.inner().clone();
     let store = store.inner().clone();
@@ -160,6 +161,13 @@ pub async fn terminal_start(
                     cmd.env(key, value);
                 }
                 ssh::touch(&store, &host.id);
+                cmd
+            }
+            // A shell inside the project's dev container.
+            None if container.unwrap_or(false) => {
+                let (docker, args) = crate::container::terminal_command(&cwd)?;
+                let mut cmd = CommandBuilder::new(docker);
+                cmd.args(args);
                 cmd
             }
             None => local_shell(shell),

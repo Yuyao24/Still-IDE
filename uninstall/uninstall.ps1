@@ -86,6 +86,15 @@ foreach ($dir in $shortcutDirs) {
 }
 Get-ChildItem -LiteralPath $env:TEMP -Filter "still-uninstall-*.ps1" -ErrorAction SilentlyContinue | ForEach-Object { if ($_.FullName -ne $PSCommandPath) { Add-Target $_.FullName } }
 $registryLeftovers = @("HKCU:\Software\$Product\$Product", "HKCU:\Software\$Identifier") | Where-Object { Test-Path $_ }
+# The still command and the File Explorer entries (Open with Still, Open with).
+Add-Target "$env:LOCALAPPDATA\Microsoft\WindowsApps\still.cmd"
+$explorerKeys = @(
+  "HKCU:\Software\Classes\Directory\shell\Still",
+  "HKCU:\Software\Classes\Directory\Background\shell\Still",
+  "HKCU:\Software\Classes\*\shell\Still",
+  "HKCU:\Software\Classes\Still.Source",
+  "HKCU:\Software\Classes\Applications\still-ide.exe"
+) | Where-Object { Test-Path -LiteralPath $_ }
 
 # ---- Kept folders -----------------------------------------------------------
 $keep = @()
@@ -169,6 +178,16 @@ foreach ($item in (@($remove) + @($sourceBuild))) {
 foreach ($key in $registryLeftovers) {
   Remove-Item -Path $key -Recurse -Force -ErrorAction SilentlyContinue
   Write-Output "Removed $key"
+}
+foreach ($key in $explorerKeys) {
+  Remove-Item -LiteralPath $key -Recurse -Force -ErrorAction SilentlyContinue
+  Write-Output "Removed $key"
+}
+Get-ChildItem -LiteralPath "HKCU:\Software\Classes" -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -like '.*' } | ForEach-Object {
+  $progids = Join-Path $_.PSPath 'OpenWithProgids'
+  if ((Test-Path -LiteralPath $progids) -and ((Get-Item -LiteralPath $progids).Property -contains 'Still.Source')) {
+    Remove-ItemProperty -LiteralPath $progids -Name 'Still.Source' -ErrorAction SilentlyContinue
+  }
 }
 $vendor = "HKCU:\Software\$Product"
 if ((Test-Path $vendor) -and -not (Get-ChildItem $vendor -ErrorAction SilentlyContinue) -and -not ((Get-Item $vendor).Property)) {
