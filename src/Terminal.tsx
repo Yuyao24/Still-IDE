@@ -33,6 +33,9 @@ interface Props {
 
 export default function Terminal({ session, root, visible, theme, fontSize, fontFamily, cursor, shell, scrollback = 5000, copyOnSelect = false, onReady, onExit }: Props) {
   const host = useRef<HTMLDivElement>(null)
+  // xterm sizes itself from its parent's height and width; the padding lives on the outer box
+  // so that measurement is the real space (otherwise the last line hides and text runs under the scrollbar).
+  const mount = useRef<HTMLDivElement>(null)
   const instance = useRef<Xterm | null>(null)
   const fitter = useRef<FitAddon | null>(null)
   const callbacks = useRef({ onReady, onExit })
@@ -42,7 +45,7 @@ export default function Terminal({ session, root, visible, theme, fontSize, font
   copying.current = copyOnSelect
 
   useEffect(() => {
-    const container = host.current
+    const container = mount.current
     if (!container) return
     const id = session.id
     const settings = initial.current
@@ -134,5 +137,5 @@ export default function Terminal({ session, root, visible, theme, fontSize, font
     return () => cancelAnimationFrame(frame)
   }, [visible])
 
-  return <div ref={host} className="terminal-host" hidden={!visible} />
+  return <div ref={host} className="terminal-host" hidden={!visible}><div ref={mount} className="terminal-mount" /></div>
 }

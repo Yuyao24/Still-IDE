@@ -579,6 +579,13 @@ export function withServer(own: CompletionSource): CompletionSource {
     const lower = typed.toLowerCase()
     const fits = (label: string) => !typed || label.toLowerCase().startsWith(lower)
     const server = theirs.options.filter(option => fits(option.label)).map(option => ({ ...option, ['source' as never]: 'server' }))
+    // self. / this.: the class's own members first (with the server's types and docs), then the rest of the server's list.
+    const ours = afterDot && mine ? mine.options.filter(option => (option as unknown as { source?: string }).source === 'this class') : []
+    if (ours.length && mine && mine.from === theirs.from) {
+      const labels = new Set(ours.map(option => option.label))
+      const merged = [...ours.map(option => { const match = server.find(item => item.label === option.label); return match ? { ...match, ['source' as never]: 'this class' } : option }), ...server.filter(option => !labels.has(option.label))]
+      return { from: mine.from, options: merged.slice(0, 80).map((option, index) => ({ ...option, boost: 99 - Math.min(198, index) })), filter: false }
+    }
     // After a dot, the server's list is the accurate one.
     if (afterDot || !mine || mine.from !== theirs.from) return server.length ? { ...theirs, options: server.slice(0, 80), filter: false } : mine
     const labels = new Map(mine.options.map(option => [option.label, option]))

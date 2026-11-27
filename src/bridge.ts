@@ -377,7 +377,7 @@ export const clipboard = {
 export const editorSupport = {
   head: async (rootPath: string, path: string): Promise<string | null> => desktop ? invoke('git_head_text', { rootPath, path }) : null,
   checkPython: (rootPath: string, source: string, path?: string, lint = true) => invoke<{ line: number; column: number; endLine?: number | null; endColumn?: number | null; severity: 'error' | 'warning'; message: string }[]>('check_python', { rootPath, source, path: path ?? null, lint }),
-  format: (rootPath: string, path: string, source: string) => invoke<{ text: string | null; tool: string | null; hint: string | null }>('format_code', { rootPath, path, source }),
+  format: (rootPath: string, path: string, source: string, options?: Record<string, unknown>) => invoke<{ text: string | null; tool: string | null; hint: string | null }>('format_code', { rootPath, path, source, options: options ?? null }),
   tools: (rootPath: string | null) => invoke<{ name: string; purpose: string; found: string | null; install: string | null }[]>('tools_status', { rootPath }),
   install: (rootPath: string | null, id: string, tool: string) => invoke<void>('install_tool', { rootPath, id, tool }),
 }

@@ -63,6 +63,22 @@ export interface Settings {
   newProjectRequirements: boolean
   openOnStart: 'last' | 'readme'
   formatOnSave: boolean
+  /** A small map of the file beside each editor (its own strip, not the right bar). */
+  minimap: boolean
+  /** Formatting (Settings → Formatting); a project's own config file wins. */
+  javaFormatStyle: 'google' | 'aosp'
+  pythonLineLength: number
+  pythonIndent: number
+  pythonQuotes: 'double' | 'single' | 'preserve'
+  webIndent: number
+  webTabs: boolean
+  webSemicolons: boolean
+  webQuotes: 'double' | 'single'
+  webPrintWidth: number
+  webTrailingCommas: 'all' | 'es5' | 'none'
+  cStyle: 'LLVM' | 'Google' | 'Chromium' | 'Mozilla' | 'WebKit' | 'Microsoft' | 'GNU'
+  cIndent: number
+  rustIndent: number
   inlineBlame: boolean
   /** Fill in __init__ / the constructor when a new class is started. */
   fillConstructors: boolean
@@ -163,6 +179,20 @@ export const defaults: Settings = {
   newProjectRequirements: true,
   openOnStart: 'last',
   formatOnSave: false,
+  minimap: false,
+  javaFormatStyle: 'google',
+  pythonLineLength: 88,
+  pythonIndent: 4,
+  pythonQuotes: 'double',
+  webIndent: 2,
+  webTabs: false,
+  webSemicolons: true,
+  webQuotes: 'double',
+  webPrintWidth: 80,
+  webTrailingCommas: 'all',
+  cStyle: 'LLVM',
+  cIndent: 2,
+  rustIndent: 4,
   inlineBlame: true,
   fillConstructors: true,
   docTemplates: true,

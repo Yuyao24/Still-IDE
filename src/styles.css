@@ -49,7 +49,8 @@
 *:not(input[type="checkbox"], input[type="radio"]) { border-radius: 0 !important; }
 
 * { box-sizing: border-box; }
-html, body, #root { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+/* clip, not hidden: a clipped box can't be scrolled sideways by focus or scrollIntoView. */
+html, body, #root { width: 100%; height: 100%; margin: 0; overflow: clip; }
 body { background: var(--editor); color: var(--ink); font: var(--ui-font-size)/1.5 var(--font-sans); -webkit-font-smoothing: antialiased; font-variant-ligatures: none; }
 button, input, textarea, select { font: inherit; color: inherit; }
 button { cursor: pointer; }
@@ -62,7 +63,11 @@ svg { flex: none; }
 ::-webkit-scrollbar-thumb:hover { background-color: var(--dash); }
 ::-webkit-scrollbar-corner { background: transparent; }
 /* No elastic bounce at the ends of lists, menus and editors (the webview adds one on touchpads). */
-html, body, * { overscroll-behavior: none; }
+/* No rubber-band at the ends of the page or of lists. Only on things that really scroll: on
+   every element, a row that clips its text would swallow the wheel instead of passing it on. */
+html, body, .tree-scroll, .symbols-panel, .console-scroll, .overview, .graph-side, .sidebar-content, .palette-results, .sheet-body,
+.settings-scroll, .home, .doc-preview, .chat-list, .rb-list, .dbg-scroll, .history-list, .tests-list, .pdf-scroll, .nb-cells,
+.pr-main, .graph-list, .graph-detail, .profile-body, .db-tree, .db-results, .cm-scroller { overscroll-behavior: none; }
 /* The editor's scrollbars fade in while scrolling or near the pointer, and out again after. */
 @property --bar { syntax: '<color>'; inherits: true; initial-value: transparent; }
 .cm-scroller { --bar: transparent; transition: --bar 450ms ease; }
@@ -123,7 +128,7 @@ button.chrome-branch:hover { color: var(--ink); }
 .bench { position: relative; z-index: 1; display: grid; gap: 0; padding: 0 24px; min-height: 0; min-width: 0; transition: grid-template-columns 230ms var(--ease), grid-template-rows 230ms var(--ease); }
 .bench.is-resizing { transition: none; }
 /* Each side island lives in a slot whose grid track grows from 0; the island keeps its own size and slides in with it. */
-.slot { position: relative; min-width: 0; min-height: 0; overflow: hidden; }
+.slot { position: relative; min-width: 0; min-height: 0; overflow: clip; }
 .slot-side { grid-column: 1; grid-row: 1 / 3; }
 .slot-right { grid-column: 3; grid-row: 1 / 3; }
 .slot-drawer { grid-column: 2; grid-row: 2; }
@@ -177,7 +182,7 @@ button.chrome-branch:hover { color: var(--ink); }
 .tree-row.is-active svg:not(.tree-chev svg) { color: var(--ink); }
 .symbols-panel { border-top: 1px solid var(--line); padding-bottom: 10px; flex-shrink: 0; max-height: 35%; overflow: auto; }
 .outline-head { display: flex; align-items: center; gap: 7px; height: 40px; padding: 0 20px; width: 100%; text-align: left; color: var(--muted); }
-.outline-symbol { display: flex; align-items: center; gap: 8px; color: var(--secondary); margin: 0 8px; width: calc(100% - 16px); height: 24px; padding: 0 12px 0 22px; text-align: left; font: 12px var(--font-mono); overflow: hidden; }
+.outline-symbol { display: flex; align-items: center; gap: 8px; color: var(--secondary); margin: 0 8px; width: calc(100% - 16px); height: 24px; padding: 0 12px 0 22px; text-align: left; font: 12px var(--font-mono); overflow: clip; }
 .outline-symbol svg { color: var(--faint); }
 
 /* Editor island */
@@ -199,7 +204,7 @@ button.crumb-symbol:hover { color: var(--ink); }
 .crumb-host { display: inline-flex; align-items: center; gap: 5px; padding: 0 6px; }
 .run-args { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 11px var(--font-mono); color: var(--muted); border: 1px dashed var(--line); padding: 1px 5px; }
 .editor-wrap { position: relative; flex: 1; min-height: 0; min-width: 0; }
-.editor-host { position: absolute; inset: 0; overflow: hidden; }
+.editor-host { position: absolute; inset: 0; overflow: clip; }
 .editor-host .cm-editor { height: 100%; }
 .editor-host.split-diff { overflow: auto; }
 .editor-host.split-diff .cm-mergeView { min-height: 100%; }
@@ -246,7 +251,10 @@ button.crumb-symbol:hover { color: var(--ink); }
 .drawer-actions { display: flex; gap: 2px; align-items: center; margin-left: auto; flex-shrink: 0; }
 .drawer-body { flex: 1; position: relative; min-height: 0; }
 .terminal-host, .console-scroll { position: absolute; inset: 0; }
-.terminal-host { padding: 12px 28px 8px; }
+.terminal-host { padding: 12px 18px 10px 28px; }
+.terminal-mount { position: relative; width: 100%; height: 100%; overflow: hidden; }
+/* Room on the right for the scrollbar, so it never sits on text. */
+.terminal-mount .xterm { height: 100%; padding-right: 10px; }
 .terminal-host[hidden] { display: none; }
 .console-wrap { position: absolute; inset: 0; display: flex; flex-direction: column; }
 .console-wrap .console-scroll { position: relative; inset: auto; flex: 1; min-height: 0; }
@@ -608,7 +616,7 @@ select.field { padding-block: 5px; }
 .settings-body { display: flex; flex-direction: column; min-height: 0; background: var(--editor); }
 .settings-head { display: flex; align-items: center; justify-content: space-between; height: 52px; padding: 0 14px 0 28px; border-bottom: 1px solid var(--line); flex-shrink: 0; }
 .settings-head h2 { font-size: 15px; font-weight: 620; letter-spacing: -.01em; }
-.settings-scroll { overflow: auto; padding: 8px 28px 32px; }
+.settings-scroll { overflow: hidden auto; padding: 8px 28px 32px; scroll-padding-top: 12px; }
 .settings-group { padding: 18px 0 14px; border-bottom: 1px solid var(--line); }
 .settings-group:last-child { border-bottom: 0; }
 .settings-group h3 { font-size: 13px; font-weight: 620; margin-bottom: 8px; }
@@ -1075,7 +1083,7 @@ button.journal-row:not(:disabled):hover span { text-decoration: underline; text-
 
 /* Fullscreen Files and Git */
 .full-body { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(260px, 340px) minmax(0, 1fr); gap: 0; padding: 0 24px 24px; }
-.full-view .full-side { position: relative; min-height: 0; overflow: hidden; border: 0; background: transparent; }
+.full-view .full-side { position: relative; min-height: 0; overflow: clip; border: 0; background: transparent; }
 .full-view .full-side::after { content: ""; position: absolute; right: 0; top: 18px; bottom: 18px; width: 1px; background: var(--line); }
 .full-main { min-width: 0; min-height: 0; display: flex; flex-direction: column; padding-left: 24px; }
 .full-main-head { display: flex; align-items: center; gap: 14px; height: 48px; flex-shrink: 0; position: relative; }
@@ -1578,3 +1586,51 @@ pre.nb-out { font: 12.5px/1.55 var(--font-mono); white-space: pre-wrap; overflow
 .db-grid .db-num { color: var(--faint); text-align: right; width: 1%; padding-left: 16px; }
 .db-grid tbody tr:hover td { background: color-mix(in srgb, var(--ink) 4%, transparent); }
 .db-error-text { margin: 0; padding: 12px 16px; color: var(--red); font: 12px/1.5 var(--font-mono); white-space: pre-wrap; }
+
+.settings-tool { margin-left: 8px; color: var(--muted); font: 11px var(--font-mono); font-weight: 400; }
+
+/* The minimap: its own strip beside each editor, separate from the right bar */
+.pane-body.with-map > .editor-host, .pane-body.with-map > .doc-split { right: 92px; }
+.pane-map { position: absolute; top: 0; bottom: 0; right: 0; width: 92px; border-left: 1px solid var(--line); background: var(--editor); animation: fade var(--fast) var(--ease); }
+.pane-map .minimap { position: absolute; inset: 0; }
+.pane-map-close { position: absolute; top: 6px; right: 6px; width: 18px; height: 18px; display: grid; place-items: center; color: var(--muted); background: var(--editor); border: 1px solid var(--line); opacity: 0; transition: opacity var(--fast) var(--ease); z-index: 2; }
+.pane-map:hover .pane-map-close, .pane-map-close:focus-visible { opacity: 1; }
+.pane-map-close:hover { color: var(--ink); }
+.side-views .side-close { margin-left: auto; padding: 0 4px; color: var(--muted); }
+.side-views .side-close:hover { color: var(--ink); }
+
+/* Home: Studio on Paper. The project you were in, large, with Continue; other projects in an
+   open grid; the dotted page and wide margins of the Paper home around it. */
+.home.studio { padding: clamp(32px, 12vh, 150px) 40px clamp(20px, 5vh, 48px); }
+.studio-page { width: 100%; max-width: 1120px; margin: 0 auto auto; display: grid; grid-template-columns: minmax(0, 1fr) 220px; gap: clamp(48px, 7vw, 110px); align-items: start; }
+.studio-column { min-width: 0; display: flex; flex-direction: column; gap: clamp(22px, 3.6vh, 36px); animation: rise 280ms var(--ease); background: var(--editor); box-shadow: 0 0 48px 40px var(--editor); }
+.studio-kicker { margin: 0 0 14px; color: var(--muted); font: 12.5px var(--font-mono); letter-spacing: .01em; }
+.studio-title { margin: 0; color: var(--ink); font-size: clamp(52px, 8.2vw, 112px); font-weight: 300; letter-spacing: -.045em; line-height: .95; overflow-wrap: anywhere; }
+.studio .studio-continue { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; margin-top: 28px; background: none; }
+.studio .studio-go { flex: none; display: inline-flex; align-items: center; gap: 12px; height: 44px; padding: 0 22px; color: var(--editor); background: var(--ink); border: 1px solid var(--ink); font-size: 15px; font-weight: 500; transition: transform var(--fast) var(--ease), box-shadow var(--base) var(--ease); }
+.studio .studio-go kbd { color: inherit; background: transparent; border-color: currentColor; opacity: .6; }
+.studio .studio-go:hover, .studio .studio-continue.is-picked .studio-go { box-shadow: 0 8px 22px var(--shadow); }
+.studio .studio-go:active { transform: translateY(1px); }
+.studio-meta { color: var(--muted); font-size: 13px; font-family: var(--font-mono); }
+.studio-changed { color: var(--amber); }
+.studio .launch-box { height: 44px; padding: 0 2px; border: 0; border-bottom: 1px solid var(--line); background: transparent; }
+.studio .launch-box:focus-within { border-color: var(--ink); box-shadow: none; }
+.studio .studio-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 4px 28px; margin-top: 12px; }
+.studio .studio-card { position: relative; align-items: flex-start; }
+.studio .studio-card .project-open { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; padding: 8px 26px 10px 0; text-align: left; }
+.studio .studio-card .launch-name { color: var(--ink); font-size: 20px; font-weight: 400; letter-spacing: -.01em; overflow-wrap: anywhere; }
+.studio .studio-card .launch-detail { color: var(--muted); font-size: 12.5px; }
+.studio .studio-card .launch-kind { color: var(--muted); font: 10.5px var(--font-mono); letter-spacing: .08em; text-transform: uppercase; }
+.studio .studio-card.is-picked { background: none; }
+.studio .studio-card.is-picked .launch-name { text-decoration: underline 1px; text-decoration-color: var(--dash); text-underline-offset: 5px; }
+.studio .studio-card .row-action { position: absolute; top: 8px; right: 0; }
+.studio .studio-card.missing .launch-name { color: var(--muted); }
+.studio .studio-actions { padding-left: 0; gap: 6px 26px; }
+.studio-margin { padding-top: 30px; }
+@media (max-width: 900px) {
+  .studio-page { grid-template-columns: minmax(0, 1fr); gap: 32px; }
+  .studio-margin { padding-top: 0; }
+  .home.studio { padding: 28px 20px; }
+}
+.studio .studio-continue .row-action { opacity: 0; margin-left: -6px; }
+.studio .studio-continue:hover .row-action, .studio .studio-continue:focus-within .row-action { opacity: 1; }

@@ -99,36 +99,115 @@ pub struct Formatted {
     hint: Option<String>,
 }
 
+/// How formatters should lay code out (Settings → Formatting). A project's own config file
+/// (pyproject.toml, .prettierrc, .clang-format, rustfmt.toml) wins over these.
+#[derive(serde::Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase", default)]
+pub struct FormatOptions {
+    java_style: Option<String>,
+    python_line_length: Option<u32>,
+    python_indent: Option<u32>,
+    python_quotes: Option<String>,
+    web_indent: Option<u32>,
+    web_tabs: Option<bool>,
+    web_semicolons: Option<bool>,
+    web_quotes: Option<String>,
+    web_print_width: Option<u32>,
+    web_trailing_commas: Option<String>,
+    c_style: Option<String>,
+    c_indent: Option<u32>,
+    rust_indent: Option<u32>,
+}
+
+fn has_any(cwd: &Path, names: &[&str]) -> bool { names.iter().any(|name| cwd.join(name).is_file()) }
+fn pyproject_has(cwd: &Path, table: &str) -> bool {
+    std::fs::read_to_string(cwd.join("pyproject.toml")).is_ok_and(|text| text.lines().any(|line| line.trim_start().starts_with(&format!("[{table}"))))
+}
+
+/// The command-line options for each formatter from Still's settings (none when the project configures it).
+fn ruff_args(cwd: &Path, options: &FormatOptions) -> Vec<String> {
+    if has_any(cwd, &["ruff.toml", ".ruff.toml"]) || pyproject_has(cwd, "tool.ruff") { return Vec::new() }
+    let mut args = Vec::new();
+    if let Some(length) = options.python_line_length.filter(|value| (40..=320).contains(value)) { args.push("--line-length".into()); args.push(length.to_string()); }
+    if let Some(indent) = options.python_indent.filter(|value| (1..=8).contains(value)) { args.push("--config".into()); args.push(format!("indent-width = {indent}")); }
+    match options.python_quotes.as_deref() {
+        Some("single") => { args.push("--config".into()); args.push("format.quote-style = 'single'".into()); }
+        Some("preserve") => { args.push("--config".into()); args.push("format.quote-style = 'preserve'".into()); }
+        _ => {}
+    }
+    args
+}
+fn black_args(cwd: &Path, options: &FormatOptions) -> Vec<String> {
+    if pyproject_has(cwd, "tool.black") { return Vec::new() }
+    let mut args = Vec::new();
+    if let Some(length) = options.python_line_length.filter(|value| (40..=320).contains(value)) { args.push("-l".into()); args.push(length.to_string()); }
+    if options.python_quotes.as_deref().is_some_and(|quotes| quotes != "double") { args.push("-S".into()); }
+    args
+}
+fn prettier_args(options: &FormatOptions) -> Vec<String> {
+    // A .prettierrc (or "prettier" in package.json) wins; these apply only without one.
+    let mut args = vec!["--config-precedence".to_owned(), "prefer-file".to_owned()];
+    if let Some(indent) = options.web_indent.filter(|value| (1..=8).contains(value)) { args.push("--tab-width".into()); args.push(indent.to_string()); }
+    if options.web_tabs == Some(true) { args.push("--use-tabs".into()); }
+    if options.web_semicolons == Some(false) { args.push("--no-semi".into()); }
+    if options.web_quotes.as_deref() == Some("single") { args.push("--single-quote".into()); }
+    if let Some(width) = options.web_print_width.filter(|value| (40..=320).contains(value)) { args.push("--print-width".into()); args.push(width.to_string()); }
+    if let Some(commas) = options.web_trailing_commas.as_deref().filter(|value| matches!(*value, "all" | "es5" | "none")) { args.push("--trailing-comma".into()); args.push(commas.into()); }
+    args
+}
+fn clang_args(cwd: &Path, path: &str, options: &FormatOptions) -> Vec<String> {
+    let mut args = vec![format!("--assume-filename={path}")];
+    if has_any(cwd, &[".clang-format", "_clang-format"]) { args.push("--style=file".into()); return args }
+    let style = options.c_style.as_deref().filter(|value| matches!(*value, "LLVM" | "Google" | "Chromium" | "Mozilla" | "WebKit" | "Microsoft" | "GNU")).unwrap_or("LLVM");
+    let indent = options.c_indent.filter(|value| (1..=8).contains(value)).map(|value| format!(", IndentWidth: {value}")).unwrap_or_default();
+    args.push(format!("--style={{BasedOnStyle: {style}{indent}}}"));
+    args
+}
+
 /// Formats source with the formatter for its language. `text` is None when no formatter is installed
 /// (then `hint` says what to install) or when the code couldn't be parsed.
 #[tauri::command]
-pub async fn format_code(root_path: String, path: String, source: String) -> Result<Formatted> {
+pub async fn format_code(root_path: String, path: String, source: String, options: Option<FormatOptions>) -> Result<Formatted> {
     tauri::async_runtime::spawn_blocking(move || {
         let cwd = root(&root_path)?;
+        let options = options.unwrap_or_default();
         let extension = path.rsplit_once('.').map(|(_, ext)| ext.to_lowercase()).unwrap_or_default();
         let done = |text: Option<String>, tool: &str| Ok(Formatted { text, tool: Some(tool.into()), hint: None });
+        let with = |base: &[&str], extra: &[String]| -> Vec<String> { base.iter().map(|item| item.to_string()).chain(extra.iter().cloned()).collect() };
+        let run = |program: &Path, args: Vec<String>| { let refs: Vec<&str> = args.iter().map(String::as_str).collect(); pipe(&cwd, program, &refs, &source) };
         match extension.as_str() {
             "py" | "pyi" => {
-                if let Some(ruff) = find(&cwd, "ruff") { return done(pipe(&cwd, &ruff, &["format", "--stdin-filename", &path, "-"], &source), "ruff") }
-                if let Some(interpreter) = python_module(&cwd, "ruff") { return done(pipe(&cwd, &interpreter, &["-m", "ruff", "format", "--stdin-filename", &path, "-"], &source), "ruff") }
-                if let Some(black) = find(&cwd, "black") { return done(pipe(&cwd, &black, &["-q", "--stdin-filename", &path, "-"], &source), "black") }
-                if let Some(interpreter) = python_module(&cwd, "black") { return done(pipe(&cwd, &interpreter, &["-m", "black", "-q", "-"], &source), "black") }
+                let ruff = ruff_args(&cwd, &options);
+                if let Some(tool) = find(&cwd, "ruff") { return done(run(&tool, with(&["format"], &ruff).into_iter().chain(["--stdin-filename".into(), path.clone(), "-".into()]).collect()), "ruff") }
+                if let Some(interpreter) = python_module(&cwd, "ruff") { return done(run(&interpreter, with(&["-m", "ruff", "format"], &ruff).into_iter().chain(["--stdin-filename".into(), path.clone(), "-".into()]).collect()), "ruff") }
+                let black = black_args(&cwd, &options);
+                if let Some(tool) = find(&cwd, "black") { return done(run(&tool, with(&["-q"], &black).into_iter().chain(["--stdin-filename".into(), path.clone(), "-".into()]).collect()), "black") }
+                if let Some(interpreter) = python_module(&cwd, "black") { return done(run(&interpreter, with(&["-m", "black", "-q"], &black).into_iter().chain(["-".into()]).collect()), "black") }
                 Ok(Formatted { text: None, tool: None, hint: Some("Install ruff to format Python (Settings → Editor → Tools).".into()) })
             }
             "java" => match find(&cwd, "google-java-format") {
-                Some(tool) => done(pipe(&cwd, &tool, &["-"], &source), "google-java-format"),
+                // AOSP style indents by 4; Google style by 2.
+                Some(tool) => done(run(&tool, if options.java_style.as_deref() == Some("aosp") { vec!["--aosp".into(), "-".into()] } else { vec!["-".into()] }), "google-java-format"),
                 None => Ok(Formatted { text: None, tool: None, hint: Some("Install google-java-format to format Java (it must be on PATH).".into()) }),
             },
             "js" | "mjs" | "cjs" | "jsx" | "ts" | "tsx" | "json" | "css" | "scss" | "less" | "html" | "vue" | "md" | "yaml" | "yml" => match find(&cwd, "prettier") {
-                Some(tool) => done(pipe(&cwd, &tool, &["--stdin-filepath", &path], &source), "prettier"),
+                Some(tool) => done(run(&tool, prettier_args(&options).into_iter().chain(["--stdin-filepath".into(), path.clone()]).collect()), "prettier"),
                 None => Ok(Formatted { text: None, tool: None, hint: Some("Install prettier in the project (npm install --save-dev prettier) to format this file.".into()) }),
             },
+            "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" | "m" | "mm" => match find(&cwd, "clang-format") {
+                Some(tool) => done(run(&tool, clang_args(&cwd, &path, &options)), "clang-format"),
+                None => Ok(Formatted { text: None, tool: None, hint: Some("Install clang-format to format C and C++ (it comes with LLVM).".into()) }),
+            },
             "rs" => match find(&cwd, "rustfmt") {
-                Some(tool) => done(pipe(&cwd, &tool, &["--emit", "stdout", "--quiet"], &source), "rustfmt"),
+                Some(tool) => {
+                    let mut args = vec!["--emit".to_owned(), "stdout".to_owned(), "--quiet".to_owned()];
+                    if !has_any(&cwd, &["rustfmt.toml", ".rustfmt.toml"]) { if let Some(indent) = options.rust_indent.filter(|value| (1..=8).contains(value)) { args.push("--config".into()); args.push(format!("tab_spaces={indent}")); } }
+                    done(run(&tool, args), "rustfmt")
+                }
                 None => Ok(Formatted { text: None, tool: None, hint: Some("Install rustfmt (rustup component add rustfmt).".into()) }),
             },
             "go" => match find(&cwd, "gofmt") {
-                Some(tool) => done(pipe(&cwd, &tool, &[], &source), "gofmt"),
+                Some(tool) => done(run(&tool, Vec::new()), "gofmt"),
                 None => Ok(Formatted { text: None, tool: None, hint: Some("Install Go to get gofmt.".into()) }),
             },
             _ => Ok(Formatted { text: None, tool: None, hint: Some("There's no formatter for this kind of file.".into()) }),

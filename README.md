@@ -24,7 +24,7 @@ empty, or the Orbit Lab sample), open any folder, or clone a Git repository.
 graph on the right and the terminal below. The underlined names at the top show
 or hide each one. On narrow windows the graph steps aside by itself.
 
-**Overview.** Ctrl/Cmd + ↑ shows every island and your recent projects at once.
+**Overview.** Ctrl/Cmd + Alt + O shows every island and your recent projects at once.
 Hover a card for Fullscreen (or press F), click or press Enter to jump, Delete
 to hide or show an island, and pick a layout (Classic, Code and graph, Review, Writing, Focus, or one you saved).
 
@@ -104,6 +104,18 @@ the container with the project mounted, runs `postCreateCommand`, and then runs
 files, tests and new terminals inside it. With the Dev Containers CLI installed,
 features and Docker Compose setups work too.
 
+**Formatting.** Settings → Formatting sets how each formatter lays code out:
+google-java-format in Google (2 spaces) or AOSP (4 spaces) style; line length,
+indent and quotes for ruff or black; indent, tabs, semicolons, quotes, width and
+trailing commas for prettier; the base style and indent for clang-format; and the
+indent for rustfmt. A project's own settings file (pyproject.toml, .prettierrc,
+.clang-format, rustfmt.toml) wins when it has one.
+
+**Minimap and sticky header.** Ctrl/Cmd + Shift + Y shows a small map of the file
+in its own strip beside the editor. The class or function you're in stays pinned
+at the top as its first line scrolls away, and slides off as the block ends;
+right-click it to turn it off.
+
 **Spell check.** Comments, docstrings and written strings in code, and the text
 of Markdown, LaTeX and plain text files. Hover a dotted word for suggestions or
 Add to dictionary.
@@ -155,7 +167,7 @@ and ligatures are adjustable.
 | Ctrl/Cmd + Shift + V | Markdown/text: edit, split, preview |
 | Ctrl/Cmd + F | Find in file |
 | Ctrl/Cmd + Shift + F | Find in all files |
-| Ctrl/Cmd + ↑ | Overview (Esc or Ctrl/Cmd + ↓ to return) |
+| Ctrl/Cmd + Alt + O | Overview (Esc to return) |
 | Ctrl/Cmd + . | Focus mode (Esc to leave) |
 | Ctrl/Cmd + Shift + M | Fullscreen the current island (Esc to restore) |
 | Ctrl/Cmd + Shift + D | Show or hide the canvas island |

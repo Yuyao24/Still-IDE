@@ -62,7 +62,7 @@ type Side = 'explorer' | 'search' | 'git' | 'packages' | 'remote'
 type Drawer = 'terminal' | 'output' | 'problems' | 'debug' | 'tests' | 'profile' | 'database'
 type DocView = 'edit' | 'split' | 'preview'
 type Tab = { id: string; path: string; contents: string; saved: string; memory?: EditorMemory; diff?: Diff; staged?: boolean; line?: number; view?: DocView; binary?: BinaryKind }
-type RightView = 'canvas' | 'chat' | 'minimap'
+type RightView = 'canvas' | 'chat'
 type DropTarget = { kind: 'strip'; index: number; left: number; top: number; height: number } | { kind: 'pane'; pane: string; zone: DropZone; box: DOMRect }
 type TabDrag = { tab: string; x: number; y: number; target: DropTarget | null }
 const defaultDocView = (kind: DocKind): DocView => kind === 'tex' || kind === 'svg' ? 'split' : kind === 'notebook' ? 'preview' : 'edit'
@@ -178,7 +178,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   })
   const [rightView, setRightView] = useState<RightView>(() => {
     const stored = localStorage.getItem('still.island.rightView')
-    return stored === 'chat' || stored === 'minimap' || stored === 'canvas' ? stored : localStorage.getItem('still.island.chat') === 'on' ? 'chat' : 'canvas'
+    return stored === 'chat' || stored === 'canvas' ? stored : localStorage.getItem('still.island.chat') === 'on' ? 'chat' : 'canvas'
   })
   const [rightWidth, setRightWidth] = useState(() => Number(localStorage.getItem('still.island.rightWidth')) || 320)
   const [chatEverOpen, setChatEverOpen] = useState(false)
@@ -1092,7 +1092,11 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     if (!active || active.diff || !handle || !desktop || remote) { if (!quiet) notify(remote ? 'Formatting works for local projects for now.' : 'Open a file to format it.'); return false }
     const path = active.path
     try {
-      const result = await editorSupport.format(workspace.root, path, handle.text())
+      const result = await editorSupport.format(workspace.root, path, handle.text(), {
+        javaStyle: settings.javaFormatStyle, pythonLineLength: settings.pythonLineLength, pythonIndent: settings.pythonIndent, pythonQuotes: settings.pythonQuotes,
+        webIndent: settings.webIndent, webTabs: settings.webTabs, webSemicolons: settings.webSemicolons, webQuotes: settings.webQuotes, webPrintWidth: settings.webPrintWidth,
+        webTrailingCommas: settings.webTrailingCommas, cStyle: settings.cStyle, cIndent: settings.cIndent, rustIndent: settings.rustIndent,
+      })
       if (result.text === null && !result.tool && handle.command('format')) return true
       if (result.text === null) { if (!quiet) notify(result.hint ?? (result.tool ? result.tool + " couldn't format this file. Check it for syntax errors." : 'No formatter for this file.')); return false }
       if (editor.current === handle) handle.replaceAll(result.text)
@@ -1201,14 +1205,14 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
         item('Right bar', () => setRightOpen(value => !value), undefined, { checked: showRight }),
         item('Canvas', () => setGraphOpen(value => !value), mod + '+Shift+D', { checked: showGraph }),
         item('Assistant', toggleChat, mod + '+Shift+A', { checked: showChat }),
-        item('Minimap', () => toggleRight('minimap'), mod + '+Shift+Y', { checked: showRight && rightView === 'minimap' }),
+        item('Minimap', () => toggleMinimap(), mod + '+Shift+Y', { checked: settings.minimap }),
         item('Terminal', () => drawerOpen ? setDrawerOpen(false) : showDrawer('terminal', true), mod + '+J', { checked: drawerOpen }),
         'separator',
         item('Split editor right', () => splitRight(), mod + '+\\', { disabled: !active }),
         item('Split editor down', () => splitRight(active, 'bottom'), undefined, { disabled: !active }),
         item('Close this pane', () => closePane(focusedRef.current), undefined, { disabled: panes.length < 2 }),
         item('Focus mode', toggleFocus, mod + '+.'),
-        item('Overview', openOverview, mod + '+↑'),
+        item('Overview', openOverview, mod + '+Alt+O'),
         item('Fullscreen editor', () => toggleMaximize('editor'), mod + '+Shift+M', { checked: maximized === 'editor' }),
         'separator',
         item('Zoom in', () => update({ editorFontSize: Math.min(28, settings.editorFontSize + 1) }), mod + '+='),
@@ -1374,7 +1378,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     comment: () => { editor.current?.command('comment') }, terminal: () => { if (drawerOpen) setDrawerOpen(false); else showDrawer('terminal', true) },
     'side.files': () => showSide('explorer', true), 'side.search': () => showSide('search', true), 'side.git': () => { if (!remote) showSide('git', true) },
     commit: () => { if (!remote) { showSide('git'); if (commit.trim()) gitAction('commit') } }, push: () => { if (!remote) gitAction('push') }, pull: () => { if (!remote) gitAction('pull') },
-    assistant: toggleChat, minimap: () => toggleRight('minimap'), focus: toggleFocus, overview: openOverview, home: goHome, settings: () => onSettings(),
+    assistant: toggleChat, minimap: () => toggleMinimap(), focus: toggleFocus, overview: openOverview, home: goHome, settings: () => onSettings(),
   }
   const keyHandlersRef = useRef(keyHandlers)
   keyHandlersRef.current = keyHandlers
@@ -1416,6 +1420,14 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     setMenu({ x: point.x, y: point.y, items: items.slice(0, 16).map(item => ({ label: item.title, action: () => { void Promise.resolve(item.run()).catch(notify) } })) })
   }
   useEffect(() => { refactorHook.notify = message => notify(message) })
+  useEffect(() => {
+    const open = (event: Event) => {
+      const { x, y } = (event as CustomEvent<{ x: number; y: number }>).detail
+      setMenu({ x, y, items: [{ label: 'Hide the sticky header', action: () => { update({ stickyScroll: false }); toast('Sticky header is off. Turn it back on in Settings → Editor, or with “Toggle sticky header”.') } }] })
+    }
+    window.addEventListener('still-sticky-menu', open)
+    return () => window.removeEventListener('still-sticky-menu', open)
+  })
   useEffect(() => {
     const open = () => { void showQuickFixes() }
     window.addEventListener('still-quick-fix', open)
@@ -1848,7 +1860,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     const keys = (event: KeyboardEvent) => {
       if (event.shiftKey && event.altKey && !event.ctrlKey && !event.metaKey && event.code === 'KeyF' && !document.querySelector('.modal-backdrop, .settings-backdrop')) { event.preventDefault(); void formatDocument(); return }
       if (event.altKey && !event.shiftKey && !event.ctrlKey && !event.metaKey && event.key === 'Enter' && (event.target as Element | null)?.closest?.('.cm-editor') && !(event.target as Element).closest('.nb') && !document.querySelector('.modal-backdrop, .settings-backdrop')) { event.preventDefault(); void showQuickFixes(); return }
-      if ((event.ctrlKey || event.metaKey) && event.shiftKey && !event.altKey && event.code === 'KeyR' && (event.target as Element | null)?.closest?.('.cm-editor') && !(event.target as Element).closest('.nb') && !document.querySelector('.modal-backdrop, .settings-backdrop')) { event.preventDefault(); event.stopPropagation(); void showRefactors(); return }
+      if ((event.ctrlKey || event.metaKey) && event.shiftKey && !event.altKey && event.code === 'KeyR' && (event.target as Element | null)?.closest?.('.cm-editor') && !(event.target as Element).closest('.nb') && !document.querySelector('.modal-backdrop, .settings-backdrop')) { event.preventDefault(); event.stopImmediatePropagation(); void showRefactors(); return }
       if (!/^F(5|9|10|11)$/.test(event.key) || event.ctrlKey || event.metaKey || event.altKey || document.querySelector('.modal-backdrop, .settings-backdrop')) return
       event.preventDefault()
       const current = debugRef.current
@@ -2087,7 +2099,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       if (!(event.ctrlKey || event.metaKey) || dialog || menu) return
       if (document.querySelector('.settings-backdrop, .sheet')) return
       const key = event.key.toLowerCase()
-      const shiftOnly = event.shiftKey && ['f', 'h', 'e', 'g', 'v', '`', '~', 'u', 'r', 'd', 'm', 'a'].includes(key)
+      const shiftOnly = event.shiftKey && ['f', 'h', 'e', 'g', 'v', '`', '~', 'u', 'r', 'd', 'm', 'a', 'y'].includes(key)
       // Plain Ctrl/Cmd+F outside the editor would open the web view's own find bar; send it to the editor instead.
       if (key === 'f' && !event.shiftKey && !event.altKey && !(event.target as Element | null)?.closest?.('.cm-editor, input, textarea, .xterm')) {
         event.preventDefault(); editor.current?.find(); return
@@ -2098,7 +2110,9 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
         update({ editorFontSize: key === '0' ? 14 : Math.max(9, Math.min(28, settings.editorFontSize + (key === '-' || key === '_' ? -1 : 1))) })
         return
       }
-      if (event.altKey || !(['k', 'p', 's', 'w', 'b', 'j', 'o', 't', 'enter', 'tab', ',', 'arrowup', '.', '\\'].includes(key) || shiftOnly)) return
+      // Overview: Ctrl/Cmd+Alt+O. (Ctrl+Shift+↑ stays with the editor for selecting lines above.)
+      if (event.altKey && !event.shiftKey && key === 'o') { event.preventDefault(); if (overview) setOverview(false); else openOverview(); return }
+      if (event.altKey || !(['k', 'p', 's', 'w', 'b', 'j', 'o', 't', 'enter', 'tab', ',', '.', '\\'].includes(key) || shiftOnly)) return
       if ((overview || graphView) && !['k', 'p', '.'].includes(key)) return
       if (key === 'enter' && palette !== null) return
       // Ctrl+Enter in a text box (SQL, a commit message, the assistant) belongs to that box, not Run.
@@ -2107,7 +2121,6 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       if (key === 'p' || key === 'k') { palette !== null ? closePalette() : openPalette(event.shiftKey ? '>' : ''); return }
       if (palette !== null) return
       if (key === 'tab') { cycleTab(event.shiftKey ? -1 : 1); return }
-      if (key === 'arrowup') { openOverview(); return }
       if (key === '.') { toggleFocus(); return }
       if (key === '\\' && !event.shiftKey) { splitRight(); return }
       if (key === 't' && !event.shiftKey) { event.preventDefault(); openPalette('#'); return }
@@ -2117,9 +2130,10 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       if (key === 'e' && event.shiftKey) { if (focusMode) setFocusMode(false); showSide('explorer', true) }
       if (key === 'g' && event.shiftKey && !remote) { if (focusMode) setFocusMode(false); showSide('git', true) }
       if (key === 'u' && event.shiftKey && !remote) showSide('packages', true)
-      if (key === 'r' && event.shiftKey) showSide('remote', true)
+      // In the editor Ctrl+Shift+R is Refactor; elsewhere it shows Servers.
+      if (key === 'r' && event.shiftKey && !(event.target as Element | null)?.closest?.('.cm-editor')) showSide('remote', true)
       if (key === 'd' && event.shiftKey) setGraphOpen(value => !value)
-      if (key === 'y' && event.shiftKey) toggleRight('minimap')
+      if (key === 'y' && event.shiftKey) toggleMinimap()
       if (key === 'm' && event.shiftKey) toggleMaximize()
       if (key === 'a' && event.shiftKey) toggleChat()
       if (key === 'h' && event.shiftKey) goHome()
@@ -2262,6 +2276,8 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       ...(active && !active.diff && conflictCount(active.contents) ? [{ id: 'merge', label: 'Git: resolve conflicts in the merge editor', icon: GitBranch, action: () => { setMergeFor(active.id); setFullView('merge') } }] : []),
     ] : []),
     { id: 'run-config', label: 'Run configuration…', icon: Play, action: askArguments },
+    { id: 'minimap', label: settings.minimap ? 'Hide the minimap' : 'Show the minimap', shortcut: mod + '+Shift+Y', icon: AlignLeft, action: toggleMinimap },
+    { id: 'sticky', label: settings.stickyScroll ? 'Toggle sticky header (on)' : 'Toggle sticky header (off)', icon: AlignLeft, action: () => update({ stickyScroll: !settings.stickyScroll }) },
     ...(active && !active.diff && !active.binary ? [
       { id: 'refactor', label: 'Refactor…', icon: Wand2, action: () => { void showRefactors() } },
       { id: 'extract-variable', label: 'Extract variable…', icon: Wand2, action: () => { editor.current?.refactor('extract-variable') } },
@@ -2273,7 +2289,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       { id: 'tests-file', label: 'Run the tests in this file', icon: FlaskConical, action: () => runTestsFrom('file') },
       ...(testReport?.results.some(result => result.status === 'failed' || result.status === 'error') ? [{ id: 'tests-failed', label: 'Run failed tests', icon: FlaskConical, action: () => runTestsFrom('failed') }] : []),
     ] : []),
-    { id: 'overview', label: 'Overview of everything', shortcut: mod + '+↑', icon: LayoutGrid, action: openOverview },
+    { id: 'overview', label: 'Overview of everything', shortcut: mod + '+Alt+O', icon: LayoutGrid, action: openOverview },
     { id: 'focus', label: focusMode ? 'Leave focus mode' : 'Focus mode', shortcut: mod + '+.', icon: Maximize2, action: toggleFocus },
     ...(active ? [{ id: 'split', label: 'Split editor right', shortcut: mod + '+\\', icon: Columns2, action: () => splitRight() }, { id: 'split-down', label: 'Split editor down', icon: Rows2, action: () => splitRight(active, 'bottom') }] : []),
     ...(panes.length > 1 ? [{ id: 'close-pane', label: 'Close this pane', icon: X, action: () => closePane(focusedRef.current) }] : []),
@@ -2421,15 +2437,21 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       <div className="doc-pane doc-pane-preview">{previewFor(kind, tab, pane, view === 'split')}</div>
     </div>
   }
+  function toggleMinimap() { update({ minimap: !settings.minimap }) }
   function renderPane(pane: string) {
     const tab = tabs.find(item => item.id === tabOf(pane))
     const many = panes.length > 1
+    // The map sits beside a plain code editor (not previews, PDFs or notebooks).
+    const mapped = Boolean(settings.minimap && tab && !tab.binary && (tab.diff || !docKind(tab.path) || (tab.view ?? defaultDocView(docKind(tab.path)!)) === 'edit'))
     return <div key={pane} data-pane={pane} className={'pane' + (pane === focused ? ' is-current' : '') + (many ? ' has-head' : '')} onMouseDown={() => focusPane(pane)}>
       {many && <div className="pane-head">
         <span className="pane-name" title={tab?.path}>{tab ? fileName(tab.path) + (tab.diff ? ' · diff' : '') : 'Empty pane'}{tab && dirty(tab) && <i className="split-dot" aria-label="unsaved" />}</span>
         <IconButton glyph={X} label="Close pane" onClick={event => { event.stopPropagation(); closePane(pane) }} />
       </div>}
-      <div className="pane-body">{tab ? paneContent(tab, pane) : <div className="pane-empty">
+      <div className={'pane-body' + (mapped ? ' with-map' : '')}>{mapped && tab && <div className="pane-map">
+        <Minimap path={tab.path} text={tab.diff?.after ?? tab.contents} viewports={viewports} pane={pane} onScroll={fraction => handles.current[pane]?.scrollTo(fraction)} />
+        <button className="pane-map-close" onClick={event => { event.stopPropagation(); update({ minimap: false }) }} title={'Hide the minimap (' + mod + '+Shift+Y)'} aria-label="Hide the minimap"><Icon glyph={X} size={11} /></button>
+      </div>}{tab ? paneContent(tab, pane) : <div className="pane-empty">
         <p>Drag a tab here, or choose a file.</p>
         <div className="pane-empty-list">{tabs.filter(item => !item.diff).slice(0, 8).map(item => <button key={item.id} onClick={() => placeTab(item.id, pane, 'center')}>{fileName(item.path)}<span>{parentPath(item.path)}</span></button>)}</div>
         <button className="text-btn" onClick={() => openPalette('')}>Find a file… <kbd>{mod}+P</kbd></button>
@@ -2543,7 +2565,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
               data-tip={(showRight ? 'Hide' : 'Show') + ' the right bar (canvas, assistant, minimap)'} aria-label="Right bar"><LayoutIcon part="right" on={showRight} /></button>
             <span className="nav-rule" />
             <button onClick={toggleFocus} data-tip={'Focus: only the code · ' + mod + '+.'} aria-label="Focus"><LayoutIcon part="focus" on={false} /></button>
-            <button onClick={openOverview} data-tip={'Overview · ' + mod + '+↑'} aria-label="Overview"><LayoutIcon part="overview" on={false} /></button>
+            <button onClick={openOverview} data-tip={'Overview · ' + mod + '+Alt+O'} aria-label="Overview"><LayoutIcon part="overview" on={false} /></button>
           </nav>
           <IconButton glyph={Settings2} label={'Settings (' + mod + '+,)'} onClick={() => onSettings()} />
           {remote ? <span className="chrome-branch"><Icon glyph={Server} size={12} />{workspace.hostName}</span>
@@ -2572,6 +2594,8 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
             onClick={() => showSide(item.key)} data-tip={item.label + ' · ' + mod + '+' + item.keys} aria-label={item.label}>
             <Icon glyph={item.glyph} size={14} /><span>{item.label}</span>{item.key === 'git' && status.changes.length > 0 && <span className="nav-count">{Math.min(status.changes.length, 99)}</span>}
           </button>)}
+          <span className="flex-1" />
+          <IconButton glyph={X} label={'Hide the sidebar (' + mod + '+B)'} onClick={() => setSidebar(null)} className="side-close" />
         </nav>
         <div className="side-body" key={'side-' + shownSide}>
         {shownSide === 'explorer' && <Explorer workspace={workspace} directories={directories} expanded={expanded} active={active?.path} changes={status} symbols={symbols}
@@ -2663,7 +2687,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
                 <button onClick={() => newFile()}><span>New file</span></button>
                 <button onClick={() => showSide('search')}><span>Find in files</span><kbd>{mod}+Shift+F</kbd></button>
                 <button onClick={() => showDrawer('terminal', true)}><span>Open terminal</span><kbd>{mod}+J</kbd></button>
-                <button onClick={openOverview}><span>Overview</span><kbd>{mod}+↑</kbd></button>
+                <button onClick={openOverview}><span>Overview</span><kbd>{mod}+Alt+O</kbd></button>
                 <button onClick={goHome}><span>Back to Home</span><kbd>{mod}+Shift+H</kbd></button>
               </div>
             </div>
@@ -2675,7 +2699,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       {rightMounted && <aside className="island right-island" style={{ width: rightTrack }} aria-label="Right bar" inert={!showRight || undefined}>
         <SplitGrip vertical value={-rightTrack} min={-Math.min(640, frame.width * 0.5)} max={-260} change={value => setRightWidth(Math.round(-value))} onActive={setResizing} />
         <nav className="right-views" role="tablist" aria-label="Right bar">
-          {([['canvas', 'Canvas', Network], ['chat', 'Assistant', Sparkles], ['minimap', 'Minimap', AlignLeft]] as const).map(([key, label, glyph]) =>
+          {([['canvas', 'Canvas', Network], ['chat', 'Assistant', Sparkles]] as const).map(([key, label, glyph]) =>
             <button key={key} role="tab" aria-selected={rightView === key} className={rightView === key ? 'is-active' : ''} onClick={() => toggleRight(key, true)}><Icon glyph={glyph} size={13} />{label}</button>)}
           <span className="flex-1" />
           <IconButton glyph={X} label="Hide the right bar" onClick={() => setRightOpen(false)} />
@@ -2686,8 +2710,6 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
             <Chat settings={{ provider: settings.aiProvider, model: settings.aiModel, effort: settings.aiEffort, ollamaUrl: settings.ollamaUrl, ollamaModel: settings.ollamaModel, githubModel: settings.githubModel, autoApproveEdits: settings.aiAutoApprove }}
               host={agentHost} projectKey={(workspace.remote ?? '') + workspace.root} focusKey={chatFocus} onSettings={() => onSettings('ai')} onClose={() => setRightOpen(false)} />
           </div>}
-          {rightView === 'minimap' && <Minimap path={active && !active.binary ? active.path : null} text={active && !active.binary ? active.diff?.after ?? active.contents : ''} viewports={viewports} pane={focused}
-            onScroll={fraction => editor.current?.scrollTo(fraction)} />}
         </div>
       </aside>}
       </div>

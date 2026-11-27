@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import {
-  Check, Code2, Copy, FileDown, FolderOpen, FolderSearch, Import, Info, Keyboard, Palette, Pencil, Plus, Search, Server, SquareTerminal, Trash2, X, Sparkles } from 'lucide-react'
+  Check, Code2, Copy, FileDown, FolderOpen, FolderSearch, Import, Info, Keyboard, Palette, Pencil, Plus, Search, Server, SquareTerminal, Trash2, X, Sparkles , AlignLeft } from 'lucide-react'
 import { type AppPaths, type PlanItem, type ShellOption, type SshOverview, desktop, editorSupport, home, hostLabel, launcher, mod, pickFolder, ssh } from './bridge'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import { listen } from '@tauri-apps/api/event'
@@ -12,11 +12,12 @@ import { type GithubModel, claudeModels, githubFallbackModels, githubModels, key
 import { type Theme, type ThemeColors, editableColors, exportTheme, isHex, parseTheme, presets, resolve } from './themes'
 import { Icon, IconButton, Segmented, Toggle } from './ui'
 
-export type SettingsSection = 'appearance' | 'editor' | 'ai' | 'terminal' | 'projects' | 'remote' | 'shortcuts' | 'about'
+export type SettingsSection = 'appearance' | 'editor' | 'formatting' | 'ai' | 'terminal' | 'projects' | 'remote' | 'shortcuts' | 'about'
 
 const sections: { id: SettingsSection; label: string; icon: typeof Palette }[] = [
   { id: 'appearance', label: 'Appearance', icon: Palette },
   { id: 'editor', label: 'Editor', icon: Code2 },
+  { id: 'formatting', label: 'Formatting', icon: AlignLeft },
   { id: 'ai', label: 'AI', icon: Sparkles },
   { id: 'terminal', label: 'Terminal', icon: SquareTerminal },
   { id: 'projects', label: 'Projects', icon: FolderOpen },
@@ -88,6 +89,7 @@ export default function SettingsView({ section, onSection, onClose, notify }: {
             {term && <p className="settings-section-label">{item.label}</p>}
             {item.id === 'appearance' && <Appearance notify={notify} />}
             {item.id === 'editor' && <EditorSettings />}
+            {item.id === 'formatting' && <FormattingSettings />}
             {item.id === 'ai' && <AiSettingsView />}
             {item.id === 'terminal' && <TerminalSettings />}
             {item.id === 'projects' && <><ProjectSettings notify={notify} /><LaunchSettings notify={notify} /></>}
@@ -383,7 +385,8 @@ function EditorSettings() {
       <h3>Checks and changes</h3>
       <Toggle label="Show errors while typing" description="Underlines syntax errors as you type. Python files are also checked for undefined names (and, with pyflakes installed, unused imports and more)." checked={settings.errors} onChange={value => update({ errors: value })} />
       <Toggle label="Inline hints from language servers" description="Parameter names and inferred types shown faintly in the code, when the language server offers them." checked={settings.inlayHints} onChange={value => update({ inlayHints: value })} />
-      <Toggle label="Sticky scroll" description="While you're inside a function, class or block whose first line has scrolled away, that line stays at the top of the editor. Click it to go there." checked={settings.stickyScroll} onChange={value => update({ stickyScroll: value })} />
+      <Toggle label="Minimap" description="A small map of the whole file beside the editor; click or drag it to move through the file. Ctrl+Shift+Y shows or hides it." checked={settings.minimap} onChange={value => update({ minimap: value })} />
+      <Toggle label="Sticky header" description="The class, function or block you're in stays pinned at the top of the editor once its first line scrolls away. Click a line to go there; right-click it to turn this off." checked={settings.stickyScroll} onChange={value => update({ stickyScroll: value })} />
       <Toggle label="Fill in constructors and self" description="Enter after starting a class (class Shop: in Python, class Shop { in Java, JavaScript and C#) adds __init__ or the constructor. Enter after def __init__(self, name): writes self.name = name, and ( after def inside a class adds self. Comments and docstrings close themselves either way." checked={settings.fillConstructors} onChange={value => update({ fillConstructors: value })} />
       <Toggle label="Fill in docstrings and Javadoc" description={'Enter between """ and """ under a function lists its Args and Returns; /** above a method lists @param and @return.'} checked={settings.docTemplates} onChange={value => update({ docTemplates: value })} />
       <Toggle label="Make f-strings as you type" description={'Typing {name} inside a plain Python string adds the f in front.'} checked={settings.autoFString} onChange={value => update({ autoFString: value })} />
@@ -401,7 +404,7 @@ function EditorSettings() {
     </section>
     <section className="settings-group">
       <h3>Formatting and linting</h3>
-      <Toggle label="Format files when saving" description="Uses ruff or black for Python, google-java-format for Java and prettier for web files, when installed. Shift+Alt+F formats any time." checked={settings.formatOnSave} onChange={value => update({ formatOnSave: value })} />
+      <p className="help">Formatting (format on save, Java style, indent widths, quotes) has its own page: Settings → Formatting.</p>
       <Toggle label="Lint Python with ruff" description="When ruff is installed, its warnings (unused imports, likely bugs, style) appear while you type." checked={settings.lintWithRuff} onChange={value => update({ lintWithRuff: value })} />
     </section>
     <ToolSettings />
@@ -472,6 +475,51 @@ function SnippetSettings() {
       <div className="flex justify-end"><button type="submit" className="text-btn primary" disabled={!draft.prefix.trim() || !draft.body.trim()}>Add snippet</button></div>
     </form>
   </section>
+}
+
+function FormattingSettings() {
+  const { settings, update } = useSettings()
+  const choose = <T extends string>(label: string, description: string | undefined, value: T, options: { value: T; label: string }[], onChange: (value: T) => void) =>
+    <div className="setting-row"><span className="setting-text"><span>{label}</span>{description && <small>{description}</small>}</span>
+      <select className="field w-56" value={value} onChange={event => onChange(event.target.value as T)} aria-label={label}>
+        {options.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+      </select></div>
+  return <>
+    <section className="settings-group">
+      <h3>Formatting</h3>
+      <p className="help mb-2">Format a file with Shift+Alt+F (or on save, below). These choices apply when a project has no settings file of its own: pyproject.toml or ruff.toml, .prettierrc, .clang-format and rustfmt.toml win when they're there.</p>
+      <Toggle label="Format on save" description="Runs the formatter for the file's language each time you save." checked={settings.formatOnSave} onChange={value => update({ formatOnSave: value })} />
+    </section>
+    <section className="settings-group">
+      <h3>Java <span className="settings-tool">google-java-format</span></h3>
+      {choose('Style', 'AOSP style indents by 4 spaces; Google style by 2.', settings.javaFormatStyle, [{ value: 'google', label: 'Google · 2 spaces' }, { value: 'aosp', label: 'AOSP · 4 spaces' }], value => update({ javaFormatStyle: value }))}
+    </section>
+    <section className="settings-group">
+      <h3>Python <span className="settings-tool">ruff, or black</span></h3>
+      <NumberRow label="Line length" value={settings.pythonLineLength} min={40} max={200} step={4} onChange={value => update({ pythonLineLength: value })} />
+      <NumberRow label="Indent" description="Spaces per level (ruff; black always uses 4)." value={settings.pythonIndent} min={2} max={8} onChange={value => update({ pythonIndent: value })} />
+      {choose('Quotes', 'black can only keep your quotes as they are, not switch them to single.', settings.pythonQuotes, [{ value: 'double', label: 'Double "…"' }, { value: 'single', label: "Single '…'" }, { value: 'preserve', label: 'Keep as written' }], value => update({ pythonQuotes: value }))}
+    </section>
+    <section className="settings-group">
+      <h3>JavaScript, TypeScript, CSS, HTML <span className="settings-tool">prettier</span></h3>
+      <NumberRow label="Indent" value={settings.webIndent} min={1} max={8} onChange={value => update({ webIndent: value })} />
+      <Toggle label="Indent with tabs" checked={settings.webTabs} onChange={value => update({ webTabs: value })} />
+      <Toggle label="Semicolons" description="End statements with semicolons." checked={settings.webSemicolons} onChange={value => update({ webSemicolons: value })} />
+      {choose('Quotes', undefined, settings.webQuotes, [{ value: 'double', label: 'Double "…"' }, { value: 'single', label: "Single '…'" }], value => update({ webQuotes: value }))}
+      <NumberRow label="Line width" value={settings.webPrintWidth} min={40} max={200} step={4} onChange={value => update({ webPrintWidth: value })} />
+      {choose('Trailing commas', undefined, settings.webTrailingCommas, [{ value: 'all', label: 'Wherever allowed' }, { value: 'es5', label: 'Objects and arrays (ES5)' }, { value: 'none', label: 'None' }], value => update({ webTrailingCommas: value }))}
+    </section>
+    <section className="settings-group">
+      <h3>C and C++ <span className="settings-tool">clang-format</span></h3>
+      {choose('Based on', undefined, settings.cStyle, (['LLVM', 'Google', 'Chromium', 'Mozilla', 'WebKit', 'Microsoft', 'GNU'] as const).map(value => ({ value, label: value })), value => update({ cStyle: value }))}
+      <NumberRow label="Indent" value={settings.cIndent} min={1} max={8} onChange={value => update({ cIndent: value })} />
+    </section>
+    <section className="settings-group">
+      <h3>Rust <span className="settings-tool">rustfmt</span></h3>
+      <NumberRow label="Indent" value={settings.rustIndent} min={1} max={8} onChange={value => update({ rustIndent: value })} />
+      <p className="help mt-2">Go is formatted by gofmt, which has no options.</p>
+    </section>
+  </>
 }
 
 function TerminalSettings() {
@@ -605,9 +653,9 @@ function ServerSettings({ notify }: { notify: (message: unknown) => void }) {
 
 const shortcutGroups: { title: string; items: [string, string][] }[] = [
   { title: 'General', items: [['Command palette and file finder', 'K / P'], ['Commands only', 'Shift+K'], ['Settings', ','], ['Go to Home', 'Shift+H'], ['Open folder', 'O'], ['New project (Home)', 'N'], ['Zoom code in / out / reset', '= / - / 0']] },
-  { title: 'Editor', items: [['Save / save all', 'S / Shift+S'], ['Close tab', 'W'], ['Next / previous tab', 'Tab / Shift+Tab'], ['Find in file', 'F'], ['Find in all files', 'Shift+F'], ['Go to line', 'Alt+G'], ['Toggle comment', '/'], ['Select next match', 'D'], ['Duplicate line', 'Shift+D'], ['Go to definition', '!F12 / Click'], ['Rename in this file', '!F2'], ['Add a cursor', '!Alt+Click'], ['Next problem', '!F8']] },
+  { title: 'Editor', items: [['Save / save all', 'S / Shift+S'], ['Close tab', 'W'], ['Next / previous tab', 'Tab / Shift+Tab'], ['Find in file', 'F'], ['Find in all files', 'Shift+F'], ['Go to line', 'Alt+G'], ['Toggle comment', '/'], ['Select next match', 'D'], ['Duplicate line', 'Shift+D'], ['Go to definition', '!F12 / Click'], ['Rename in this file', '!F2'], ['Refactor (extract variable or function)', 'Shift+R'], ['Quick fix', '!Alt+Enter'], ['Add a cursor', '!Alt+Click'], ['Next problem', '!F8']] },
   { title: 'Run', items: [['Run active file', 'Enter'], ['Check or compile only', 'Shift+Enter']] },
-  { title: 'Layout', items: [['Overview of everything', '↑'], ['Focus mode', '.'], ['Show or hide the sidebar', 'B'], ['Files', 'Shift+E'], ['Search', 'Shift+F'], ['Git', 'Shift+G'], ['Packages', 'Shift+U'], ['Servers', 'Shift+R'], ['Canvas', 'Shift+D'], ['Chat', 'Shift+A'], ['Terminal', 'J'], ['New terminal', 'Shift+`'], ['Fullscreen the focused island', 'Shift+M']] },
+  { title: 'Layout', items: [['Overview of everything', 'Alt+O'], ['Show or hide the minimap', 'Shift+Y'], ['Focus mode', '.'], ['Show or hide the sidebar', 'B'], ['Files', 'Shift+E'], ['Search', 'Shift+F'], ['Git', 'Shift+G'], ['Packages', 'Shift+U'], ['Servers (outside the editor)', 'Shift+R'], ['Canvas', 'Shift+D'], ['Chat', 'Shift+A'], ['Terminal', 'J'], ['New terminal', 'Shift+`'], ['Fullscreen the focused island', 'Shift+M']] },
 ]
 
 function KeySettings() {

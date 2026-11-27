@@ -205,6 +205,115 @@ export function expandSnippetBefore(view: EditorView, languageName: string): boo
   return true
 }
 
+// ---- self. / cls. / this.: the members of the class you're in ----
+export interface Member { name: string; kind: 'method' | 'property'; detail?: string }
+const notMembers = new Set(['if', 'for', 'while', 'switch', 'catch', 'return', 'function', 'new', 'else', 'try', 'do', 'super', 'this', 'synchronized', 'constructor'])
+
+/** The receiver before the dot, when it means "this object". */
+export function receiverIsSelf(context: CompletionContext, languageName: string) {
+  const match = context.matchBefore(/\b(self|cls|this)\s*\.\s*[\w$#]*$/)
+  if (!match) return false
+  const word = /^(\w+)/.exec(match.text)![1]
+  return languageName.toLowerCase() === 'python' ? word === 'self' || word === 'cls' : word === 'this'
+}
+
+/** Fields and methods of the class around `pos` (and of parent classes in the same file). */
+export function classMembers(state: CompletionContext['state'], pos: number, languageName: string): Member[] {
+  const doc = state.doc
+  const text = doc.toString()
+  const python = languageName.toLowerCase() === 'python'
+  // The class: from the syntax tree, or (Python) the nearest less-indented `class` line above.
+  let node = syntaxTree(state).resolveInner(pos, -1) as ReturnType<ReturnType<typeof syntaxTree>['resolveInner']> | null
+  while (node && !/^(ClassDefinition|ClassDeclaration|ClassExpression|RecordDeclaration|EnumDeclaration|ObjectDeclaration|InterfaceDeclaration)$/.test(node.name)) node = node.parent
+  let from: number, to: number
+  if (node) { from = node.from; to = node.to }
+  else if (python) {
+    const line = doc.lineAt(pos)
+    const indent = /^\s*/.exec(line.text)![0].length
+    let found = -1
+    for (let number = line.number; number >= 1; number--) {
+      const row = doc.line(number).text
+      const match = /^(\s*)class\s+\w+/.exec(row)
+      if (match && match[1].length < indent) { found = number; break }
+    }
+    if (found < 0) return []
+    from = doc.line(found).from
+    const classIndent = /^\s*/.exec(doc.line(found).text)![0].length
+    let end = found + 1
+    while (end <= doc.lines && (!doc.line(end).text.trim() || /^\s*/.exec(doc.line(end).text)![0].length > classIndent)) end++
+    to = end <= doc.lines ? doc.line(end).from : doc.length
+  } else return []
+  const members = new Map<string, Member>()
+  const add = (name: string, kind: Member['kind'], detail?: string) => {
+    if (!name || notMembers.has(name) || (python && /^__\w+__$/.test(name))) return
+    const known = members.get(name)
+    if (!known || (known.kind === 'property' && kind === 'method')) members.set(name, { name, kind, detail })
+  }
+  const parents: string[] = []
+  const body = text.slice(from, to)
+  if (python) {
+    const header = /^\s*class\s+(\w+)\s*(?:\(([^)]*)\))?/.exec(body)
+    if (header?.[2]) parents.push(...header[2].split(',').map(item => item.trim().split('.').at(-1) ?? '').filter(item => /^\w+$/.test(item)))
+    const lines = body.split('\n')
+    const bodyIndent = lines.slice(1).find(line => line.trim())?.match(/^\s*/)?.[0].length ?? 4
+    let property = false
+    for (const line of lines.slice(1)) {
+      const indent = /^\s*/.exec(line)![0].length
+      if (indent === bodyIndent) {
+        if (/^\s*@property\b/.test(line)) { property = true; continue }
+        const method = /^\s*(?:async\s+)?def\s+(\w+)\s*\(\s*(?:self|cls)?\s*,?\s*([^)]*)\)?/.exec(line)
+        if (method) { add(method[1], property ? 'property' : 'method', property ? undefined : '(' + method[2].replace(/\s+/g, ' ').slice(0, 50) + ')'); property = false; continue }
+        const field = /^\s*(\w+)\s*(?::[^=]+)?=(?!=)/.exec(line)
+        if (field) add(field[1], 'property')
+        if (!/^\s*@/.test(line)) property = false
+      }
+      for (const match of line.matchAll(/\b(?:self|cls)\.(\w+)\s*(?::[^=]+)?=(?!=)/g)) add(match[1], 'property')
+    }
+  } else {
+    const header = /\b(?:class|record|enum|interface|object)\s+(\w+)[^{]*?\b(?:extends|:)\s*([\w.]+)/.exec(body.slice(0, body.indexOf('{') + 1 || 400))
+    if (header?.[2]) parents.push(header[2].split('.').at(-1)!)
+    const className = /\b(?:class|record|enum|interface|object)\s+(\w+)/.exec(body)?.[1]
+    // Lines directly in the class body: brace depth 1 (strings and comments roughly skipped).
+    let depth = 0, line = '', start = true
+    const flush = () => {
+      if (depth === 1 && line.trim()) {
+        const clean = line.replace(/\/\/.*$/, '').replace(/@\w+(\([^)]*\))?/g, '').trim()
+        const method = /([A-Za-z_$#][\w$]*)\s*(<[^>]*>)?\s*\(([^)]*)\)?/.exec(clean)
+        const isMethod = method && !/[=]/.test(clean.slice(0, method.index)) && !/^(return|new|throw)\b/.test(clean)
+        if (isMethod && method[1] !== className) add(method[1].replace(/^#/, ''), 'method', '(' + (method[3] ?? '').replace(/\s+/g, ' ').slice(0, 50) + ')')
+        else {
+          const field = /([A-Za-z_$#][\w$]*)\s*[?!]?\s*(?::[^=;]+)?(?:=|;|$)/.exec(clean.replace(/^(?:(?:public|private|protected|static|final|readonly|transient|volatile|internal|override|abstract|declare|val|var|let|const)\s+)*(?:[\w<>\[\],.?]+\s+(?=[A-Za-z_$#][\w$]*\s*(=|;)))?/, ''))
+          // A field may be set with a call (= new ArrayList<>()); only a ( before the = means a method.
+          if (field && !/\(/.test(clean.split('=')[0])) add(field[1].replace(/^#/, ''), 'property')
+        }
+      }
+      line = ''
+    }
+    for (let index = body.indexOf('{'); index >= 0 && index < body.length; index++) {
+      const char = body[index]
+      if (char === '/' && body[index + 1] === '/') { while (index < body.length && body[index] !== '\n') index++; flush(); continue }
+      if (char === '/' && body[index + 1] === '*') { index = body.indexOf('*/', index + 2); if (index < 0) break; index++; continue }
+      if (char === '"' || char === "'" || char === '`') { const close = body.indexOf(char, index + 1); line += char + char; index = close < 0 ? body.length : close; continue }
+      if (char === '{') { if (depth === 1) flush(); depth++; start = true; continue }
+      if (char === '}') { if (depth === 1) flush(); depth--; if (depth === 0) break; continue }
+      if ((char === ';' || char === '\n') && depth === 1) { if (char === ';') line += ';'; flush(); continue }
+      if (depth === 1) line += char
+      start = false
+    }
+    void start
+    for (const match of body.matchAll(/\bthis\.([A-Za-z_$#][\w$]*)\s*=(?!=)/g)) add(match[1].replace(/^#/, ''), 'property')
+  }
+  // Parent classes defined in the same file.
+  for (const parent of parents.slice(0, 3)) {
+    const at = text.search(new RegExp(python ? '^\\s*class\\s+' + parent + '\\b' : '\\b(class|interface)\\s+' + parent + '\\b', 'm'))
+    if (at < 0 || (at >= from && at < to)) continue
+    const inner = text.indexOf(python ? ':' : '{', at)
+    if (inner < 0) continue
+    for (const member of classMembers(state, inner + 2, languageName)) if (!members.has(member.name)) members.set(member.name, member)
+  }
+  return [...members.values()]
+}
+
 export function smartCompletions(languageName: string): CompletionSource {
   const vocabulary = vocabularies[languageName] ?? { builtins: [], keywords: [], members: [] }
   return (context: CompletionContext): CompletionResult | null => {
@@ -227,6 +336,12 @@ export function smartCompletions(languageName: string): CompletionSource {
       if (!previous || previous.score < total) scored.set(option.label, { ...option, score: total })
     }
     const names = fileNames(context, typed)
+    if (afterDot && receiverIsSelf(context, languageName)) {
+      // self. / this.: the class's own fields and methods first.
+      for (const member of classMembers(context.state, context.pos, languageName)) {
+        if (matches(member.name)) add({ label: member.name, type: member.kind, detail: member.detail, ['source' as never]: 'this class' } as Completion, 3.6)
+      }
+    }
     if (afterDot) {
       // After a dot: names used after dots in this file, then common members.
       const doc = context.state.doc.toString()

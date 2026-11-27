@@ -188,7 +188,7 @@ export default function Home(props: Props) {
       ? [{ key: 'new', kind: 'action', label: 'New project', name: typed, detail: 'create it in your projects folder', run: () => { setNewName(typed); setCreating(true) } }] : []),
   ] : [
     ...(latest ? [{ ...projectRow(latest), key: 'continue', kind: 'continue', label: 'Continue', detail: [resume ? resume.path.split('/').at(-1) + ', line ' + resume.line : '', changed ? changed + ' changed' : '', relativeTime(latest.lastOpened).toLowerCase()].filter(Boolean).join(' · '), run: () => { void open(latest.path, resume ?? undefined) } }] : []),
-    ...(showAll ? filtered : filtered.slice(0, 6)).filter(project => project.path !== latest?.path).map(projectRow),
+    ...(showAll ? filtered : filtered.slice(0, 7)).filter(project => project.path !== latest?.path).map(projectRow),
   ]
   const todays = entries.filter(entry => sameDay(entry.time, Date.now())).slice(-3).reverse()
 
@@ -197,12 +197,23 @@ export default function Home(props: Props) {
       left={<span className="brand"><img src={mark} alt="" /><span className="brand-word">Still</span></span>}
       right={<button className="quiet-link" onClick={() => props.onSettings()}>Settings</button>} />
 
-    <main className="home launch contents">
-      <div className="contents-page">
-        <div className="launch-column">
-          <header className="launch-hero">
-            <p className="contents-date">{new Date().toLocaleDateString([], { weekday: 'long', day: 'numeric', month: 'long' })}</p>
-            <h1>{greeting()}.</h1>
+    <main className="home launch studio">
+      <div className="studio-page">
+        <div className="studio-column">
+          {/* The project you were in, large; Continue takes you back to the file and line. */}
+          <header className="studio-hero">
+            <p className="studio-kicker">{new Date().toLocaleDateString([], { weekday: 'long', day: 'numeric', month: 'long' })} · {greeting()}{latest ? ' · last open ' + relativeTime(latest.lastOpened).toLowerCase() : ''}</p>
+            {latest && !term ? <>
+              <h1 className="studio-title" title={latest.path}>{latest.name}</h1>
+              <div className={'studio-continue launch-row is-continue' + (picked === 0 ? ' is-picked' : '')} onMouseEnter={() => setPicked(0)} onContextMenu={event => showMenu(event, projectMenu(latest))}>
+                <button className="studio-go project-open" onClick={() => { void open(latest.path, resume ?? undefined) }}>Continue <kbd>↵</kbd></button>
+                <span className="studio-meta">
+                  {[resume ? resume.path + ':' + resume.line : '', latest.languages.slice(0, 2).join(', ')].filter(Boolean).join(' · ')}
+                  {changed ? <> · <span className="studio-changed">{changed} changed</span></> : null}
+                </span>
+                <IconButton glyph={Ellipsis} label={'Actions for ' + latest.name} className="row-action" onClick={event => showMenu(event, projectMenu(latest), true)} />
+              </div>
+            </> : <h1 className="studio-title">{term ? 'Find' : greeting() + '.'}</h1>}
           </header>
 
           {state && !state.projectsRoot && desktop && <section className="setup-card">
@@ -228,34 +239,33 @@ export default function Home(props: Props) {
             <kbd>{mod}+K</kbd>
           </div>
 
-          <h2 className="contents-heading">{term ? 'Results' : 'Contents'}</h2>
-          <div className="launch-list" ref={list} role="listbox" aria-label="Projects and actions">
-            {launchRows.map((row, index) => {
-              const number = launchRows.slice(0, index + 1).filter(item => item.kind === 'project').length
-              return <div key={row.key} role="option" aria-selected={index === picked} className={'launch-row' + (index === picked ? ' is-picked' : '') + (row.kind === 'continue' ? ' is-continue' : '') + (row.missing ? ' missing' : '')}
-                onMouseEnter={() => setPicked(index)} onContextMenu={row.project ? event => showMenu(event, projectMenu(row.project!)) : undefined}>
-                <button className="project-open" onClick={row.run} disabled={row.missing}>
-                  <span className="launch-kind">{row.kind === 'project' ? String(number).padStart(2, '0') : row.label}</span>
-                  <span className="launch-name">{row.name}</span>
-                  <span className="contents-leader" aria-hidden="true" />
-                  <span className="launch-detail">{row.detail}</span>
-                </button>
-                {row.project && <IconButton glyph={Ellipsis} label={'Actions for ' + row.name} className="row-action" onClick={event => showMenu(event, projectMenu(row.project!), true)} />}
-              </div>
-            })}
-            {state && !launchRows.length && <p className="calm-quiet">{term ? <>Nothing matches “{filter}”. Press Enter to create a project with that name.</> : <>No projects yet. <button className="link" onClick={() => setCreating(true)}>Create one</button>, or try the Orbit Lab sample from New project.</>}</p>}
-          </div>
+          <section className="studio-projects">
+            <h2 className="contents-heading">{term ? 'Results' : 'Projects'}</h2>
+            <div className="launch-list studio-grid" ref={list} role="listbox" aria-label="Projects and actions">
+              {launchRows.map((row, index) => row.kind === 'continue' ? null :
+                <div key={row.key} role="option" aria-selected={index === picked} className={'launch-row studio-card' + (index === picked ? ' is-picked' : '') + (row.kind === 'action' ? ' is-action' : '') + (row.missing ? ' missing' : '')}
+                  onMouseEnter={() => setPicked(index)} onContextMenu={row.project ? event => showMenu(event, projectMenu(row.project!)) : undefined}>
+                  <button className="project-open" onClick={row.run} disabled={row.missing}>
+                    {row.kind === 'action' && <span className="launch-kind">{row.label}</span>}
+                    <span className="launch-name">{row.name}{row.project?.pinned && <Icon glyph={Pin} size={11} className="project-pin" />}</span>
+                    <span className="launch-detail">{row.detail}</span>
+                  </button>
+                  {row.project && <IconButton glyph={Ellipsis} label={'Actions for ' + row.name} className="row-action" onClick={event => showMenu(event, projectMenu(row.project!), true)} />}
+                </div>)}
+              {state && !launchRows.some(row => row.kind !== 'continue') && <p className="calm-quiet">{term ? <>Nothing matches “{filter}”. Press Enter to create a project with that name.</> : latest ? <>That’s every project for now.</> : <>No projects yet. <button className="link" onClick={() => setCreating(true)}>Create one</button>, or try the Orbit Lab sample from New project.</>}</p>}
+            </div>
+          </section>
 
-          <nav className="launch-actions" aria-label="Start something">
-            <button onClick={() => setCreating(true)}>New project <kbd>{mod}+N</kbd></button>
+          <nav className="launch-actions studio-actions" aria-label="Start something">
+            <button onClick={() => setCreating(true)}>+ New project <kbd>{mod}+N</kbd></button>
             <button onClick={() => { void openFolder() }}>Open folder <kbd>{mod}+O</kbd></button>
-            <button onClick={() => desktop ? setCloning(true) : props.notify('Cloning is available in the Still desktop app.')}>Clone</button>
+            <button onClick={() => desktop ? setCloning(true) : props.notify('Cloning is available in the Still desktop app.')}>Clone a repository</button>
             <button onClick={() => desktop ? setConnecting(true) : props.notify('SSH is available in the Still desktop app.')}>Connect to server</button>
-            {!term && projects.length > 6 && <button onClick={() => setShowAll(value => !value)}>{showAll ? 'Fewer projects' : 'All ' + projects.length + ' projects'}</button>}
+            {!term && projects.length > 7 && <button onClick={() => setShowAll(value => !value)}>{showAll ? 'Fewer projects' : 'All ' + projects.length + ' projects'}</button>}
           </nav>
         </div>
 
-        {!term && <aside className="contents-margin" aria-label="Today and servers">
+        {!term && <aside className="contents-margin studio-margin" aria-label="Today and servers">
           <section className="launch-today">
             <span className="calm-label">Today</span>
             {todays.length ? todays.map(entry => <button key={entry.id} className="calm-entry" onClick={() => { void open(entry.root, entry.path ? { path: entry.path, line: 1, time: entry.time } : undefined) }} title={entry.project}>
