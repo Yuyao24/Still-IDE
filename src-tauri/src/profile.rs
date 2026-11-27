@@ -73,10 +73,52 @@ finally:
 sys.exit(code)
 "#;
 
+/// Memory: tracemalloc records where allocations happen; at the end, the lines holding the most
+/// memory (and the peak) come back for a table.
+const MEMORY: &str = r#"
+import json, linecache, os, runpy, sys, time, tracemalloc
+target = os.path.abspath(sys.argv[1])
+out = os.environ.get('STILL_PROFILE_OUT')
+root = os.path.abspath(os.environ.get('STILL_PROFILE_ROOT') or os.getcwd())
+sys.argv = sys.argv[1:]
+sys.path.insert(0, os.path.dirname(target))
+tracemalloc.start(1)
+started = time.perf_counter()
+code = 0
+# The program's variables stay alive until the snapshot, so what it holds at the end counts.
+namespace = {'__name__': '__main__', '__file__': target, '__builtins__': __builtins__}
+try:
+    with open(target, 'rb') as handle:
+        source = handle.read()
+    exec(compile(source, target, 'exec'), namespace)
+except SystemExit as stop:
+    code = stop.code if isinstance(stop.code, int) else (0 if stop.code is None else 1)
+finally:
+    elapsed = time.perf_counter() - started
+    snapshot = tracemalloc.take_snapshot()
+    current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    snapshot = snapshot.filter_traces([tracemalloc.Filter(False, tracemalloc.__file__), tracemalloc.Filter(False, '<frozen *>'), tracemalloc.Filter(False, runpy.__file__)])
+    top = []
+    stats = snapshot.statistics('lineno')
+    # The project's own lines first, then the rest.
+    stats = [stat for stat in stats if os.path.abspath(stat.traceback[0].filename).startswith(root + os.sep)][:30] + [stat for stat in stats if not os.path.abspath(stat.traceback[0].filename).startswith(root + os.sep)][:10]
+    for stat in stats:
+        frame = stat.traceback[0]
+        path = os.path.abspath(frame.filename)
+        mine = path.startswith(root + os.sep)
+        top.append({'file': os.path.relpath(path, root).replace(os.sep, '/') if mine else path, 'line': frame.lineno, 'size': stat.size, 'count': stat.count, 'mine': mine, 'code': linecache.getline(frame.filename, frame.lineno).strip()[:120]})
+    if out:
+        with open(out, 'w', encoding='utf-8') as handle:
+            json.dump({'kind': 'memory', 'elapsed': elapsed, 'current': current, 'peak': peak, 'top': top}, handle)
+sys.exit(code)
+"#;
+
 /// Runs a Python file under the sampler; when it ends, sends `profile-result` with the stacks.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
-pub fn profile_start(app: AppHandle, jobs: State<Jobs>, id: String, root_path: String, path: String, args: Option<String>, env: Option<String>, dotenv: Option<bool>) -> Result<()> {
+pub fn profile_start(app: AppHandle, jobs: State<Jobs>, id: String, root_path: String, path: String, args: Option<String>, env: Option<String>, dotenv: Option<bool>, memory: Option<bool>) -> Result<()> {
+    let script = if memory.unwrap_or(false) { MEMORY } else { SAMPLER };
     let cwd = root(&root_path)?;
     let file = resolve(&cwd, &path)?;
     if !path.ends_with(".py") || !file.is_file() {
@@ -91,10 +133,10 @@ pub fn profile_start(app: AppHandle, jobs: State<Jobs>, id: String, root_path: S
         job.use_env(vars);
         let (program, _, _) = python(&cwd).ok_or("Python 3 was not found on PATH or in .venv.")?;
         let _ = std::fs::remove_file(&out);
-        job.emit("command", format!("$ profile {path}\n"));
+        job.emit("command", format!("$ profile {}{path}\n", if script == MEMORY { "memory: " } else { "" }));
         let mut cmd = command(program, &cwd);
         cmd.env("PYTHONIOENCODING", "utf-8").env("STILL_PROFILE_OUT", &out).env("STILL_PROFILE_ROOT", &cwd)
-            .args(["-u", "-c", SAMPLER]).arg(Path::new(".").join(relative(&path)?)).args(&args);
+            .args(["-u", "-c", script]).arg(Path::new(".").join(relative(&path)?)).args(&args);
         let (code, _) = job.run(&mut cmd, false)?;
         match std::fs::read_to_string(&out) {
             Ok(data) => { let _ = events.emit("profile-result", serde_json::json!({ "id": session, "path": path, "data": data })); }

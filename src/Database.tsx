@@ -3,9 +3,10 @@
 // Postgres passwords go to the system's credential store, not Still's settings.
 import { useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from 'react'
 import { invoke } from '@tauri-apps/api/core'
-import { ChevronDown, ChevronRight, Database as DatabaseGlyph, KeyRound, Play, Plus, RefreshCw, Table2, Trash2, Eye } from 'lucide-react'
+import { ChevronDown, ChevronRight, Database as DatabaseGlyph, Download, KeyRound, Play, Plus, RefreshCw, Table2, Trash2, Eye } from 'lucide-react'
+import { save } from '@tauri-apps/plugin-dialog'
 import { Icon, IconButton } from './ui'
-import { desktop } from './bridge'
+import { desktop, launcher } from './bridge'
 
 export interface DbConnection { id: string; label: string; kind: 'sqlite' | 'postgres'; path?: string; url?: string; key?: string; source: 'file' | 'env' | 'saved' }
 interface DbColumn { name: string; type: string; key: boolean }
@@ -89,9 +90,42 @@ export function DatabasePanel({ root, files, readFile, remote, focus, notify }: 
     setOpen(previous => { const next = new Set(previous); if (next.has(key)) next.delete(key); else next.add(key); return next })
     if (item && !tables[item.id]) void loadTables(item)
   }
+  // A table opened from the list (SELECT * … with a primary key) can be edited cell by cell.
+  const lastRun = useRef('')
+  const [editable, setEditable] = useState<{ sql: string; conn: string; name: string; keys: string[] } | null>(null)
+  const [editing, setEditing] = useState<{ row: number; column: number; value: string } | null>(null)
+  const canEdit = Boolean(editable && result && current && editable.conn === current.id && editable.sql === lastRun.current && editable.keys.every(key => result.columns.includes(key)))
+  const literal = (value: string | null) => value === null ? 'NULL' : "'" + value.replace(/'/g, "''") + "'"
+  async function saveCell(row: number, column: number, value: string) {
+    if (!editable || !result || !current) return
+    const original = result.rows[row]
+    const next = value === 'NULL' ? null : value
+    if (next === original[column]) { setEditing(null); return }
+    const where = editable.keys.map(key => quoteName(key) + (original[result.columns.indexOf(key)] === null ? ' IS NULL' : ' = ' + literal(original[result.columns.indexOf(key)]))).join(' AND ')
+    const statement = `UPDATE ${editable.name} SET ${quoteName(result.columns[column])} = ${literal(next)} WHERE ${where}`
+    try {
+      const done = await invoke<DbResult>('db_query', { conn: connArg(current), sql: statement })
+      if (done.changed !== 1) { notify(done.changed ? 'That changed ' + done.changed + ' rows; check the table.' : 'No row matched; the table may have changed. Run the query again.'); return }
+      setResult(previous => previous && { ...previous, rows: previous.rows.map((cells, index) => index === row ? cells.map((cell, at) => at === column ? next : cell) : cells) })
+      setEditing(null)
+    } catch (problem) { notify('Couldn’t save: ' + String(problem)) }
+  }
+  function exportCsv() {
+    if (!result?.columns.length) return
+    const cell = (value: string | null) => value === null ? '' : /[",\n\r]/.test(value) ? '"' + value.replace(/"/g, '""') + '"' : value
+    const csv = [result.columns.map(cell), ...result.rows.map(row => row.map(cell))].map(row => row.join(',')).join('\r\n') + '\r\n'
+    const base = (editable?.name.replace(/"/g, '').split('.').at(-1) ?? 'results') + '.csv'
+    if (!desktop) { const link = document.createElement('a'); link.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' })); link.download = base; link.click(); return }
+    void save({ title: 'Export results as CSV', defaultPath: base, filters: [{ name: 'CSV', extensions: ['csv'] }] }).then(path => {
+      if (path) return launcher.writeText(path, csv).then(() => notify('Saved ' + result.rows.length + ' rows to ' + path.split(/[\\/]/).at(-1) + '.'))
+    }).catch(problem => notify(String(problem)))
+  }
+
   async function run(text = sql, on = current) {
     if (!on) { notify('Pick a database first.'); return }
     if (!text.trim()) return
+    lastRun.current = text
+    setEditing(null)
     setRunning(true); setError(null)
     try { setResult(await invoke<DbResult>('db_query', { conn: connArg(on), sql: text })) }
     catch (problem) { setError(String(problem)); setResult(null) }
@@ -102,6 +136,8 @@ export function DatabasePanel({ root, files, readFile, remote, focus, notify }: 
   function showTable(item: DbConnection, table: DbTable) {
     const name = (item.kind === 'postgres' && table.schema && table.schema !== 'public' ? quoteName(table.schema) + '.' : '') + quoteName(table.name)
     const text = `SELECT * FROM ${name} LIMIT 200;`
+    const keys = table.columns.filter(column => column.key).map(column => column.name)
+    setEditable(keys.length && !table.view ? { sql: text, conn: item.id, name, keys } : null)
     setSelected(item.id); setSql(text)
     setTimeout(() => { void run(text, item) }, 0)
   }
@@ -197,13 +233,21 @@ export function DatabasePanel({ root, files, readFile, remote, focus, notify }: 
           <span className={'dbg-status' + (error ? ' is-error' : '')}>
             {running ? 'Running…' : error ? 'The query failed.' : result ? (result.columns.length ? `${result.rows.length}${result.truncated ? '+' : ''} row${result.rows.length === 1 ? '' : 's'}` : `${result.changed ?? 0} row${result.changed === 1 ? '' : 's'} changed`) + ` · ${result.millis} ms${result.statements > 1 ? ' · ' + result.statements + ' statements' : ''}` : current ? current.label : ''}
           </span>
+          <span className="flex-1" />
+          {canEdit && <span className="help db-hint">Double-click a cell to edit it</span>}
+          {result && result.columns.length > 0 && <button className="text-btn" onClick={exportCsv}><Icon glyph={Download} size={12} />Export CSV</button>}
         </div>
       </div>
       <div className="db-results">
         {error ? <pre className="db-error-text">{error}</pre>
           : result && result.columns.length ? <table className="db-grid">
             <thead><tr><th className="db-num">#</th>{result.columns.map((column, index) => <th key={index} scope="col">{column}</th>)}</tr></thead>
-            <tbody>{result.rows.map((row, index) => <tr key={index}><td className="db-num">{index + 1}</td>{row.map((cell, column) => <td key={column} className={cell === null ? 'is-null' : ''} title={cell && cell.length > 80 ? cell.slice(0, 2000) : undefined}>{cell === null ? 'NULL' : cell.length > 200 ? cell.slice(0, 200) + '…' : cell}</td>)}</tr>)}</tbody>
+            <tbody>{result.rows.map((row, index) => <tr key={index}><td className="db-num">{index + 1}</td>{row.map((cell, column) => editing && editing.row === index && editing.column === column
+              ? <td key={column} className="is-editing"><input autoFocus className="db-cell-input" value={editing.value} aria-label={'Edit ' + result.columns[column]} spellCheck={false}
+                  onChange={event => setEditing({ ...editing, value: event.target.value })} onBlur={() => setEditing(null)}
+                  onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); void saveCell(index, column, editing.value) } else if (event.key === 'Escape') { event.preventDefault(); setEditing(null) } }} /></td>
+              : <td key={column} className={cell === null ? 'is-null' : ''} title={cell && cell.length > 80 ? cell.slice(0, 2000) : canEdit ? 'Double-click to edit' : undefined}
+                  onDoubleClick={canEdit ? () => setEditing({ row: index, column, value: cell ?? 'NULL' }) : undefined}>{cell === null ? 'NULL' : cell.length > 200 ? cell.slice(0, 200) + '…' : cell}</td>)}</tr>)}</tbody>
           </table>
           : result ? <p className="dbg-empty tests-empty">Done. {result.changed ?? 0} row{result.changed === 1 ? '' : 's'} changed.</p>
           : <p className="dbg-empty tests-empty"><Icon glyph={DatabaseGlyph} size={13} /> Pick a table to see its rows, or write SQL above.</p>}

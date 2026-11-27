@@ -1634,3 +1634,22 @@ pre.nb-out { font: 12.5px/1.55 var(--font-mono); white-space: pre-wrap; overflow
 }
 .studio .studio-continue .row-action { opacity: 0; margin-left: -6px; }
 .studio .studio-continue:hover .row-action, .studio .studio-continue:focus-within .row-action { opacity: 1; }
+
+/* Island headers line up: the sidebar's view tabs, the editor's file tabs and the right bar's
+   tabs are one height, with the same inset hairline and the active underline on that line. */
+.side-views { height: 50px; padding: 0 8px 0 16px; align-items: stretch; }
+.side-views .side-close { align-self: center; }
+.right-views { flex: 0 0 50px; align-items: stretch; padding: 0 8px 0 16px; position: relative; border-bottom-color: transparent !important; }
+.right-views::after { content: ""; position: absolute; left: 16px; right: 16px; bottom: -1px; height: 1px; background: var(--line); pointer-events: none; }
+.right-views button[role=tab] { position: relative; height: auto; box-shadow: none !important; }
+.right-views button[role=tab]::after { content: ""; position: absolute; left: 9px; right: 9px; bottom: -1px; height: 1px; background: var(--ink); transform: scaleX(0); transition: transform var(--base) var(--ease); z-index: 1; }
+.right-views button[role=tab].is-active::after { transform: scaleX(1); }
+.right-views > .icon-btn { align-self: center; }
+.tree-coverage { flex: none; font: 10.5px var(--font-mono); color: var(--muted); }
+.tree-coverage.is-high { color: var(--green); }
+.tree-coverage.is-low { color: var(--amber); }
+.db-hint { margin-right: 10px; font-size: 11.5px; }
+.db-grid td.is-editing { padding: 0; }
+.db-cell-input { width: 100%; min-width: 120px; height: 24px; padding: 0 11px; font: 12px var(--font-mono); color: var(--ink); background: var(--editor); border: 1px solid var(--ink); outline: none; }
+.memory-table .memory-code { max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--secondary); }
+.memory-bar { display: inline-block; height: 6px; margin-right: 8px; vertical-align: middle; background: color-mix(in srgb, var(--ink) 28%, transparent); }

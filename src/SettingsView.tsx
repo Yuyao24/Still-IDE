@@ -385,6 +385,7 @@ function EditorSettings() {
       <h3>Checks and changes</h3>
       <Toggle label="Show errors while typing" description="Underlines syntax errors as you type. Python files are also checked for undefined names (and, with pyflakes installed, unused imports and more)." checked={settings.errors} onChange={value => update({ errors: value })} />
       <Toggle label="Inline hints from language servers" description="Parameter names and inferred types shown faintly in the code, when the language server offers them." checked={settings.inlayHints} onChange={value => update({ inlayHints: value })} />
+      <LineGuideSetting />
       <Toggle label="Minimap" description="A small map of the whole file beside the editor; click or drag it to move through the file. Ctrl+Shift+Y shows or hides it." checked={settings.minimap} onChange={value => update({ minimap: value })} />
       <Toggle label="Sticky header" description="The class, function or block you're in stays pinned at the top of the editor once its first line scrolls away. Click a line to go there; right-click it to turn this off." checked={settings.stickyScroll} onChange={value => update({ stickyScroll: value })} />
       <Toggle label="Fill in constructors and self" description="Enter after starting a class (class Shop: in Python, class Shop { in Java, JavaScript and C#) adds __init__ or the constructor. Enter after def __init__(self, name): writes self.name = name, and ( after def inside a class adds self. Comments and docstrings close themselves either way." checked={settings.fillConstructors} onChange={value => update({ fillConstructors: value })} />
@@ -417,7 +418,7 @@ function EditorSettings() {
     </section>
     <section className="settings-group">
       <h3>Calm</h3>
-      <div className="setting-row"><span className="setting-text"><span>Idle screen</span><small>After this long without input, show drifting code, the time and today's numbers. Any key brings you back.</small></span>
+      <div className="setting-row"><span className="setting-text"><span>Idle screen</span><small>After this long without input, show an excerpt of your code, the time and today's numbers. Any key brings you back.</small></span>
         <Segmented label="Idle screen" value={String(settings.idleMinutes)} onChange={value => update({ idleMinutes: Number(value) })}
           options={[{ value: '0', label: 'Off' }, { value: '2', label: '2 min' }, { value: '5', label: '5 min' }, { value: '10', label: '10 min' }, { value: '20', label: '20 min' }]} /></div>
       <Toggle label="Keep a journal" description="Notes saves, runs and commits on this computer. Shown on Home under Journal." checked={settings.journal} onChange={value => update({ journal: value })} />
@@ -475,6 +476,22 @@ function SnippetSettings() {
       <div className="flex justify-end"><button type="submit" className="text-btn primary" disabled={!draft.prefix.trim() || !draft.body.trim()}>Add snippet</button></div>
     </form>
   </section>
+}
+
+function LineGuideSetting() {
+  const { settings, update } = useSettings()
+  const presets = [{ value: 0, label: 'Off' }, { value: -1, label: 'Match the formatter' }, { value: 79, label: '79 · PEP 8' }, { value: 80, label: '80 · classic' }, { value: 88, label: '88 · Black, ruff' },
+    { value: 100, label: '100 · Google Java, Kotlin, Rust' }, { value: 120, label: '120 · JetBrains' }]
+  const custom = !presets.some(preset => preset.value === settings.lineGuide)
+  return <div className="setting-row"><span className="setting-text"><span>Line guide</span><small>A faint vertical line at the longest a line should be. “Match the formatter” uses the line length from Settings → Formatting for each language.</small></span>
+    <span className="flex items-center gap-2">
+      <select className="field w-56" aria-label="Line guide" value={custom ? 'custom' : String(settings.lineGuide)} onChange={event => update({ lineGuide: event.target.value === 'custom' ? (settings.lineGuide > 0 ? settings.lineGuide : 90) : Number(event.target.value) })}>
+        {presets.map(preset => <option key={preset.value} value={preset.value}>{preset.label}</option>)}
+        <option value="custom">Custom…</option>
+      </select>
+      {custom && <input className="field w-20" type="number" min={20} max={400} aria-label="Line guide column" value={settings.lineGuide} onChange={event => { const value = Math.round(Number(event.target.value)); if (value >= 20 && value <= 400) update({ lineGuide: value }) }} />}
+    </span>
+  </div>
 }
 
 function FormattingSettings() {

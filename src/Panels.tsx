@@ -51,6 +51,8 @@ interface ExplorerProps {
   onKey: (event: KeyboardEvent, entry: Entry) => void
   /** Drag a file or folder onto a folder to move it there. */
   onMove?: (entry: Entry, folder: string) => void
+  /** Share of lines the tests ran, per file (after a run with coverage). */
+  coverage?: Record<string, number>
 }
 
 export function Explorer(props: ExplorerProps) {
@@ -120,6 +122,7 @@ export function Explorer(props: ExplorerProps) {
           <span className="tree-chev">{item.directory && <Icon size={12} glyph={expanded ? ChevronDown : ChevronRight} />}</span>
           {item.directory ? <Icon glyph={expanded ? FolderOpen : Folder} className="file-muted" /> : <FileIcon path={item.path} />}
           <span className="tree-name">{item.name}</span>
+          {props.coverage?.[item.path] !== undefined && <span className={'tree-coverage' + (props.coverage[item.path] < 50 ? ' is-low' : props.coverage[item.path] >= 80 ? ' is-high' : '')} title={props.coverage[item.path] + '% of lines run by the tests'}>{props.coverage[item.path]}%</span>}
           {mark && <span className={'tree-mark' + (mark === 'U' ? ' untracked' : '')}>{mark}</span>}
         </button>
         {item.directory && expanded && rows(item.path, depth + 1)}

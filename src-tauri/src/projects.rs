@@ -279,6 +279,20 @@ pub fn open_project(store: State<Store>, path: String) -> Result<WorkspaceInfo> 
     Ok(info)
 }
 
+/// A single file opened on its own: its folder serves the file, but it isn't added to your projects.
+#[derive(serde::Serialize)]
+pub struct LooseFile { root: String, name: String, file: String }
+
+#[tauri::command]
+pub fn open_loose_file(path: String) -> Result<LooseFile> {
+    let full = std::path::PathBuf::from(plain(&path));
+    if !full.is_file() { return Err(format!("{path} isn't a file.")) }
+    let parent = full.parent().ok_or("That file has no folder.")?;
+    let info = crate::workspace::workspace_info(parent.to_string_lossy().to_string())?;
+    let file = full.file_name().map(|name| name.to_string_lossy().to_string()).ok_or("That file has no name.")?;
+    Ok(LooseFile { root: info.root, name: file.clone(), file })
+}
+
 #[tauri::command]
 pub fn forget_project(store: State<Store>, path: String) -> Result<()> {
     store.update(|config| {

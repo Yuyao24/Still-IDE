@@ -3,7 +3,7 @@ import { listen } from '@tauri-apps/api/event'
 import { Copy, Ellipsis, FolderOpen, FolderSearch, Moon, Pin, PinOff, Server, Sun, Trash2, X } from 'lucide-react'
 import {
   type HomeState, type JobEvent, type ProjectSummary, type SshHost, type SshOverview, type Workspace,
-  api, demo, desktop, forgetProject, home, hostLabel, mod, pickFolder, ssh,
+  api, demo, desktop, forgetProject, home, hostLabel, mod, pickFile, pickFolder, recentFiles, ssh, type RecentFile,
 } from './bridge'
 import { ConnectDialog, HostDialog, OpenRemoteDialog } from './Remote'
 import { useSettings } from './settings'
@@ -71,6 +71,20 @@ export default function Home(props: Props) {
     try { props.onOpen(await home.open(path), resume ? { file: resume.path, line: resume.line } : undefined) } catch (error) { props.notify(error) }
   }
 
+  /** A single file on its own, without making its folder a project. */
+  async function openLoose(path: string) {
+    if (!desktop) { props.notify('Opening single files is available in the Still desktop app.'); return }
+    try { const workspace = await home.openFile(path); props.onOpen(workspace, { file: workspace.file! }) }
+    catch (error) { recentFiles.remove(path); setLoose(recentFiles.list()); props.notify(error) }
+  }
+  async function openFile() {
+    try {
+      const path = await pickFile('Open a file')
+      if (path) await openLoose(path)
+    } catch (error) { props.notify(error) }
+  }
+  const [loose, setLoose] = useState<RecentFile[]>(() => recentFiles.list())
+
   async function openFolder() {
     try {
       const path = await pickFolder('Open a project folder')
@@ -93,7 +107,7 @@ export default function Home(props: Props) {
       const meta = event.ctrlKey || event.metaKey
       const key = event.key.toLowerCase()
       if (meta && key === 'n') { event.preventDefault(); setCreating(true) }
-      else if (meta && key === 'o') { event.preventDefault(); void openFolder() }
+      else if (meta && key === 'o') { event.preventDefault(); if (event.shiftKey) void openFile(); else void openFolder() }
       else if (meta && (key === 'k' || key === 'p' || key === 'f')) { event.preventDefault(); filterInput.current?.focus() }
       else if (meta && key === ',') { event.preventDefault(); props.onSettings() }
       else if (key === '/' && !(event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement)) { event.preventDefault(); filterInput.current?.focus() }
@@ -177,6 +191,10 @@ export default function Home(props: Props) {
     detail: project.missing ? 'missing' : [project.location === 'external' ? shortPath(project.path, homeDir) : '', project.languages.slice(0, 2).join(', '), project.lastOpened ? relativeTime(project.lastOpened).toLowerCase() : ''].filter(Boolean).join(' · '),
     run: () => { if (!project.missing) void open(project.path) },
   })
+  const fileRow = (item: RecentFile): LaunchRow => {
+    const parts = item.path.split(/[\\/]/)
+    return { key: 'file:' + item.path, kind: 'file', label: 'File', name: parts.at(-1) ?? item.path, detail: [shortPath(parts.slice(0, -1).join(item.path.includes('\\') ? '\\' : '/'), homeDir), relativeTime(item.time).toLowerCase()].filter(Boolean).join(' · '), run: () => { void openLoose(item.path) } }
+  }
   const typed = filter.trim()
   const gitUrl = /^(https?:\/\/\S+|git@\S+:\S+|ssh:\/\/\S+)$/.test(typed) && (typed.endsWith('.git') || /github|gitlab|bitbucket|git@/.test(typed))
   const sshTarget = !gitUrl && /^[^@\s/]+@[^\s/:]+(:\d+)?$/.test(typed)
@@ -184,11 +202,13 @@ export default function Home(props: Props) {
     ...(gitUrl ? [{ key: 'clone', kind: 'action', label: 'Clone', name: typed.replace(/^https?:\/\//, '').replace(/\.git$/, ''), detail: 'into your projects folder', run: () => { setCloneUrl(typed); setCloning(true) } }] : []),
     ...(sshTarget ? [{ key: 'ssh', kind: 'action', label: 'Connect', name: typed, detail: 'browse its folders', run: () => { setConnectTarget(typed); setConnecting(true) } }] : []),
     ...filtered.slice(0, 8).map(projectRow),
+    ...loose.filter(item => item.path.toLowerCase().includes(typed.toLowerCase())).slice(0, 4).map(fileRow),
     ...(!gitUrl && !sshTarget && !/[<>:"/\\|?*]/.test(typed) && !projects.some(project => project.name.toLowerCase() === typed.toLowerCase())
       ? [{ key: 'new', kind: 'action', label: 'New project', name: typed, detail: 'create it in your projects folder', run: () => { setNewName(typed); setCreating(true) } }] : []),
   ] : [
     ...(latest ? [{ ...projectRow(latest), key: 'continue', kind: 'continue', label: 'Continue', detail: [resume ? resume.path.split('/').at(-1) + ', line ' + resume.line : '', changed ? changed + ' changed' : '', relativeTime(latest.lastOpened).toLowerCase()].filter(Boolean).join(' · '), run: () => { void open(latest.path, resume ?? undefined) } }] : []),
     ...(showAll ? filtered : filtered.slice(0, 7)).filter(project => project.path !== latest?.path).map(projectRow),
+    ...loose.slice(0, 4).map(fileRow),
   ]
   const todays = entries.filter(entry => sameDay(entry.time, Date.now())).slice(-3).reverse()
 
@@ -239,26 +259,27 @@ export default function Home(props: Props) {
             <kbd>{mod}+K</kbd>
           </div>
 
-          <section className="studio-projects">
+          {(term || launchRows.some(row => row.kind !== 'continue') || !latest) && <section className="studio-projects">
             <h2 className="contents-heading">{term ? 'Results' : 'Projects'}</h2>
             <div className="launch-list studio-grid" ref={list} role="listbox" aria-label="Projects and actions">
               {launchRows.map((row, index) => row.kind === 'continue' ? null :
                 <div key={row.key} role="option" aria-selected={index === picked} className={'launch-row studio-card' + (index === picked ? ' is-picked' : '') + (row.kind === 'action' ? ' is-action' : '') + (row.missing ? ' missing' : '')}
                   onMouseEnter={() => setPicked(index)} onContextMenu={row.project ? event => showMenu(event, projectMenu(row.project!)) : undefined}>
                   <button className="project-open" onClick={row.run} disabled={row.missing}>
-                    {row.kind === 'action' && <span className="launch-kind">{row.label}</span>}
+                    {(row.kind === 'action' || row.kind === 'file') && <span className="launch-kind">{row.label}</span>}
                     <span className="launch-name">{row.name}{row.project?.pinned && <Icon glyph={Pin} size={11} className="project-pin" />}</span>
                     <span className="launch-detail">{row.detail}</span>
                   </button>
                   {row.project && <IconButton glyph={Ellipsis} label={'Actions for ' + row.name} className="row-action" onClick={event => showMenu(event, projectMenu(row.project!), true)} />}
                 </div>)}
-              {state && !launchRows.some(row => row.kind !== 'continue') && <p className="calm-quiet">{term ? <>Nothing matches “{filter}”. Press Enter to create a project with that name.</> : latest ? <>That’s every project for now.</> : <>No projects yet. <button className="link" onClick={() => setCreating(true)}>Create one</button>, or try the Orbit Lab sample from New project.</>}</p>}
+              {state && !launchRows.some(row => row.kind !== 'continue') && <p className="calm-quiet">{term ? <>Nothing matches “{filter}”. Press Enter to create a project with that name.</> : latest ? null : <>No projects yet. <button className="link" onClick={() => setCreating(true)}>Create one</button>, or try the Orbit Lab sample from New project.</>}</p>}
             </div>
-          </section>
+          </section>}
 
           <nav className="launch-actions studio-actions" aria-label="Start something">
             <button onClick={() => setCreating(true)}>+ New project <kbd>{mod}+N</kbd></button>
             <button onClick={() => { void openFolder() }}>Open folder <kbd>{mod}+O</kbd></button>
+            <button onClick={() => { void openFile() }}>Open file <kbd>{mod}+Shift+O</kbd></button>
             <button onClick={() => desktop ? setCloning(true) : props.notify('Cloning is available in the Still desktop app.')}>Clone a repository</button>
             <button onClick={() => desktop ? setConnecting(true) : props.notify('SSH is available in the Still desktop app.')}>Connect to server</button>
             {!term && projects.length > 7 && <button onClick={() => setShowAll(value => !value)}>{showAll ? 'Fewer projects' : 'All ' + projects.length + ' projects'}</button>}
@@ -266,13 +287,13 @@ export default function Home(props: Props) {
         </div>
 
         {!term && <aside className="contents-margin studio-margin" aria-label="Today and servers">
-          <section className="launch-today">
+          {todays.length > 0 && <section className="launch-today">
             <span className="calm-label">Today</span>
-            {todays.length ? todays.map(entry => <button key={entry.id} className="calm-entry" onClick={() => { void open(entry.root, entry.path ? { path: entry.path, line: 1, time: entry.time } : undefined) }} title={entry.project}>
+            {todays.map(entry => <button key={entry.id} className="calm-entry" onClick={() => { void open(entry.root, entry.path ? { path: entry.path, line: 1, time: entry.time } : undefined) }} title={entry.project}>
               <time>{clock(entry.time)}</time><span>{entryText(entry)}</span>
-            </button>) : <p className="calm-quiet">Nothing yet today.</p>}
+            </button>)}
             <button className="calm-more" onClick={() => setJournal(true)}>Open journal</button>
-          </section>
+          </section>}
           {desktop && hosts.length > 0 && <section className="launch-today contents-servers">
             <span className="calm-label">Servers</span>
             {hosts.slice(0, 5).map(host => <button key={host.id} className="calm-entry" onClick={() => setRemoteHost(host)} title={hostLabel(host)}>

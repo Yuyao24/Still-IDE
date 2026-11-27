@@ -21,6 +21,7 @@ export const keyActions: { id: string; label: string }[] = [
   { id: 'refactor', label: 'Refactor…' },
   { id: 'extract-variable', label: 'Extract variable' },
   { id: 'extract-method', label: 'Extract method or function' },
+  { id: 'inline-variable', label: 'Inline variable' },
   { id: 'goto-line', label: 'Go to line' },
   { id: 'comment', label: 'Toggle comment' },
   { id: 'terminal', label: 'Show or hide the terminal' },
@@ -49,7 +50,7 @@ export const keyPresets: Record<KeyPreset, { label: string; keys: Record<string,
   jetbrains: { label: 'JetBrains', keys: {
     'palette.commands': 'Mod+Shift+A', 'palette.files': 'Mod+Shift+N', 'palette.symbols': 'Mod+Alt+Shift+N', 'goto-line': 'Mod+G', 'terminal': 'Alt+F12',
     'side.files': 'Alt+1', 'side.git': 'Alt+9', 'side.search': 'Mod+Shift+F', 'run': 'Shift+F10', 'debug': 'Shift+F9', 'tests': 'Mod+Shift+F10', 'format': 'Mod+Alt+L',
-    'rename': 'Shift+F6', 'definition': 'Mod+B', 'references': 'Alt+F7', 'quickfix': 'Alt+Enter', 'refactor': 'Mod+Alt+Shift+T', 'extract-variable': 'Mod+Alt+V', 'extract-method': 'Mod+Alt+M', 'commit': 'Mod+K', 'push': 'Mod+Shift+K', 'pull': 'Mod+T',
+    'rename': 'Shift+F6', 'definition': 'Mod+B', 'references': 'Alt+F7', 'quickfix': 'Alt+Enter', 'refactor': 'Mod+Alt+Shift+T', 'extract-variable': 'Mod+Alt+V', 'extract-method': 'Mod+Alt+M', 'inline-variable': 'Mod+Alt+N', 'commit': 'Mod+K', 'push': 'Mod+Shift+K', 'pull': 'Mod+T',
     'next-tab': 'Alt+ArrowRight', 'prev-tab': 'Alt+ArrowLeft', 'close': 'Mod+F4', 'settings': 'Mod+Alt+S', 'comment': 'Mod+/',
   } },
 }

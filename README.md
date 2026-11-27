@@ -56,7 +56,7 @@ you only download the installer once.
 
 **Journal and idle screen.** Saves, runs and commits are noted in a journal on
 this computer (turn it off in Settings → Editor). After a few minutes without
-input an idle screen shows drifting code, one excerpt at a time, the time and
+input an idle screen shows your code, one excerpt at a time, the time and
 today's numbers; any key brings you back.
 
 **Editor.** CodeMirror 6 with syntax highlighting for Python, Java, JavaScript,
@@ -77,11 +77,13 @@ colours. Copy it or save it as a PNG.
 `.venv` (or `venv`, or `VIRTUAL_ENV`) and falls back to Python 3 on PATH. Java
 compiles with `javac -d bin` and shows compiler errors in the gutter and the
 Problems tab. Tests run with pytest or JUnit (Maven or Gradle), with
-coverage marked in the gutter: pytest-cov for Python and JaCoCo for Java. Programs can read input: type into the box under the output.
+coverage marked in the gutter and each file's percentage in the file tree:
+pytest-cov for Python and JaCoCo for Java. Programs can read input: type into the box under the output.
 Right-click Run to pass program arguments.
 
 **Refactor.** Ctrl/Cmd + Shift + R (or right-click → Refactor…) offers Extract
-variable for an expression and, in Python, Extract function for whole lines:
+variable for an expression, Inline variable for a line that sets one, and, in
+Python, Extract function for whole lines:
 Still works out the new function's parameters and return values (and makes it a
 method when the lines use `self`). Language servers add their own refactorings,
 such as Extract method in Java and TypeScript. Moving or renaming a file or
@@ -91,11 +93,13 @@ Java package lines.
 
 **Profiler.** "Profile this file" runs a Python file under a sampling profiler
 and shows a flame graph (click to zoom, double-click to open the line) and the
-functions where the time went.
+functions where the time went. "Memory" lists the lines holding the most memory
+at the end, and the peak.
 
 **Database.** The Database tab lists SQLite files in the project and Postgres
 servers (a `DATABASE_URL` in `.env`, or ones you add). Pick a table to see its
-rows, or write SQL and run it with Ctrl/Cmd + Enter. Postgres passwords are kept
+rows (double-click a cell to edit it), or write SQL and run it with Ctrl/Cmd +
+Enter. Export any result to CSV. Postgres passwords are kept
 in the system keychain.
 
 **Dev containers.** A project with `.devcontainer/devcontainer.json` shows "Dev
@@ -110,6 +114,13 @@ indent and quotes for ruff or black; indent, tabs, semicolons, quotes, width and
 trailing commas for prettier; the base style and indent for clang-format; and the
 indent for rustfmt. A project's own settings file (pyproject.toml, .prettierrc,
 .clang-format, rustfmt.toml) wins when it has one.
+
+**Single files.** Open file (Ctrl/Cmd + Shift + O), Open with Still or
+`still notes.md` opens just that file, without making its folder a project.
+Recent files sit on Home with your projects.
+
+**Line guide.** A faint line at the longest a line should be: 79, 80, 88, 100,
+120, your own number, or each language's formatter setting (Settings → Editor).
 
 **Minimap and sticky header.** Ctrl/Cmd + Shift + Y shows a small map of the file
 in its own strip beside the editor. The class or function you're in stays pinned

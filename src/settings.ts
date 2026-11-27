@@ -65,6 +65,8 @@ export interface Settings {
   formatOnSave: boolean
   /** A small map of the file beside each editor (its own strip, not the right bar). */
   minimap: boolean
+  /** Line guide: 0 off, -1 match the formatter's line length, or a column. */
+  lineGuide: number
   /** Formatting (Settings → Formatting); a project's own config file wins. */
   javaFormatStyle: 'google' | 'aosp'
   pythonLineLength: number
@@ -180,6 +182,7 @@ export const defaults: Settings = {
   openOnStart: 'last',
   formatOnSave: false,
   minimap: false,
+  lineGuide: 0,
   javaFormatStyle: 'google',
   pythonLineLength: 88,
   pythonIndent: 4,

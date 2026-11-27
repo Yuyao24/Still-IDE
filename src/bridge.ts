@@ -7,7 +7,7 @@ import orbitTest from '../src-tauri/sample/test_orbit.py?raw'
 import requirements from '../src-tauri/sample/requirements.txt?raw'
 import gitignore from '../src-tauri/sample/gitignore.txt?raw'
 
-export interface Workspace { root: string; name: string; sample?: boolean; remote?: string; hostName?: string }
+export interface Workspace { root: string; name: string; sample?: boolean; remote?: string; hostName?: string; /** A single file opened on its own (relative to root). */ file?: string }
 export interface Entry { name: string; path: string; directory: boolean }
 export interface Runtimes { python: string | null; pythonVenv: boolean; java: string | null; node?: string | null; git?: string | null; ssh?: string | null; shell: string }
 export interface ProjectSummary {
@@ -133,6 +133,20 @@ function demoGit(): GitStatus {
   return { branch: 'main', changes }
 }
 
+export async function pickFile(title: string): Promise<string | null> {
+  if (!desktop) throw new Error('Choosing files is available in the Still desktop app.')
+  const path = await open({ directory: false, multiple: false, title })
+  return !path || Array.isArray(path) ? null : path
+}
+
+/** Single files opened on their own, newest first (kept on this computer). */
+export interface RecentFile { path: string; time: number }
+export const recentFiles = {
+  list: (): RecentFile[] => { try { return (JSON.parse(localStorage.getItem('still.recentFiles') || '[]') as RecentFile[]).filter(item => typeof item.path === 'string') } catch { return [] } },
+  add: (path: string) => { try { localStorage.setItem('still.recentFiles', JSON.stringify([{ path, time: Date.now() }, ...recentFiles.list().filter(item => item.path !== path)].slice(0, 12))) } catch { /* storage unavailable */ } },
+  remove: (path: string) => { try { localStorage.setItem('still.recentFiles', JSON.stringify(recentFiles.list().filter(item => item.path !== path))) } catch { /* storage unavailable */ } },
+}
+
 export async function pickFolder(title: string): Promise<string | null> {
   if (!desktop) throw new Error('Choosing folders is available in the Still desktop app.')
   const path = await open({ directory: true, multiple: false, title })
@@ -151,6 +165,12 @@ export const home = {
   state: async (): Promise<HomeState> => desktop ? invoke('home_state') : demoHome(),
   setRoot: (path: string) => invoke<string>('set_projects_root', { path }),
   open: async (path: string): Promise<Workspace> => desktop ? invoke('open_project', { path }) : demo,
+  /** A single file on its own, without making its folder a project. */
+  openFile: async (path: string): Promise<Workspace> => {
+    const loose = await invoke<{ root: string; name: string; file: string }>('open_loose_file', { path })
+    recentFiles.add(path)
+    return loose
+  },
   forget: (path: string) => invoke<void>('forget_project', { path }),
   /** Moves the project folder to the system trash and takes it off Home. */
   remove: (path: string) => invoke<void>('delete_project', { path }),

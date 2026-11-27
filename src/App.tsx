@@ -76,9 +76,9 @@ export default function App() {
       if (target) {
         try {
           // Windows paths use backslashes; either kind of slash separates the folder from the file.
-          const folder = target.directory ? target.path : target.path.replace(/[\\/][^\\/]*$/, '') || '/'
-          const workspace = await home.open(folder)
-          setView({ kind: 'workspace', workspace, options: target.directory ? undefined : { file: target.path.split(/[\\/]/).at(-1) } })
+          // A folder opens as a project; a file opens on its own.
+          const workspace = target.directory ? await home.open(target.path) : await home.openFile(target.path)
+          setView({ kind: 'workspace', workspace, options: workspace.file ? { file: workspace.file } : undefined })
           return
         } catch { /* fall through to the usual start */ }
       }

@@ -158,6 +158,7 @@ fn main() {
             ssh::ssh_debug_start,
             profile::profile_start,
             container::container_status,
+            projects::open_loose_file,
             container::container_up,
             container::container_stop,
             container::container_run,

@@ -398,18 +398,88 @@ function extractMethod(view: EditorView, notify: (message: string) => void) {
   })
 }
 
+// ---- Inline variable ----
+interface InlinePlan { name: string; expression: string; line: { from: number; to: number; number: number }; uses: { from: number; to: number }[] }
+
+function declarationOn(text: string, language: string): { indent: string; name: string; expression: string } | null {
+  const lower = language.toLowerCase()
+  const patterns: RegExp[] = lower === 'python' || lower === 'ruby' ? [/^(\s*)([A-Za-z_]\w*)\s*(?::[^=]+)?=(?!=)\s*(.+?)\s*$/]
+    : /javascript|typescript/.test(lower) ? [/^(\s*)(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)(?:\s*:[^=]+)?\s*=(?!=)\s*(.+?);?\s*$/]
+    : lower === 'java' || lower === 'c#' || lower === 'c++' ? [/^(\s*)(?:final\s+)?(?:[\w<>\[\],.?]+\s+)([A-Za-z_]\w*)\s*=(?!=)\s*(.+?);\s*$/]
+    : lower === 'kotlin' || lower === 'scala' ? [/^(\s*)(?:val|var)\s+([A-Za-z_]\w*)(?:\s*:[^=]+)?\s*=(?!=)\s*(.+?)\s*$/]
+    : lower === 'rust' ? [/^(\s*)let\s+(?:mut\s+)?([A-Za-z_]\w*)(?:\s*:[^=]+)?\s*=(?!=)\s*(.+?);\s*$/]
+    : lower === 'go' ? [/^(\s*)([A-Za-z_]\w*)\s*:=\s*(.+?)\s*$/] : []
+  for (const pattern of patterns) {
+    const match = pattern.exec(text)
+    if (match && !/^(return|if|for|while|else|elif|import|from|print)$/.test(match[2])) return { indent: match[1], name: match[2], expression: match[3] }
+  }
+  return null
+}
+
+function planInline(state: EditorState, language: string): InlinePlan | { problem: string } {
+  const doc = state.doc
+  const line = doc.lineAt(state.selection.main.head)
+  const found = declarationOn(line.text, language)
+  if (!found) return { problem: 'Put the caret on a line that sets a variable (name = value) to inline it.' }
+  const python = language.toLowerCase() === 'python' || language.toLowerCase() === 'ruby'
+  // Where the variable can be used: the rest of its block.
+  let end = doc.length
+  if (python) {
+    for (let number = line.number + 1; number <= doc.lines; number++) {
+      const row = doc.line(number)
+      if (row.text.trim() && /^\s*/.exec(row.text)![0].length < found.indent.length) { end = row.from; break }
+    }
+  } else {
+    let depth = 0
+    for (let at = line.to; at < doc.length; at++) {
+      const char = doc.sliceString(at, at + 1)
+      if (char === '{') depth++
+      else if (char === '}') { depth--; if (depth < 0) { end = at; break } }
+    }
+  }
+  const body = doc.sliceString(line.to, end)
+  const name = found.name
+  if (new RegExp('(?<![\\w.$])' + name + '\\s*(=(?!=)|\\+=|-=|\\*=|/=|%=|\\+\\+|--|:=)').test(body)) return { problem: name + ' is set again later, so it can’t be inlined safely.' }
+  const tree = treeOf(state)
+  const uses: { from: number; to: number }[] = []
+  for (const match of body.matchAll(new RegExp('(?<![\\w.$])' + name + '(?![\\w$])', 'g'))) {
+    const from = line.to + (match.index ?? 0)
+    if (/String|Comment/.test(tree.resolveInner(from, 1).name)) continue
+    // A property with the same name (obj.name) isn't this variable.
+    if (doc.sliceString(from - 1, from) === '.') continue
+    uses.push({ from, to: from + name.length })
+  }
+  if (!uses.length) return { problem: name + ' isn’t used after this line.' }
+  return { name, expression: found.expression, line: { from: line.from, to: Math.min(doc.length, line.to + 1), number: line.number }, uses }
+}
+
+function inlineVariable(view: EditorView, language: string, notify: (message: string) => void) {
+  const plan = planInline(view.state, language)
+  if ('problem' in plan) { notify(plan.problem); return }
+  // Wrap in brackets unless the value is a single name, call, literal or already bracketed.
+  const simple = /^([\w.$]+(\([^()]*\))?|\d[\w.]*|(['"`]).*\3|\(.*\)|\[.*\])$/.test(plan.expression)
+  const value = simple ? plan.expression : '(' + plan.expression + ')'
+  view.dispatch({
+    changes: [{ from: plan.line.from, to: plan.line.to }, ...plan.uses.map(use => ({ ...use, insert: value }))],
+    userEvent: 'input.refactor', scrollIntoView: true,
+  })
+  notify('Inlined ' + plan.name + (plan.uses.length > 1 ? ' in ' + plan.uses.length + ' places.' : '.'))
+}
+
 /** The refactorings Still offers here for this language. */
 export function builtInRefactors(view: EditorView, language: string, notify: (message: string) => void): Refactor[] {
   const state = view.state
   const items: Refactor[] = []
   if (declaration(language, 'x', 'y', false) && trimmed(state) && !extractVariableCheck(state, language)) items.push({ id: 'extract-variable', title: 'Extract variable…', run: () => extractVariable(view, language, notify) })
+  if (state.selection.main.empty && !('problem' in planInline(state, language))) items.push({ id: 'inline-variable', title: 'Inline variable', run: () => inlineVariable(view, language, notify) })
   if (language === 'Python' && !state.selection.main.empty && 'make' in planPythonMethod(state)) items.push({ id: 'extract-method', title: 'Extract function…', run: () => extractMethod(view, notify) })
   return items
 }
 
 /** Runs one refactoring by id (for its shortcut), explaining why when it can't. */
-export function runRefactor(view: EditorView, language: string, id: 'extract-variable' | 'extract-method', notify: (message: string) => void) {
-  if (id === 'extract-variable') extractVariable(view, language, notify)
+export function runRefactor(view: EditorView, language: string, id: 'extract-variable' | 'extract-method' | 'inline-variable', notify: (message: string) => void) {
+  if (id === 'inline-variable') inlineVariable(view, language, notify)
+  else if (id === 'extract-variable') extractVariable(view, language, notify)
   else if (language === 'Python') extractMethod(view, notify)
   else notify('Extract method comes from the language server for this kind of file; try Refactor… (' + language + ').')
 }

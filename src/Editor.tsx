@@ -153,6 +153,8 @@ const look = EditorView.theme({
   '.cm-sticky': { position: 'absolute', top: '0', left: '0', right: '0', zIndex: '6', overflow: 'hidden', background: 'var(--editor-solid, var(--editor))', boxShadow: '0 1px 0 var(--line), 0 6px 12px -10px var(--shadow)', fontFamily: 'var(--font-mono)', lineHeight: 'var(--editor-line-height)' },
   '.cm-sticky-line': { position: 'relative', zIndex: '1', display: 'flex', alignItems: 'center', cursor: 'pointer', whiteSpace: 'pre', overflow: 'hidden', background: 'var(--editor-solid, var(--editor))' },
   '.cm-sticky-line:last-child': { zIndex: '0' },
+  '.cm-rulers': { position: 'absolute', top: '0', left: '0', width: '0', pointerEvents: 'none', zIndex: '0' },
+  '.cm-ruler': { position: 'absolute', top: '0', bottom: '0', width: '0', borderLeft: '1px solid color-mix(in srgb, var(--ink) 9%, transparent)' },
   '.cm-sticky-line:hover': { background: 'var(--hover)' },
   '.cm-sticky-number': { flex: 'none', boxSizing: 'border-box', width: 'var(--sticky-left)', paddingRight: '26px', textAlign: 'right', color: 'var(--muted)', fontSize: '0.86em' },
   '.cm-sticky-code': { paddingLeft: '14px', overflow: 'hidden', textOverflow: 'ellipsis' },
@@ -285,6 +287,8 @@ export interface EditorOptions {
   spellCheck?: boolean
   /** Keep the enclosing function or class header at the top while scrolling inside it. */
   sticky?: boolean
+  /** Columns to draw a line guide at (empty for none). */
+  rulers?: number[]
   /** Show the language server's inlay hints. */
   inlayHints?: boolean
 }
@@ -332,6 +336,7 @@ function configure(options: EditorOptions, path: string): Extension {
     // A snippet's name then Tab expands it at once, like a live template, even before suggestions show.
     Prec.highest(keymap.of([{ key: 'Tab', run: view => completionStatus(view.state) === 'active' || hasNextSnippetField(view.state) ? false : expandSnippetBefore(view, snippetLanguage(path)) }])),
     stickyScroll(line => highlightToHtml(line, path.split('.').at(-1) ?? ''), options.sticky !== false),
+    options.rulers?.length ? lineGuides(options.rulers) : [],
     options.spellCheck !== false ? spellCheck(mode(path)?.name ?? (/\.(txt|text|rst)$/i.test(path) ? 'Plain Text' : ''), word => spellHook.add(word)) : [],
     EditorState.tabSize.of(options.tabSize),
     indentUnit.of(' '.repeat(options.tabSize)),
@@ -392,6 +397,35 @@ function indentColumns(text: string, unit: number) {
   }
   return { column, blank: true }
 }
+/** Line guides: a thin vertical line at a column (80, 100, 120…), like other editors' rulers. */
+function lineGuides(columns: number[]) {
+  return ViewPlugin.fromClass(class {
+    dom: HTMLDivElement
+    constructor(readonly view: EditorView) {
+      this.dom = document.createElement('div')
+      this.dom.className = 'cm-rulers'
+      this.dom.setAttribute('aria-hidden', 'true')
+      view.scrollDOM.appendChild(this.dom)
+      this.measure()
+    }
+    update(update: ViewUpdate) { if (update.geometryChanged || update.docChanged) this.measure() }
+    measure() {
+      this.view.requestMeasure({
+        read: view => {
+          const content = view.contentDOM
+          const style = getComputedStyle(content.querySelector('.cm-line') ?? content)
+          return { left: content.offsetLeft + (parseFloat(style.paddingLeft) || 0), char: view.defaultCharacterWidth, height: Math.max(view.scrollDOM.clientHeight, content.offsetHeight) }
+        },
+        write: ({ left, char, height }) => {
+          this.dom.style.height = height + 'px'
+          this.dom.innerHTML = columns.map(column => `<div class="cm-ruler" style="left:${left + column * char}px" title="${column} characters"></div>`).join('')
+        },
+      })
+    }
+    destroy() { this.dom.remove() }
+  })
+}
+
 const indentGuides = ViewPlugin.fromClass(class {
   decorations: DecorationSet
   constructor(view: EditorView) { this.decorations = this.build(view) }
@@ -778,7 +812,7 @@ export interface EditorHandle {
   /** Refactorings for the selection: Still's own (extract variable or function) and the language server's. */
   refactors: () => Promise<{ title: string; run: () => void | Promise<void> }[]>
   /** One of Still's refactorings by name, for its shortcut. */
-  refactor: (id: 'extract-variable' | 'extract-method') => void
+  refactor: (id: 'extract-variable' | 'extract-method' | 'inline-variable') => void
   /** Where the caret is on screen, for a menu beside it. */
   caretPoint: () => { x: number; y: number } | null
   text: () => string
@@ -882,7 +916,8 @@ function handleFor(editor: EditorView, path: string): EditorHandle {
         const line = doc.line(number)
         const match = /[ \t]+$/.exec(line.text)
         // Leave the line being typed on alone, so the caret doesn't jump back.
-        if (match && !(heads.has(number) && editor.hasFocus && line.text.trim())) changes.push({ from: line.from + match.index, to: line.to })
+        // Including an empty line you just indented with Tab: its indent stays until you leave it.
+        if (match && !heads.has(number)) changes.push({ from: line.from + match.index, to: line.to })
       }
       if (finalNewline && doc.length && doc.sliceString(doc.length - 1) !== '\n') changes.push({ from: doc.length, insert: '\n' })
       if (changes.length) editor.dispatch({ changes, userEvent: 'input.tidy' })
@@ -1112,7 +1147,7 @@ export default function Editor(props: Props) {
   useEffect(() => {
     view.current?.dispatch({ effects: configuration.reconfigure(configure(props.options, props.path)) })
   }, [options.wrap, options.lineNumbers, options.highlightLine, options.tabSize, options.autocomplete, options.occurrences, options.whitespace,
-    options.indentGuides, options.closeBrackets, options.scrollPastEnd, options.cursorBlink, options.folding, options.blameColumn, options.constructors, options.sticky, options.docTemplates, options.fStrings, options.continueComments, options.spellCheck])
+    options.indentGuides, options.closeBrackets, options.scrollPastEnd, options.cursorBlink, options.folding, options.blameColumn, options.constructors, options.sticky, options.docTemplates, options.fStrings, options.continueComments, options.spellCheck, (options.rulers ?? []).join()])
 
   useEffect(() => {
     const editor = view.current

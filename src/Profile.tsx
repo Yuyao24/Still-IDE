@@ -5,7 +5,12 @@ import { useMemo, useState } from 'react'
 import { Flame, Play } from 'lucide-react'
 import { Icon } from './ui'
 
+/** What tracemalloc found: the lines holding the most memory at the end, and the peak. */
+export interface MemoryData { kind: 'memory'; elapsed: number; current: number; peak: number; top: { file: string; line: number; size: number; count: number; mine: boolean; code: string }[] }
+const bytes = (value: number) => value >= 1048576 ? (value / 1048576).toFixed(1) + ' MB' : value >= 1024 ? (value / 1024).toFixed(1) + ' KB' : value + ' B'
+
 export interface ProfileData {
+  kind?: 'time'
   elapsed: number
   interval: number
   frames: { name: string; file: string; line: number; mine: boolean }[]
@@ -54,9 +59,40 @@ function hue(text: string) {
   return Math.abs(hash) % 40
 }
 
-export function ProfilePanel({ data, path, running, canRun, why, onRun, onOpen }: {
+export function ProfilePanel(props: {
+  data: ProfileData | MemoryData | null; path: string | null; running: boolean; canRun: boolean; why?: string
+  onRun: (memory: boolean) => void; onOpen: (file: string, line: number) => void
+}) {
+  if (props.data && 'kind' in props.data && props.data.kind === 'memory') return <MemoryPanel {...props} data={props.data} />
+  return <TimePanel {...props} data={props.data as ProfileData | null} />
+}
+
+function MemoryPanel({ data, path, running, canRun, onRun, onOpen }: { data: MemoryData; path: string | null; running: boolean; canRun: boolean; onRun: (memory: boolean) => void; onOpen: (file: string, line: number) => void }) {
+  const largest = Math.max(1, ...data.top.map(item => item.size))
+  return <div className="profile">
+    <div className="dbg-bar tests-bar">
+      <button className="text-btn" disabled={!canRun || running} onClick={() => onRun(false)}><Icon glyph={Play} size={12} />Time</button>
+      <button className="text-btn primary" disabled={!canRun || running} onClick={() => onRun(true)}><Icon glyph={Play} size={12} />Memory</button>
+      <span className="dbg-status">{running ? 'Running and recording allocations…' : `${path ?? ''} · peak ${bytes(data.peak)} · ${bytes(data.current)} still held at the end · ${data.elapsed.toFixed(2)} s`}</span>
+    </div>
+    <div className="profile-body">
+      <p className="flame-hover">Lines that allocated the memory still held when the program ended, largest first. Double-click a row to open the line.</p>
+      <table className="profile-table memory-table">
+        <thead><tr><th scope="col">Where</th><th scope="col">Code</th><th scope="col">Held</th><th scope="col">Blocks</th></tr></thead>
+        <tbody>{data.top.map((item, index) => <tr key={index} className={item.mine ? 'is-mine' : ''} onDoubleClick={() => onOpen(item.file, item.line)}>
+          <td>{item.file.split(/[\\/]/).slice(-2).join('/')}:{item.line}</td>
+          <td className="memory-code">{item.code}</td>
+          <td><span className="memory-bar" style={{ width: Math.max(2, item.size / largest * 64) + 'px' }} />{bytes(item.size)}</td>
+          <td>{item.count}</td>
+        </tr>)}</tbody>
+      </table>
+    </div>
+  </div>
+}
+
+function TimePanel({ data, path, running, canRun, why, onRun, onOpen }: {
   data: ProfileData | null; path: string | null; running: boolean; canRun: boolean; why?: string
-  onRun: () => void; onOpen: (file: string, line: number) => void
+  onRun: (memory: boolean) => void; onOpen: (file: string, line: number) => void
 }) {
   const tree = useMemo(() => data ? build(data) : null, [data])
   const [focus, setFocus] = useState<string | null>(null)
@@ -85,7 +121,8 @@ export function ProfilePanel({ data, path, running, canRun, why, onRun, onOpen }
   const shown = hover ? label(hover) : null
   return <div className="profile">
     <div className="dbg-bar tests-bar">
-      <button className="text-btn primary" disabled={!canRun || running} onClick={onRun}><Icon glyph={Play} size={12} />Profile this file</button>
+      <button className="text-btn primary" disabled={!canRun || running} onClick={() => onRun(false)}><Icon glyph={Play} size={12} />{data ? 'Time' : 'Profile this file'}</button>
+      <button className="text-btn" disabled={!canRun || running} onClick={() => onRun(true)}>Memory</button>
       {focus && <button className="text-btn" onClick={() => setFocus(null)}>Show everything</button>}
       <span className="dbg-status">
         {running ? 'Running under the profiler…' : !data ? (canRun ? 'Runs the file and samples where time goes, about every millisecond.' : why)

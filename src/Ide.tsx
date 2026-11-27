@@ -7,10 +7,10 @@ import {
   Check, Circle, CircleAlert, CodeXml, Columns2, Copy, FilePlus2, Files, FolderOpen, FolderPlus,
   FolderSearch, GitBranch, GitCompareArrows, GitPullRequestArrow, Hammer, House, Moon, Package,  Pencil, Play, Plus,
   RefreshCw, Rows2, Search, Server, Settings2, Square, SquareTerminal, Sun, TerminalSquare, Trash2, WrapText, X,
-  Camera, Eye, PenLine, LayoutGrid, Maximize2, Minimize2, Network, BookOpen, Sparkles, Bug, FlaskConical, ArrowLeftRight, AlignLeft, Flame, Wand2, Database as DatabaseIcon,
+  Camera, Eye, PenLine, LayoutGrid, Maximize2, Minimize2, Network, BookOpen, Sparkles, Bug, FlaskConical, ArrowLeftRight, AlignLeft, Flame, Wand2, Database as DatabaseIcon, FileText,
 } from 'lucide-react'
 import {
-  api, backups, clipboard, desktop, editorSupport, fileName, fileTemplate, history, type BlameLine, type FileCommit, fileSystem, home, mod, normalize, parentPath, pickFolder, ssh, textHash,
+  api, backups, clipboard, desktop, editorSupport, fileName, fileTemplate, history, type BlameLine, type FileCommit, fileSystem, home, mod, normalize, parentPath, pickFile, pickFolder, ssh, textHash,
   type Branches, type Change, type Commit, type Diagnostic, type Diff, type Entry, type GitStatus, type JobEvent, type Packages, type Runtimes,
   type SshHost, type SshOverview, type Workspace,
   tex, type TexResult,
@@ -26,7 +26,7 @@ import { PullRequests } from './PullRequests'
 import { GitGraph } from './GitGraph'
 import { MergeEditor, conflictCount } from './MergeEditor'
 import { spellHook } from './spell'
-import { ProfilePanel, type ProfileData } from './Profile'
+import { ProfilePanel, type MemoryData, type ProfileData } from './Profile'
 import { importUpdatesForMove, type ImportUpdate } from './imports'
 import { containers, type ContainerInfo } from './bridge'
 import { DatabasePanel } from './Database'
@@ -126,7 +126,8 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const [texResults, setTexResults] = useState<Record<string, TexResult>>({})
   const [texBusy, setTexBusy] = useState<string[]>([])
   const [cursor, setCursor] = useState<Cursor>({ line: 1, column: 1 })
-  const [sidebar, setSidebar] = useState<Side | null>('explorer')
+  // A single file opened on its own starts with just the editor.
+  const [sidebar, setSidebar] = useState<Side | null>(workspace.file ? null : 'explorer')
   const [lastSide, setLastSide] = useState<Side>('explorer')
   const [sideWidth, setSideWidth] = useState(() => storedSize('still.sidebar.width', 240))
   const [drawer, setDrawer] = useState<Drawer>('output')
@@ -137,6 +138,9 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const sessionsRef = useRef<TerminalSession[]>([])
   const [frame, setFrame] = useState({ width: window.innerWidth, height: window.innerHeight })
   const [directories, setDirectories] = useState<Record<string, Entry[]>>({})
+  /** For a single file on its own, the rest of its folder stays out of the way. */
+  const onlyLoose = (entries: Entry[]) => workspace.file ? entries.filter(entry => entry.path === workspace.file) : entries
+  const shownDirectories = useMemo(() => workspace.file ? { '': (directories[''] ?? []).filter(entry => entry.path === workspace.file) } : directories, [directories, workspace.file])
   const [expanded, setExpanded] = useState(new Set<string>())
   const [files, setFiles] = useState<Entry[]>([])
   const [status, setStatus] = useState(emptyStatus)
@@ -294,7 +298,13 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   // Prose (Markdown, text) wraps and skips indent guides and error checks.
   const optionsFor = (tab: Tab): EditorOptions => {
     const prose = !tab.diff && (docKind(tab.path) === 'markdown' || docKind(tab.path) === 'text')
-    return prose ? { ...editorOptions, wrap: true, indentGuides: false, errors: false } : editorOptions
+    if (prose) return { ...editorOptions, wrap: true, indentGuides: false, errors: false }
+    // The line guide: a set column, or the formatter's line length for this language.
+    const ext = tab.path.split('.').at(-1)?.toLowerCase() ?? ''
+    const column = settings.lineGuide === -1
+      ? (/^pyi?$/.test(ext) ? settings.pythonLineLength : /^(m?[jt]sx?|c[jt]s|css|scss|html|vue|json)$/.test(ext) ? settings.webPrintWidth : ext === 'java' ? 100 : ext === 'rs' ? 100 : ext === 'go' ? 0 : 80)
+      : settings.lineGuide
+    return column > 0 ? { ...editorOptions, rulers: [column] } : editorOptions
   }
   const host = remote ? [...(servers?.saved ?? []), ...(servers?.imported ?? [])].find(item => item.id === workspace.remote) : undefined
 
@@ -440,7 +450,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   async function refreshFiles(folders: Iterable<string> = latest.current.expanded, id = generation.current) {
     try {
       await Promise.all(['', ...folders].map(path => directory(path, id)))
-      if (!remote) { const result = await fs.files(); if (generation.current === id) setFiles(result) }
+      if (!remote) { const result = await fs.files(); if (generation.current === id) setFiles(onlyLoose(result)) }
       staleGraph()
     } catch (error) { if (generation.current === id) notify(error) }
   }
@@ -565,6 +575,20 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       }).catch(notify)
     }, 'Switch project?')
   }
+
+  /** Opens a single file on its own (its folder doesn't become a project). */
+  function chooseFile() {
+    leave(() => {
+      void pickFile('Open a file').then(async path => {
+        if (path) onSwitch(await home.openFile(path))
+      }).catch(notify)
+    }, 'Switch project?')
+  }
+  function openFolderAsProject() {
+    leave(() => { void home.open(workspace.root).then(onSwitch).catch(notify) }, 'Open the whole folder?')
+  }
+  // A single file opens in the editor straight away.
+  useEffect(() => { if (workspace.file) void openFile(workspace.file) }, [workspace.root, workspace.file])
 
   function approvalAndClose() {
     windowCloseApproved.current = true
@@ -1169,6 +1193,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
         'separator',
         item('Open file…', () => openPalette(''), mod + '+P'),
         item('Open folder…', chooseFolder, mod + '+O'),
+        item('Open file…', chooseFile, mod + '+Shift+O'),
         { label: 'Open recent', disabled: !recent.length, items: recent.length ? recent.map(project => item(project.name, () => leave(() => { void home.open(project.path).then(onSwitch).catch(notify) }, 'Switch project?'))) : [item('Nothing yet', () => {}, undefined, { disabled: true })] },
         'separator',
         item('Save', () => { void store(active).catch(notify) }, mod + '+S', { disabled: !active || !dirty(active) }),
@@ -1374,7 +1399,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     split: () => splitRight(), run: () => { void run() }, debug: () => { void startDebug() }, tests: () => { void runTests(null) },
     format: () => { void formatDocument() }, rename: () => { editor.current?.command('rename') }, definition: () => { void goToDefinition() },
     references: () => { editor.current?.command('references') }, quickfix: () => { void showQuickFixes() },
-    refactor: () => { void showRefactors() }, 'extract-variable': () => { editor.current?.refactor('extract-variable') }, 'extract-method': () => { editor.current?.refactor('extract-method') }, 'goto-line': () => { editor.current?.command('gotoLine') },
+    refactor: () => { void showRefactors() }, 'extract-variable': () => { editor.current?.refactor('extract-variable') }, 'extract-method': () => { editor.current?.refactor('extract-method') }, 'inline-variable': () => { editor.current?.refactor('inline-variable') }, 'goto-line': () => { editor.current?.command('gotoLine') },
     comment: () => { editor.current?.command('comment') }, terminal: () => { if (drawerOpen) setDrawerOpen(false); else showDrawer('terminal', true) },
     'side.files': () => showSide('explorer', true), 'side.search': () => showSide('search', true), 'side.git': () => { if (!remote) showSide('git', true) },
     commit: () => { if (!remote) { showSide('git'); if (commit.trim()) gitAction('commit') } }, push: () => { if (!remote) gitAction('push') }, pull: () => { if (!remote) gitAction('pull') },
@@ -1420,6 +1445,13 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     setMenu({ x: point.x, y: point.y, items: items.slice(0, 16).map(item => ({ label: item.title, action: () => { void Promise.resolve(item.run()).catch(notify) } })) })
   }
   useEffect(() => { refactorHook.notify = message => notify(message) })
+  const coveragePercents = useMemo(() => {
+    const coverage = testReport?.coverage
+    if (!coverage) return undefined
+    const result: Record<string, number> = {}
+    for (const [path, lines] of Object.entries(coverage)) { const total = lines.covered.length + lines.missed.length; if (total) result[path] = Math.round(lines.covered.length / total * 100) }
+    return result
+  }, [testReport])
   useEffect(() => {
     const open = (event: Event) => {
       const { x, y } = (event as CustomEvent<{ x: number; y: number }>).detail
@@ -1660,13 +1692,13 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   }
 
   // ---- Profiler: run a Python file under the sampler, then show the flame graph ----
-  const [profile, setProfile] = useState<{ data: ProfileData; path: string } | null>(null)
+  const [profile, setProfile] = useState<{ data: ProfileData | MemoryData; path: string } | null>(null)
   const [profiling, setProfiling] = useState(false)
   useEffect(() => {
     if (!desktop) return
     let stop: UnlistenFn | null = null, cancelled = false
     void listen<{ id: string; path: string; data: string }>('profile-result', ({ payload }) => {
-      try { setProfile({ data: JSON.parse(payload.data) as ProfileData, path: payload.path }) } catch (error) { notify(error) }
+      try { setProfile({ data: JSON.parse(payload.data) as ProfileData | MemoryData, path: payload.path }) } catch (error) { notify(error) }
       setProfiling(false)
       setDrawer('profile'); setDrawerOpen(true)
     }).then(unlisten => { if (cancelled) unlisten(); else stop = unlisten })
@@ -1674,12 +1706,12 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   }, [])
   useEffect(() => { if (!job) setProfiling(false) }, [job])
   const profileWhy = !desktop ? 'Profiling runs in the Still desktop app.' : remote ? 'Profiling works for projects on this computer for now.' : mode !== 'Python' ? 'Open a Python file to profile it.' : undefined
-  async function startProfile() {
+  async function startProfile(memory = false) {
     if (!active || profileWhy || activeJob.current) { if (profileWhy) notify(profileWhy); return }
     await store(active)
     setProfiling(true)
     setDrawer('profile'); setDrawerOpen(true)
-    await launch('run', 'profile', 'profile_start', { rootPath: workspace.root, path: active.path, args: runArgs[active.path] || null, env: runEnv[active.path] || null, dotenv: settings.loadDotEnv }, { path: active.path })
+    await launch('run', 'profile', 'profile_start', { rootPath: workspace.root, path: active.path, args: runArgs[active.path] || null, env: runEnv[active.path] || null, dotenv: settings.loadDotEnv, memory }, { path: active.path })
   }
   // Language servers: one per language in use, started when a file of that language is open.
   const [langServers, setLangServers] = useState<Record<string, LanguageServer | 'starting' | 'none'>>({})
@@ -2027,7 +2059,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     returnedFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
     setPalette(query)
     const id = generation.current
-    void fs.files().then(result => { if (generation.current === id) setFiles(result) }).catch(error => { if (!remote) notify(error) })
+    void fs.files().then(result => { if (generation.current === id) setFiles(onlyLoose(result)) }).catch(error => { if (!remote) notify(error) })
   }
 
   function closePalette() {
@@ -2140,7 +2172,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
       if (key === '`' || key === '~') { setDrawer('terminal'); setDrawerOpen(true); if (desktop) { remote ? remoteSession() : newSession() } }
       if (key === ',') onSettings()
       if (key === 's') void (event.shiftKey ? storeAll() : store(active)).catch(notify)
-      if (key === 'o') chooseFolder()
+      if (key === 'o') { if (event.shiftKey) chooseFile(); else chooseFolder() }
       if (key === 'enter') void run(event.shiftKey)
       if (key === 'b') { if (focusMode) setFocusMode(false); setSidebar(value => value ? null : lastSide) }
       if (key === 'j') {
@@ -2266,6 +2298,8 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const commands: PaletteItem[] = [
     { id: 'home', label: 'Go to Home', shortcut: mod + '+Shift+H', icon: House, action: goHome },
     { id: 'folder', label: 'Open folder', shortcut: mod + '+O', icon: FolderOpen, action: chooseFolder },
+    { id: 'open-file', label: 'Open a single file', shortcut: mod + '+Shift+O', icon: FileText, action: chooseFile },
+    ...(workspace.file ? [{ id: 'whole-folder', label: 'Open this file’s folder as a project', icon: FolderOpen, action: openFolderAsProject }] : []),
     { id: 'symbols', label: 'Go to symbol in project', shortcut: mod + '+T', icon: Search, action: () => openPalette('#') },
     ...(!remote ? [
       { id: 'stash', label: 'Git: stash changes', icon: GitBranch, action: stashChanges },
@@ -2281,9 +2315,10 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     ...(active && !active.diff && !active.binary ? [
       { id: 'refactor', label: 'Refactor…', icon: Wand2, action: () => { void showRefactors() } },
       { id: 'extract-variable', label: 'Extract variable…', icon: Wand2, action: () => { editor.current?.refactor('extract-variable') } },
+      { id: 'inline-variable', label: 'Inline variable', icon: Wand2, action: () => { editor.current?.refactor('inline-variable') } },
       ...(mode === 'Python' ? [{ id: 'extract-method', label: 'Extract function…', icon: Wand2, action: () => { editor.current?.refactor('extract-method') } }] : []),
     ] : []),
-    ...(!profileWhy ? [{ id: 'profile', label: 'Profile this file (flame graph)', icon: Flame, action: () => { void startProfile() } }] : []),
+    ...(!profileWhy ? [{ id: 'profile', label: 'Profile this file (flame graph)', icon: Flame, action: () => { void startProfile() } }, { id: 'profile-memory', label: 'Profile memory of this file', icon: Flame, action: () => { void startProfile(true) } }] : []),
     ...(!testsWhy ? [
       { id: 'tests-all', label: 'Run all tests', icon: FlaskConical, action: () => runTestsFrom('all') },
       { id: 'tests-file', label: 'Run the tests in this file', icon: FlaskConical, action: () => runTestsFrom('file') },
@@ -2598,7 +2633,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
           <IconButton glyph={X} label={'Hide the sidebar (' + mod + '+B)'} onClick={() => setSidebar(null)} className="side-close" />
         </nav>
         <div className="side-body" key={'side-' + shownSide}>
-        {shownSide === 'explorer' && <Explorer workspace={workspace} directories={directories} expanded={expanded} active={active?.path} changes={status} symbols={symbols}
+        {shownSide === 'explorer' && <Explorer workspace={workspace} directories={shownDirectories} expanded={expanded} active={active?.path} coverage={coveragePercents} changes={status} symbols={symbols}
           onOpen={path => { void openFile(path) }} onExpand={toggleFolder} onNew={() => newFile()} onNewFolder={() => newFolder()} onWorkspace={chooseFolder}
           onRefresh={() => { void refreshFiles(); reloadFromDisk() }} onJump={line => editor.current?.jump(line)} onContext={explorerMenu} onKey={explorerKey}
           onMove={(entry, folder) => { void moveEntry(entry, (folder ? folder + '/' : '') + entry.name) }} />}
@@ -2759,7 +2794,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
               files={async () => (await fs.files()).filter(item => !item.directory).map(item => item.path)} readFile={path => fs.read(path)} />
           </div>}
           {drawer === 'profile' && <ProfilePanel data={profile?.data ?? null} path={profile?.path ?? null} running={profiling} canRun={!profileWhy && !job} why={profileWhy}
-            onRun={() => { void startProfile() }} onOpen={(file, line) => { if (/^([A-Za-z]:)?[\\/]/.test(file)) notify('That function is in ' + file + ', outside the project.'); else jumpTo({ path: file, line }) }} />}
+            onRun={memory => { void startProfile(memory) }} onOpen={(file, line) => { if (/^([A-Za-z]:)?[\\/]/.test(file)) notify('That function is in ' + file + ', outside the project.'); else jumpTo({ path: file, line }) }} />}
           {drawer === 'tests' && <TestsPanel report={testReport} running={testsRunning} canRun={!testsWhy && !job} why={testsWhy} onRun={runTestsFrom} onJump={jumpToTest} coverage={settings.testCoverage} onCoverage={value => update({ testCoverage: value })}
             onRunId={id => { void runTests(id, id.includes('#') || id.endsWith('.java') || !/\.py(::|$)/.test(id) && testLanguage === 'java' ? 'java' : 'python') }}
             watch={testWatch} onWatch={value => { setTestWatch(value); if (value) notify('Watching: the tests run again each time you save.') }} />}
@@ -2854,7 +2889,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
     </FullView>}
     {fullView === 'files' && <FullView title="Files" project={workspace.name} onClose={() => { setFullView(null); requestAnimationFrame(() => editor.current?.focus()) }}>
       <div className="full-side island side">
-        <Explorer workspace={workspace} directories={directories} expanded={expanded} active={filePreview?.path ?? active?.path} changes={status} symbols={[]}
+        <Explorer workspace={workspace} directories={shownDirectories} expanded={expanded} active={filePreview?.path ?? active?.path} changes={status} symbols={[]}
           onOpen={path => { void fs.read(path).then(text => setFilePreview({ path, text })).catch(notify) }} onExpand={toggleFolder} onNew={() => newFile()} onNewFolder={() => newFolder()} onWorkspace={chooseFolder}
           onRefresh={() => { void refreshFiles(); reloadFromDisk() }} onJump={() => {}} onContext={explorerMenu} onKey={explorerKey}
           onMove={(entry, folder) => { void moveEntry(entry, (folder ? folder + '/' : '') + entry.name) }} />
