@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent } from 'react'
 import { listen } from '@tauri-apps/api/event'
-import { Copy, Ellipsis, FolderOpen, FolderSearch, Moon, Pin, PinOff, Server, Sun, Trash2, X } from 'lucide-react'
+import { Copy, Ellipsis, FolderOpen, FolderSearch, Moon, Pin, PinOff, Sun, Trash2, X } from 'lucide-react'
 import {
   type HomeState, type JobEvent, type ProjectSummary, type SshHost, type SshOverview, type Workspace,
   api, demo, desktop, forgetProject, home, hostLabel, mod, pickFile, pickFolder, recentFiles, ssh, type RecentFile,
@@ -46,9 +46,6 @@ export default function Home(props: Props) {
   const [connecting, setConnecting] = useState(false)
   const [menu, setMenu] = useState<MenuState | null>(null)
   const [showAll, setShowAll] = useState(false)
-  const [cloneUrl, setCloneUrl] = useState('')
-  const [connectTarget, setConnectTarget] = useState('')
-  const [newName, setNewName] = useState('')
   const [deleting, setDeleting] = useState<ProjectSummary | null>(null)
   const filterInput = useRef<HTMLInputElement>(null)
   const list = useRef<HTMLDivElement>(null)
@@ -182,136 +179,113 @@ export default function Home(props: Props) {
     void api.git(latest.path).then(result => { if (live) setChanged(result.changes.length) }).catch(() => {})
     return () => { live = false }
   }, [latest?.path])
-  // The rows under the box: Continue first, then projects; or, while typing, matching projects plus
-  // "Clone …", "Connect to …" and "New project …" when the text looks like one of those.
-  const [picked, setPicked] = useState(0)
-  interface LaunchRow { key: string; kind: string; label: string; name: string; detail: string; project?: ProjectSummary; missing?: boolean; run: () => void }
-  const projectRow = (project: ProjectSummary): LaunchRow => ({
-    key: project.path, kind: 'project', label: '', name: project.name, project, missing: project.missing,
-    detail: project.missing ? 'missing' : [project.location === 'external' ? shortPath(project.path, homeDir) : '', project.languages.slice(0, 2).join(', '), project.lastOpened ? relativeTime(project.lastOpened).toLowerCase() : ''].filter(Boolean).join(' · '),
-    run: () => { if (!project.missing) void open(project.path) },
-  })
-  const fileRow = (item: RecentFile): LaunchRow => {
-    const parts = item.path.split(/[\\/]/)
-    return { key: 'file:' + item.path, kind: 'file', label: 'File', name: parts.at(-1) ?? item.path, detail: [shortPath(parts.slice(0, -1).join(item.path.includes('\\') ? '\\' : '/'), homeDir), relativeTime(item.time).toLowerCase()].filter(Boolean).join(' · '), run: () => { void openLoose(item.path) } }
-  }
-  const typed = filter.trim()
-  const gitUrl = /^(https?:\/\/\S+|git@\S+:\S+|ssh:\/\/\S+)$/.test(typed) && (typed.endsWith('.git') || /github|gitlab|bitbucket|git@/.test(typed))
-  const sshTarget = !gitUrl && /^[^@\s/]+@[^\s/:]+(:\d+)?$/.test(typed)
-  const launchRows: LaunchRow[] = typed ? [
-    ...(gitUrl ? [{ key: 'clone', kind: 'action', label: 'Clone', name: typed.replace(/^https?:\/\//, '').replace(/\.git$/, ''), detail: 'into your projects folder', run: () => { setCloneUrl(typed); setCloning(true) } }] : []),
-    ...(sshTarget ? [{ key: 'ssh', kind: 'action', label: 'Connect', name: typed, detail: 'browse its folders', run: () => { setConnectTarget(typed); setConnecting(true) } }] : []),
-    ...filtered.slice(0, 8).map(projectRow),
-    ...loose.filter(item => item.path.toLowerCase().includes(typed.toLowerCase())).slice(0, 4).map(fileRow),
-    ...(!gitUrl && !sshTarget && !/[<>:"/\\|?*]/.test(typed) && !projects.some(project => project.name.toLowerCase() === typed.toLowerCase())
-      ? [{ key: 'new', kind: 'action', label: 'New project', name: typed, detail: 'create it in your projects folder', run: () => { setNewName(typed); setCreating(true) } }] : []),
-  ] : [
-    ...(latest ? [{ ...projectRow(latest), key: 'continue', kind: 'continue', label: 'Continue', detail: [resume ? resume.path.split('/').at(-1) + ', line ' + resume.line : '', changed ? changed + ' changed' : '', relativeTime(latest.lastOpened).toLowerCase()].filter(Boolean).join(' · '), run: () => { void open(latest.path, resume ?? undefined) } }] : []),
-    ...(showAll ? filtered : filtered.slice(0, 7)).filter(project => project.path !== latest?.path).map(projectRow),
-    ...loose.slice(0, 4).map(fileRow),
-  ]
   const todays = entries.filter(entry => sameDay(entry.time, Date.now())).slice(-3).reverse()
+  const fileRow = (item: RecentFile) => {
+    const parts = item.path.split(/[\\/]/)
+    return <div key={item.path} className="calm-row">
+      <button className="project-open" onClick={() => { void openLoose(item.path) }} title={item.path} onKeyDown={rowKey}>
+        <span className="calm-name">{parts.at(-1)}</span>
+        <span className="calm-meta">{[shortPath(parts.slice(0, -1).join(item.path.includes('\\') ? '\\' : '/'), homeDir), relativeTime(item.time).toLowerCase()].filter(Boolean).join(' · ')}</span>
+      </button>
+      <IconButton glyph={X} label={'Remove ' + parts.at(-1) + ' from recent files'} className="row-action" onClick={() => { recentFiles.remove(item.path); setLoose(recentFiles.list()) }} />
+    </div>
+  }
+  const files = term ? loose.filter(item => item.path.toLowerCase().includes(term)) : loose
 
   return <div className="app home-app">
     <TitleBar onError={props.notify}
       left={<span className="brand"><img src={mark} alt="" /><span className="brand-word">Still</span></span>}
-      right={<button className="quiet-link" onClick={() => props.onSettings()}>Settings</button>} />
+      right={<>
+        <label className="paper-search">
+          <input ref={filterInput} value={filter} onChange={event => setFilter(event.target.value)} placeholder="Search" aria-label="Search projects" spellCheck={false}
+            onKeyDown={event => {
+              if (event.key === 'Escape') { setFilter(''); event.currentTarget.blur() }
+              if (event.key === 'Enter' && filtered[0] && !filtered[0].missing) void open(filtered[0].path)
+              if (event.key === 'ArrowDown') { event.preventDefault(); list.current?.querySelector<HTMLButtonElement>('.project-open')?.focus() }
+            }} />
+          {!filter && <kbd>{mod}+K</kbd>}
+        </label>
+        <IconButton glyph={theme.kind === 'dark' ? Sun : Moon} label={theme.kind === 'dark' ? 'Light theme' : 'Dark theme'} onClick={props.onToggleTheme} />
+        <button className="quiet-link" onClick={() => props.onSettings()}>Settings</button>
+      </>} />
 
-    <main className="home launch studio">
-      <div className="studio-page">
-        <div className="studio-column">
-          {/* The project you were in, large; Continue takes you back to the file and line. */}
-          <header className="studio-hero">
-            <p className="studio-kicker">{new Date().toLocaleDateString([], { weekday: 'long', day: 'numeric', month: 'long' })} · {greeting()}{latest ? ' · last open ' + relativeTime(latest.lastOpened).toLowerCase() : ''}</p>
-            {latest && !term ? <>
-              <h1 className="studio-title" title={latest.path}>{latest.name}</h1>
-              <div className={'studio-continue launch-row is-continue' + (picked === 0 ? ' is-picked' : '')} onMouseEnter={() => setPicked(0)} onContextMenu={event => showMenu(event, projectMenu(latest))}>
-                <button className="studio-go project-open" onClick={() => { void open(latest.path, resume ?? undefined) }}>Continue <kbd>↵</kbd></button>
-                <span className="studio-meta">
-                  {[resume ? resume.path + ':' + resume.line : '', latest.languages.slice(0, 2).join(', ')].filter(Boolean).join(' · ')}
-                  {changed ? <> · <span className="studio-changed">{changed} changed</span></> : null}
-                </span>
-                <IconButton glyph={Ellipsis} label={'Actions for ' + latest.name} className="row-action" onClick={event => showMenu(event, projectMenu(latest), true)} />
-              </div>
-            </> : <h1 className="studio-title">{term ? 'Find' : greeting() + '.'}</h1>}
-          </header>
-
-          {state && !state.projectsRoot && desktop && <section className="setup-card">
-            <div>
-              <h2>Where should your projects live?</h2>
-              <p>Still keeps new projects in one folder so they are easy to find. You can still create or open individual projects anywhere, and uninstalling Still never touches them.</p>
-            </div>
-            <div className="setup-actions">
-              <button className="paper-btn primary" onClick={() => { void chooseRoot(state.suggestedRoot) }}>Use {shortPath(state.suggestedRoot, homeDir)}</button>
-              <button className="paper-btn" onClick={() => { void chooseRoot() }}>Choose folder…</button>
-            </div>
-          </section>}
-
-          {/* One box for everything: find a project, paste a Git URL to clone, or type user@host to connect. */}
-          <div className="launch-box">
-            <input ref={filterInput} value={filter} onChange={event => { setFilter(event.target.value); setPicked(0) }} spellCheck={false} autoFocus
-              placeholder="Open a project, paste a Git URL, or type user@host" aria-label="Open a project, clone a repository or connect to a server"
-              onKeyDown={event => {
-                if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); setPicked(value => Math.max(0, Math.min(launchRows.length - 1, value + (event.key === 'ArrowDown' ? 1 : -1)))) }
-                else if (event.key === 'Enter') { event.preventDefault(); launchRows[picked]?.run() }
-                else if (event.key === 'Escape') { setFilter(''); setPicked(0) }
-              }} />
-            <kbd>{mod}+K</kbd>
+    <main className="home" onKeyDown={rowKey}>
+      <div className="paper">
+        <header className="paper-hero">
+          <h1>{greeting()}.</h1>
+          <p>Pick up where you left off, or start something new.</p>
+          <div className="paper-actions">
+            <button className="paper-btn primary" onClick={() => setCreating(true)} title={'New project (' + mod + '+N)'}>New project</button>
+            <button className="calm-action" onClick={() => { void openFolder() }} title={'Open folder (' + mod + '+O)'}>Open folder</button>
+            <button className="calm-action" onClick={() => { void openFile() }} title={'Open a single file (' + mod + '+Shift+O)'}>Open file</button>
+            <button className="calm-action" onClick={() => desktop ? setCloning(true) : props.notify('Cloning is available in the Still desktop app.')}>Clone</button>
+            <button className="calm-action" onClick={() => desktop ? setConnecting(true) : props.notify('SSH is available in the Still desktop app.')}>Connect to server</button>
           </div>
+        </header>
 
-          {(term || launchRows.some(row => row.kind !== 'continue') || !latest) && <section className="studio-projects">
-            <h2 className="contents-heading">{term ? 'Results' : 'Projects'}</h2>
-            <div className="launch-list studio-grid" ref={list} role="listbox" aria-label="Projects and actions">
-              {launchRows.map((row, index) => row.kind === 'continue' ? null :
-                <div key={row.key} role="option" aria-selected={index === picked} className={'launch-row studio-card' + (index === picked ? ' is-picked' : '') + (row.kind === 'action' ? ' is-action' : '') + (row.missing ? ' missing' : '')}
-                  onMouseEnter={() => setPicked(index)} onContextMenu={row.project ? event => showMenu(event, projectMenu(row.project!)) : undefined}>
-                  <button className="project-open" onClick={row.run} disabled={row.missing}>
-                    {(row.kind === 'action' || row.kind === 'file') && <span className="launch-kind">{row.label}</span>}
-                    <span className="launch-name">{row.name}{row.project?.pinned && <Icon glyph={Pin} size={11} className="project-pin" />}</span>
-                    <span className="launch-detail">{row.detail}</span>
-                  </button>
-                  {row.project && <IconButton glyph={Ellipsis} label={'Actions for ' + row.name} className="row-action" onClick={event => showMenu(event, projectMenu(row.project!), true)} />}
-                </div>)}
-              {state && !launchRows.some(row => row.kind !== 'continue') && <p className="calm-quiet">{term ? <>Nothing matches “{filter}”. Press Enter to create a project with that name.</> : latest ? null : <>No projects yet. <button className="link" onClick={() => setCreating(true)}>Create one</button>, or try the Orbit Lab sample from New project.</>}</p>}
+        {state && !state.projectsRoot && desktop && <section className="setup-card">
+          <div>
+            <h2>Where should your projects live?</h2>
+            <p>Still keeps new projects in one folder so they are easy to find. You can still create or open individual projects anywhere, and uninstalling Still never touches them.</p>
+          </div>
+          <div className="setup-actions">
+            <button className="paper-btn primary" onClick={() => { void chooseRoot(state.suggestedRoot) }}>Use {shortPath(state.suggestedRoot, homeDir)}</button>
+            <button className="paper-btn" onClick={() => { void chooseRoot() }}>Choose folder…</button>
+          </div>
+        </section>}
+
+        {latest && !term && <section className="calm-continue">
+          <button onClick={() => { void open(latest.path, resume ?? undefined) }} onContextMenu={event => showMenu(event, projectMenu(latest))}>
+            <span className="calm-label">Continue</span>
+            <b>{latest.name}</b>
+            <span className="calm-where">{[resume ? resume.path.split('/').at(-1) + ', line ' + resume.line : '', relativeTime(latest.lastOpened).toLowerCase()].filter(Boolean).join(' · ')}{changed ? <em> · {changed} changed</em> : null}</span>
+          </button>
+        </section>}
+
+        <section className="calm-grid">
+          <div ref={list} className="calm-projects">
+            <div className="calm-head">
+              <h2>{term ? 'Matching projects' : 'Projects'}</h2>
+              {!term && <span className="calm-sort">
+                <button className={sort === 'recent' ? 'is-active' : ''} onClick={() => setSort('recent')}>Recent</button>
+                <button className={sort === 'name' ? 'is-active' : ''} onClick={() => setSort('name')}>Name</button>
+              </span>}
             </div>
-          </section>}
-
-          <nav className="launch-actions studio-actions" aria-label="Start something">
-            <button onClick={() => setCreating(true)}>+ New project <kbd>{mod}+N</kbd></button>
-            <button onClick={() => { void openFolder() }}>Open folder <kbd>{mod}+O</kbd></button>
-            <button onClick={() => { void openFile() }}>Open file <kbd>{mod}+Shift+O</kbd></button>
-            <button onClick={() => desktop ? setCloning(true) : props.notify('Cloning is available in the Still desktop app.')}>Clone a repository</button>
-            <button onClick={() => desktop ? setConnecting(true) : props.notify('SSH is available in the Still desktop app.')}>Connect to server</button>
-            {!term && projects.length > 7 && <button onClick={() => setShowAll(value => !value)}>{showAll ? 'Fewer projects' : 'All ' + projects.length + ' projects'}</button>}
-          </nav>
-        </div>
-
-        {!term && <aside className="contents-margin studio-margin" aria-label="Today and servers">
-          {todays.length > 0 && <section className="launch-today">
-            <span className="calm-label">Today</span>
+            <div className="calm-list">
+              {(showAll || term ? filtered : filtered.slice(0, 7)).map(row)}
+              {state && !filtered.length && <p className="calm-quiet">
+                {term ? <>No projects match “{filter}”.</> : <>No projects yet. <button className="link" onClick={() => setCreating(true)}>Create one</button>, or try the Orbit Lab sample from New project.</>}
+              </p>}
+            </div>
+            {!term && filtered.length > 7 && <button className="calm-more" onClick={() => setShowAll(value => !value)}>{showAll ? 'Fewer' : 'All ' + filtered.length + ' projects'}</button>}
+            {state?.projectsRoot && !term && <button className="calm-root" onClick={event => showMenu(event, [
+              { label: 'Change projects folder…', icon: FolderOpen, action: () => { void chooseRoot() } },
+              { label: 'Reveal in file manager', icon: FolderSearch, action: () => { void home.reveal(state.projectsRoot!).catch(props.notify) } },
+            ], true)} title={state.projectsRoot}>{shortPath(state.projectsRoot, homeDir)}</button>}
+            {files.length > 0 && <>
+              <div className="calm-head calm-files-head"><h2>Files</h2></div>
+              <div className="calm-list">{files.slice(0, 5).map(fileRow)}</div>
+            </>}
+          </div>
+          {!term && <div className="calm-journal">
+            <div className="calm-head"><h2>Today</h2></div>
             {todays.map(entry => <button key={entry.id} className="calm-entry" onClick={() => { void open(entry.root, entry.path ? { path: entry.path, line: 1, time: entry.time } : undefined) }} title={entry.project}>
               <time>{clock(entry.time)}</time><span>{entryText(entry)}</span>
             </button>)}
             <button className="calm-more" onClick={() => setJournal(true)}>Open journal</button>
-          </section>}
-          {desktop && hosts.length > 0 && <section className="launch-today contents-servers">
-            <span className="calm-label">Servers</span>
-            {hosts.slice(0, 5).map(host => <button key={host.id} className="calm-entry" onClick={() => setRemoteHost(host)} title={hostLabel(host)}>
-              <Icon glyph={Server} size={12} /><span>{host.name}</span>
-            </button>)}
-          </section>}
-        </aside>}
+          </div>}
+        </section>
       </div>
     </main>
 
     {deleting && <DeleteProjectDialog project={deleting} onClose={() => setDeleting(null)} onDeleted={() => { setDeleting(null); void refresh(); props.notify('Moved ' + deleting.name + ' to the trash.') }} notify={props.notify} />}
-    {creating && <NewProjectDialog initialName={newName} root={state?.projectsRoot ?? null} homeDir={homeDir} onClose={() => { setCreating(false); setNewName('') }} notify={props.notify}
+    {creating && <NewProjectDialog root={state?.projectsRoot ?? null} homeDir={homeDir} onClose={() => setCreating(false)} notify={props.notify}
       onChooseRoot={() => { void chooseRoot() }} onCreated={(workspace, options) => {
         setCreating(false)
         if (settings.journal) journal.add({ kind: 'create', project: workspace.name, root: workspace.root, text: 'Created ' + workspace.name })
         props.onOpen(workspace, options)
       }} />}
-    {cloning && <CloneDialog initialUrl={cloneUrl} root={state?.projectsRoot ?? null} homeDir={homeDir} onClose={() => { setCloning(false); setCloneUrl('') }}
+    {cloning && <CloneDialog root={state?.projectsRoot ?? null} homeDir={homeDir} onClose={() => setCloning(false)}
       onCloned={path => {
         setCloning(false)
         if (settings.journal) journal.add({ kind: 'clone', project: path.split(/[\\/]/).filter(Boolean).at(-1) ?? path, root: path, text: 'Cloned ' + (path.split(/[\\/]/).filter(Boolean).at(-1) ?? path) })
@@ -320,7 +294,7 @@ export default function Home(props: Props) {
     {journalOpen && <JournalSheet onClose={() => setJournal(false)} onOpen={entry => { setJournal(false); void open(entry.root, entry.path ? { path: entry.path, line: 1, time: entry.time } : undefined) }} />}
     {editingHost && <HostDialog host={editingHost} onClose={() => setEditingHost(null)} onSaved={host => { void refresh(); setRemoteHost(host) }} />}
     {remoteHost && <OpenRemoteDialog host={remoteHost} onClose={() => setRemoteHost(null)} onOpen={path => props.onOpenRemote(remoteHost, path)} />}
-    {connecting && <ConnectDialog initial={connectTarget} hosts={hosts} onClose={() => { setConnecting(false); setConnectTarget(''); void refresh() }} onOpen={props.onOpenRemote} onAdvanced={host => { setConnecting(false); setEditingHost(host) }} />}
+    {connecting && <ConnectDialog hosts={hosts} onClose={() => { setConnecting(false); void refresh() }} onOpen={props.onOpenRemote} onAdvanced={host => { setConnecting(false); setEditingHost(host) }} />}
     {menu && <Menu {...menu} onClose={() => setMenu(null)} />}
   </div>
 }

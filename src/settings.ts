@@ -111,8 +111,7 @@ export interface Settings {
   backgroundFade: number
   backgroundTint: string
   backgroundTintStrength: number
-  /** Experimental: how surfaces are drawn, and how much of the background shows through them. */
-  surfaceStyle: 'paper' | 'frosted' | 'liquid'
+  /** How much of the desktop (or the background picture) shows through the panels, 0–100. */
   translucency: number
   lintWithRuff: boolean
   /** Start Pyright, jdtls, typescript-language-server and others when they're installed. */
@@ -217,7 +216,6 @@ export const defaults: Settings = {
   backgroundFade: 55,
   backgroundTint: '#7c6f64',
   backgroundTintStrength: 0,
-  surfaceStyle: 'paper',
   translucency: 0,
   lintWithRuff: true,
   languageServers: true,
@@ -302,11 +300,12 @@ export function applySettings(settings: Settings, systemDark: boolean) {
   root.setProperty('--ligatures', settings.ligatures ? 'contextual common-ligatures' : 'none')
   root.setProperty('--font-features', settings.ligatures ? '"liga" 1, "calt" 1' : '"liga" 0, "calt" 0')
   const classes = document.documentElement.classList
-  // Experimental surfaces: a background picture, glass, and see-through panels.
-  const backdrop = Boolean(settings.backgroundImage) || settings.translucency > 0 || settings.surfaceStyle !== 'paper'
+  // A background picture, and a see-through window (the desktop and other windows show behind Still).
+  const seeThrough = settings.translucency > 0 && Boolean((window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__)
+  const backdrop = Boolean(settings.backgroundImage) || seeThrough
   classes.toggle('has-backdrop', backdrop)
-  classes.toggle('surface-frosted', settings.surfaceStyle === 'frosted')
-  classes.toggle('surface-liquid', settings.surfaceStyle === 'liquid')
+  classes.toggle('has-picture', Boolean(settings.backgroundImage))
+  classes.toggle('see-through', seeThrough)
   const resolved = resolveTheme(theme).colors
   classes.toggle('theme-dark', theme.kind === 'dark')
   const solid = resolved.editor
@@ -316,9 +315,8 @@ export function applySettings(settings: Settings, systemDark: boolean) {
   root.setProperty('--backdrop-tint', settings.backgroundTint || '#000000')
   root.setProperty('--backdrop-tint-strength', String(Math.max(0, Math.min(100, settings.backgroundTintStrength)) / 100))
   if (backdrop) {
-    // Panels let the background through: glass needs a little even at no translucency.
-    const glass = settings.surfaceStyle === 'paper' ? 0 : 18
-    const alpha = Math.max(18, 100 - Math.max(settings.translucency, glass))
+    // Panels let the picture or the desktop through, as much as the slider says (never all the way, so text stays readable).
+    const alpha = Math.max(15, 100 - (seeThrough || settings.backgroundImage ? settings.translucency : 0))
     for (const key of ['editor', 'panel', 'rail', 'bar', 'drawer'] as const) root.setProperty('--' + key, `color-mix(in srgb, ${resolved[key] ?? solid} ${alpha}%, transparent)`)
   }
   classes.toggle('smooth-caret', settings.smoothCaret)

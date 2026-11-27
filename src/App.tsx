@@ -156,7 +156,7 @@ export default function App() {
   const openSettings = (section?: SettingsSection) => setSettingsSection(section ?? settingsSection ?? 'appearance')
 
   return <SettingsContext.Provider value={context}>
-    {(settings.backgroundImage || settings.translucency > 0 || settings.surfaceStyle !== 'paper') && <div className="backdrop" aria-hidden="true" />}
+    {settings.backgroundImage && <div className="backdrop" aria-hidden="true" />}
     {view.kind === 'home'
       ? <Home onOpen={(workspace, options) => setView({ kind: 'workspace', workspace, options })} onOpenRemote={openRemote}
           onSettings={section => openSettings(section as SettingsSection | undefined)} onToggleTheme={toggleTheme} notify={notify} />

@@ -148,9 +148,9 @@ function Experimental({ notify }: { notify: (message: unknown) => void }) {
   const { settings, update } = useSettings()
   const input = useRef<HTMLInputElement>(null)
   return <section className="settings-group">
-    <h3>Experimental</h3>
+    <h3>Background and transparency</h3>
     <div className="setting-row">
-      <span className="setting-text"><span>Background picture</span><small>A picture behind the whole window. Panels let it show through when they're see-through or glass.</small></span>
+      <span className="setting-text"><span>Background picture</span><small>A picture behind the whole window. Window transparency lets it show through the panels.</small></span>
       <span className="setting-actions">
         {settings.backgroundImage && <span className="setting-thumb" style={{ backgroundImage: `url("${settings.backgroundImage}")` }} />}
         <button className="text-btn" onClick={() => input.current?.click()}>{settings.backgroundImage ? 'Change…' : 'Choose…'}</button>
@@ -170,9 +170,7 @@ function Experimental({ notify }: { notify: (message: unknown) => void }) {
       </div>
       <Slider label="Tint strength" value={settings.backgroundTintStrength} onChange={value => update({ backgroundTintStrength: value })} />
     </>}
-    <div className="setting-row"><span className="setting-text"><span>Surfaces</span><small>Paper is flat and calm. Frosted glass blurs what's behind panels; liquid glass adds a bright rim and rounder corners.</small></span>
-      <Segmented label="Surfaces" value={settings.surfaceStyle} onChange={value => update({ surfaceStyle: value })} options={[{ value: 'paper', label: 'Paper' }, { value: 'frosted', label: 'Frosted' }, { value: 'liquid', label: 'Liquid' }]} /></div>
-    <Slider label="See-through panels" description="Lets the background show through the editor and panels, like a translucent browser." value={settings.translucency} onChange={value => update({ translucency: value })} />
+    <Slider label="Window transparency" description={desktop ? 'Lets your wallpaper and the windows behind Still show through the whole app. Menus and dialogs stay solid so they are easy to read.' : 'Lets your wallpaper show through the whole app. Available in the Still desktop app.'} value={settings.translucency} onChange={value => update({ translucency: value })} />
   </section>
 }
 

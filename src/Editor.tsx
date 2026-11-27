@@ -99,6 +99,9 @@ const look = EditorView.theme({
   '.cm-refactor-check': { display: 'flex', alignItems: 'center', gap: '4px', color: 'var(--secondary)' },
   '.cm-refactor-check input': { accentColor: 'var(--ink)' },
   '.cm-lsp-message-error': { color: 'var(--red)' },
+  // Gutters keep one width while scrolling (it depends on the file, never on which lines are on screen).
+  '.cm-tests': { width: '0', overflow: 'hidden' },
+  '&.has-tests .cm-tests': { width: '18px' },
   '.cm-tests .cm-gutterElement': { padding: '0 2px 0 4px', cursor: 'pointer' },
   '.cm-test-marker': { display: 'inline-block', width: '12px', textAlign: 'center', fontSize: '10px', fontFamily: 'var(--font-sans)', color: 'var(--green)' },
   '.cm-test-marker.is-idle': { color: 'var(--muted)' },
@@ -122,7 +125,9 @@ const look = EditorView.theme({
   '.cm-breakpoint': { width: '8px', height: '8px', borderRadius: '50%', background: 'var(--red)' },
   '.cm-breakpoint.is-condition': { background: 'transparent', boxShadow: 'inset 0 0 0 2px var(--red)' },
   '.cm-breakpoint.is-log': { borderRadius: '0', transform: 'rotate(45deg) scale(.85)', background: 'var(--amber)' },
-  '.cm-coverage .cm-gutterElement': { padding: '0' },
+  '.cm-coverage': { width: '0', overflow: 'hidden' },
+  '&.has-coverage .cm-coverage': { width: '5px' },
+  '.cm-coverage .cm-gutterElement': { padding: '0 0 0 2px' },
   '.cm-covered, .cm-missed': { width: '3px', height: '100%', minHeight: '1em' },
   '.cm-covered': { background: 'color-mix(in srgb, var(--green) 55%, transparent)' },
   '.cm-missed': { background: 'color-mix(in srgb, var(--red) 60%, transparent)' },
@@ -143,8 +148,8 @@ const look = EditorView.theme({
   '.cm-lint-marker': { width: '7px', height: '7px', borderRadius: '0', content: 'none' },
   '.cm-lint-marker-error': { content: 'none', background: 'var(--red)' },
   '.cm-lint-marker-warning': { content: 'none', background: 'var(--amber)' },
-  '.cm-gutter-changes': { width: '3px', marginLeft: '4px' },
-  '.cm-gutter-changes .cm-gutterElement': { padding: '0', cursor: 'pointer' },
+  '.cm-gutter-changes': { width: '7px' },
+  '.cm-gutter-changes .cm-gutterElement': { padding: '0 0 0 4px', cursor: 'pointer' },
   '.cm-change': { width: '3px', height: '100%' },
   '.cm-change-add': { background: 'var(--green)' },
   '.cm-change-mod': { background: 'var(--amber)' },
@@ -194,7 +199,8 @@ const look = EditorView.theme({
   '.cm-searchMatch-selected': { outline: '1px solid var(--accent)' },
   '.cm-button, .cm-textfield': { background: 'var(--editor)', color: 'var(--ink)', border: '1px solid var(--line)', borderRadius: '0', backgroundImage: 'none' },
   '.cm-panel.cm-search label': { color: 'var(--secondary)' },
-  '.cm-gutter-lint': { minWidth: '9px' },
+  '.cm-gutter-lint': { width: '14px' },
+  '.cm-gutter-lint .cm-gutterElement': { padding: '0', display: 'flex', alignItems: 'center', justifyContent: 'center' },
   '.cm-foldPlaceholder': { background: 'var(--hover)', border: '1px solid var(--line)', color: 'var(--muted)' },
   '.cm-deletedChunk': { background: 'color-mix(in srgb, var(--red) 12%, var(--editor))', color: 'var(--ink)' },
   '.cm-insertedLine, .cm-changedLine': { background: 'color-mix(in srgb, var(--green) 10%, var(--editor))' },
@@ -315,7 +321,7 @@ function completionFor(path: string, whileTyping: boolean) {
   return autocompletion({
     activateOnTyping: whileTyping, defaultKeymap: false, icons: true, maxRenderedOptions: 40,
     addToOptions: [sourceColumn], optionClass: () => 'cm-completion-row',
-    ...(own ? { override: [withServer(smartCompletions(smart ?? ''))] } : {}),
+    ...(own ? { override: [withServer(smartCompletions(smart ?? '', path))] } : {}),
   })
 }
 
@@ -536,7 +542,7 @@ const changeTracker = ViewPlugin.fromClass(class {
 // Clicking a change marker offers to stage or revert that change (handled by the IDE).
 const changeHandlers = new WeakMap<EditorView, (line: number, event: MouseEvent) => void>()
 const changeGutter = [baseText, changeMarks, changeTracker, gutter({
-  class: 'cm-gutter-changes', markers: view => view.state.field(changeMarks, false) ?? RangeSet.empty,
+  class: 'cm-gutter-changes', renderEmptyElements: true, markers: view => view.state.field(changeMarks, false) ?? RangeSet.empty,
   domEventHandlers: {
     mousedown: (view, line, event) => {
       let marked = false
@@ -639,7 +645,7 @@ const coverageField = StateField.define<RangeSet<GutterMarker>>({
     return value
   },
 })
-const coverageGutter = [coverageField, gutter({ class: 'cm-coverage', markers: view => view.state.field(coverageField, false) ?? RangeSet.empty })]
+const coverageGutter = [coverageField, EditorView.editorAttributes.compute([coverageField], state => (state.field(coverageField, false)?.size ? { class: 'has-coverage' } : {}) as Record<string, string>), gutter({ class: 'cm-coverage', renderEmptyElements: true, markers: view => view.state.field(coverageField, false) ?? RangeSet.empty })]
 
 // ---- Tests: ▶ beside each test, ✓ or ✗ after a run ----
 const setTests = StateEffect.define<{ line: number; id: string; status?: string }[]>()
@@ -668,8 +674,8 @@ const testField = StateField.define<RangeSet<GutterMarker>>({
   },
 })
 function testGutter(run: (id: string) => void) {
-  return [testField, gutter({
-    class: 'cm-tests',
+  return [testField, EditorView.editorAttributes.compute([testField], state => (state.field(testField, false)?.size ? { class: 'has-tests' } : {}) as Record<string, string>), gutter({
+    class: 'cm-tests', renderEmptyElements: true,
     markers: view => view.state.field(testField, false) ?? RangeSet.empty,
     domEventHandlers: {
       mousedown: (view, line) => {

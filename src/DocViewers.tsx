@@ -1,7 +1,7 @@
 // Viewers for files that aren't edited as code: PDFs (drawn with pdf.js, so they look the same
 // on every platform), images, and LaTeX — compiled to PDF with the TeX installed on the machine,
 // or, without one, a quick reading view with the maths typeset.
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { type RefObject, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import * as pdfjs from 'pdfjs-dist'
 import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import katex from 'katex'
@@ -25,6 +25,78 @@ export function fromBase64(text: string) {
   const bytes = new Uint8Array(binary.length)
   for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index)
   return bytes
+}
+
+// ---- Zoom (shared by the viewers) ----
+/** True when Ctrl+= / Ctrl+- / Ctrl+0 should zoom a viewer rather than the code: the viewer has
+ *  focus, or the pointer is over it while the caret isn't in an editor. */
+export function viewerTakesZoom(element?: Element | null) {
+  const active = document.activeElement
+  const focused = active?.closest('[data-zoom]')
+  if (focused) return !element || focused === element
+  if (active?.closest('.cm-editor, input, textarea, .xterm')) return false
+  const hovered = [...document.querySelectorAll('[data-zoom]')].find(node => node.matches(':hover'))
+  return Boolean(hovered) && (!element || hovered === element)
+}
+
+const clampZoom = (value: number) => Math.max(0.1, Math.min(8, Math.round(value * 100) / 100))
+/** Ctrl+wheel (and trackpad pinch) and Ctrl+= / - / 0 zoom a viewer, keeping the point under the
+ *  pointer where it is. `reset` is what Ctrl+0 goes back to. */
+function useViewerZoom(host: RefObject<HTMLElement | null>, scale: number, setZoom: (next: number | 'fit') => void, reset: number | 'fit' = 'fit') {
+  const latest = useRef({ scale, setZoom, reset })
+  latest.current = { scale, setZoom, reset }
+  const pending = useRef<{ x: number; y: number; left: number; top: number; ratio: number } | null>(null)
+  useEffect(() => {
+    const element = host.current
+    if (!element) return
+    const zoomTo = (target: number | 'fit', clientX?: number, clientY?: number) => {
+      const { scale: current, setZoom: set } = latest.current
+      if (target === 'fit') { pending.current = null; set('fit'); return }
+      const next = clampZoom(target)
+      if (next === current) return
+      const box = element.getBoundingClientRect()
+      const x = (clientX ?? box.left + box.width / 2) - box.left, y = (clientY ?? box.top + box.height / 2) - box.top
+      pending.current = { x, y, left: element.scrollLeft, top: element.scrollTop, ratio: next / current }
+      set(next)
+    }
+    const wheel = (event: WheelEvent) => {
+      if (!(event.ctrlKey || event.metaKey)) return
+      // Also stops the web view zooming the whole window.
+      event.preventDefault()
+      const step = event.deltaMode === 1 ? event.deltaY * 0.05 : event.deltaY * 0.0025
+      zoomTo(latest.current.scale * Math.exp(-Math.max(-0.5, Math.min(0.5, step))), event.clientX, event.clientY)
+    }
+    const key = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.altKey || !['=', '+', '-', '_', '0'].includes(event.key) || !viewerTakesZoom(element)) return
+      event.preventDefault()
+      event.stopImmediatePropagation()
+      const current = latest.current.scale
+      if (event.key === '0') zoomTo(latest.current.reset)
+      else zoomTo(event.key === '-' || event.key === '_' ? current / 1.2 : current * 1.2)
+    }
+    const grab = () => { if (!element.contains(document.activeElement)) element.focus({ preventScroll: true }) }
+    element.addEventListener('wheel', wheel, { passive: false })
+    element.addEventListener('pointerdown', grab)
+    window.addEventListener('keydown', key, true)
+    return () => { element.removeEventListener('wheel', wheel); element.removeEventListener('pointerdown', grab); window.removeEventListener('keydown', key, true) }
+  }, [host])
+  useLayoutEffect(() => {
+    const element = host.current, at = pending.current
+    if (!element || !at) return
+    pending.current = null
+    element.scrollLeft = (at.left + at.x) * at.ratio - at.x
+    element.scrollTop = (at.top + at.y) * at.ratio - at.y
+  }, [scale])
+}
+
+function ZoomTools({ scale, fit, onZoom, children }: { scale: number; fit: boolean; onZoom: (next: number | 'fit') => void; children?: React.ReactNode }) {
+  return <div className="pdf-tools">
+    {children}
+    <IconButton glyph={Minus} label={'Zoom out (' + (navigator.platform.startsWith('Mac') ? '⌘' : 'Ctrl') + '+-)'} onClick={() => onZoom(clampZoom(scale / 1.2))} />
+    <button className="pdf-zoom" onClick={() => onZoom(1)} title="Actual size">{Math.round(scale * 100)}%</button>
+    <IconButton glyph={Plus} label={'Zoom in (' + (navigator.platform.startsWith('Mac') ? '⌘' : 'Ctrl') + '+=)'} onClick={() => onZoom(clampZoom(scale * 1.2))} />
+    <IconButton glyph={Scan} label="Fit" className={fit ? 'is-on' : ''} onClick={() => onZoom('fit')} />
+  </div>
 }
 
 // ---- PDF ----
@@ -86,6 +158,7 @@ export function PdfView({ data, label }: { data: Uint8Array | null; label?: stri
 
   const widest = Math.max(1, ...boxes.map(box => box.width))
   const scale = zoom === 'fit' ? Math.max(0.2, (width - 48) / widest) : zoom
+  useViewerZoom(host, scale, setZoom)
   function onScroll() {
     const scroller = host.current
     if (!scroller) return
@@ -96,18 +169,12 @@ export function PdfView({ data, label }: { data: Uint8Array | null; label?: stri
   }
 
   return <div className="pdf-view">
-    <div className="pdf-scroll" ref={host} onScroll={onScroll}>
+    <div className="pdf-scroll" ref={host} onScroll={onScroll} data-zoom tabIndex={-1}>
       {error ? <p className="doc-message">This PDF couldn't be shown: {error}</p>
         : !doc ? <p className="doc-message">Opening {label ?? 'the PDF'}…</p>
           : boxes.map((box, index) => <PdfPage key={index} doc={doc} number={index + 1} box={box} scale={scale} />)}
     </div>
-    {doc && <div className="pdf-tools">
-      <span className="pdf-page-count">{page} / {boxes.length}</span>
-      <IconButton glyph={Minus} label="Zoom out" onClick={() => setZoom(Math.max(0.25, Math.round((scale - 0.15) * 20) / 20))} />
-      <button className="pdf-zoom" onClick={() => setZoom(1)} title="Actual size">{Math.round(scale * 100)}%</button>
-      <IconButton glyph={Plus} label="Zoom in" onClick={() => setZoom(Math.min(5, Math.round((scale + 0.15) * 20) / 20))} />
-      <IconButton glyph={Scan} label="Fit width" className={zoom === 'fit' ? 'is-on' : ''} onClick={() => setZoom('fit')} />
-    </div>}
+    {doc && <ZoomTools scale={scale} fit={zoom === 'fit'} onZoom={setZoom}><span className="pdf-page-count">{page} / {boxes.length}</span></ZoomTools>}
   </div>
 }
 
@@ -145,8 +212,10 @@ function PdfPage({ doc, number, box, scale }: { doc: pdfjs.PDFDocumentProxy; num
 
 // ---- Images ----
 export function ImageView({ data, path }: { data: Uint8Array | null; path: string }) {
-  const [fit, setFit] = useState(true)
+  const host = useRef<HTMLDivElement>(null)
+  const [zoom, setZoom] = useState<number | 'fit'>('fit')
   const [size, setSize] = useState<{ width: number; height: number } | null>(null)
+  const [box, setBox] = useState({ width: 800, height: 600 })
   const url = useMemo(() => {
     if (!data) return null
     const extension = path.split('.').at(-1)?.toLowerCase() ?? 'png'
@@ -155,16 +224,39 @@ export function ImageView({ data, path }: { data: Uint8Array | null; path: strin
     for (let index = 0; index < data.length; index += 0x8000) binary += String.fromCharCode(...data.subarray(index, index + 0x8000))
     return `data:image/${type};base64,${btoa(binary)}`
   }, [data, path])
-  return <div className={'image-view' + (fit ? ' is-fit' : '')} onClick={() => setFit(value => !value)} title={fit ? 'Click for actual size' : 'Click to fit'}>
-    {url ? <img src={url} alt={path} onLoad={event => setSize({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })} /> : <p className="doc-message">Opening the image…</p>}
-    {size && <span className="image-size">{size.width} × {size.height}{data ? ' · ' + (data.length / 1024).toFixed(data.length > 10240 ? 0 : 1) + ' KB' : ''}</span>}
+  useEffect(() => {
+    const element = host.current
+    if (!element) return
+    const observer = new ResizeObserver(() => setBox({ width: element.clientWidth, height: element.clientHeight }))
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [])
+  // Fit: as large as fits, but never blown up past actual size.
+  const fitScale = size ? Math.min(1, (box.width - 48) / size.width, (box.height - 48) / size.height) : 1
+  const scale = zoom === 'fit' ? Math.max(0.01, fitScale) : zoom
+  useViewerZoom(host, scale, setZoom)
+  return <div className="image-frame"><div className="image-view" ref={host} data-zoom tabIndex={-1} onDoubleClick={() => setZoom(zoom === 'fit' ? 1 : 'fit')} title="Ctrl+scroll or Ctrl+= / - to zoom; double-click for actual size">
+    {url ? <img src={url} alt={path} draggable={false} style={size ? { width: size.width * scale, height: size.height * scale } : undefined}
+      onLoad={event => setSize({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })} /> : <p className="doc-message">Opening the image…</p>}
+  </div>
+    {size && <ZoomTools scale={scale} fit={zoom === 'fit'} onZoom={setZoom}>
+      <span className="pdf-page-count">{size.width} × {size.height}{data ? ' · ' + (data.length / 1024).toFixed(data.length > 10240 ? 0 : 1) + ' KB' : ''}</span>
+    </ZoomTools>}
   </div>
 }
 
 /** SVG files are edited as text; the preview draws them (scripts and event handlers removed). */
 export function SvgView({ text }: { text: string }) {
+  const host = useRef<HTMLDivElement>(null)
+  const [zoom, setZoom] = useState<number | 'fit'>(1)
+  const scale = zoom === 'fit' ? 1 : zoom
+  useViewerZoom(host, scale, setZoom, 1)
   const clean = useMemo(() => DOMPurify.sanitize(text, { USE_PROFILES: { svg: true, svgFilters: true } }), [text])
-  return <div className="image-view is-fit svg-view" dangerouslySetInnerHTML={{ __html: clean }} />
+  return <div className="image-frame"><div className="image-view svg-view" ref={host} data-zoom tabIndex={-1}>
+    <div className="svg-art" style={{ zoom: scale }} dangerouslySetInnerHTML={{ __html: clean }} />
+  </div>
+    <ZoomTools scale={scale} fit={zoom === 'fit' || zoom === 1} onZoom={next => setZoom(next === 'fit' ? 1 : next)} />
+  </div>
 }
 
 // ---- LaTeX ----

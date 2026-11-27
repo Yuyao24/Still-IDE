@@ -1222,15 +1222,14 @@ button.journal-row:not(:disabled):hover span { text-decoration: underline; text-
 .pdf-page-count { color: var(--muted); margin-right: 6px; font-variant-numeric: tabular-nums; }
 .pdf-zoom { min-width: 44px; font: 12px var(--font-ui); color: var(--ink); font-variant-numeric: tabular-nums; }
 .doc-message { color: var(--muted); padding: 28px; font-size: 13px; }
-.image-view { position: absolute; inset: 0; overflow: auto; display: flex; align-items: center; justify-content: center; padding: 24px; cursor: zoom-in;
+.image-view { position: absolute; inset: 0; overflow: auto; display: flex; padding: 24px; outline: none;
   background-color: var(--editor); background-image: linear-gradient(45deg, var(--hover) 25%, transparent 25%), linear-gradient(-45deg, var(--hover) 25%, transparent 25%), linear-gradient(45deg, transparent 75%, var(--hover) 75%), linear-gradient(-45deg, transparent 75%, var(--hover) 75%);
   background-size: 16px 16px; background-position: 0 0, 0 8px, 8px -8px, -8px 0; }
-.image-view.is-fit { cursor: zoom-out; }
-.image-view.is-fit img, .svg-view svg { max-width: 100%; max-height: 100%; object-fit: contain; }
-.image-view img { display: block; image-rendering: auto; }
-.image-size { position: absolute; right: 14px; bottom: 12px; padding: 3px 8px; background: var(--editor); border: 1px solid var(--line); color: var(--muted); font-size: 11.5px; }
-.svg-view { cursor: default; }
-.svg-view svg { width: auto; height: auto; }
+.pdf-scroll { outline: none; }
+/* margin: auto centres the picture but, unlike centring the flex box, never cuts off a zoomed-in edge. */
+.image-view img, .image-view .svg-art { display: block; flex: none; margin: auto; image-rendering: auto; }
+.image-frame { position: absolute; inset: 0; }
+.svg-view .svg-art svg { display: block; width: auto; height: auto; }
 .tex-view { position: absolute; inset: 0; display: flex; flex-direction: column; }
 .tex-view > .pdf-view, .tex-view > .doc-preview { position: relative; flex: 1; min-height: 0; }
 .tex-status { flex: none; padding: 7px 18px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 12px; }
@@ -1260,37 +1259,24 @@ button.journal-row:not(:disabled):hover span { text-decoration: underline; text-
 .minimap:hover .minimap-view { background: color-mix(in srgb, var(--ink) 10%, transparent); }
 .minimap-empty { color: var(--muted); font-size: 12.5px; padding: 18px; }
 
-/* ---- Experimental: background picture, glass and see-through panels ---- */
+/* ---- Background picture and see-through window ---- */
 .backdrop { position: fixed; inset: 0; z-index: -1; pointer-events: none; background-color: var(--editor-solid); background-image: var(--backdrop-image); background-size: cover; background-position: center; }
 /* Fade: the theme's own colour laid over the picture. Tint: a colour wash on top. */
 .backdrop::before { content: ''; position: absolute; inset: 0; background: var(--editor-solid); opacity: var(--backdrop-fade); }
 .backdrop::after { content: ''; position: absolute; inset: 0; background: var(--backdrop-tint); opacity: var(--backdrop-tint-strength); mix-blend-mode: color; }
-.has-backdrop body { background: var(--editor-solid); }
+.has-picture body { background: var(--editor-solid); }
+/* See-through: nothing under the panels is painted, so the desktop shows through the window. */
+.see-through:not(.has-picture), .see-through:not(.has-picture) body { background: transparent; }
 .has-backdrop #root { position: relative; z-index: 1; }
 .has-backdrop .app, .has-backdrop .home { background: transparent; }
 /* Anything that sits on top of the editor stays readable: nearly solid, and whatever shows
-   through is blurred past recognition. See-through panels apply to the workspace itself only. */
-.has-backdrop { --overlay: color-mix(in srgb, var(--editor-solid) 95%, transparent); }
+   through is blurred past recognition. Transparency applies to the workspace itself only. */
+.has-backdrop { --overlay: color-mix(in srgb, var(--editor-solid) 96%, transparent); }
 .has-backdrop .menu, .has-backdrop .palette, .has-backdrop .sheet, .has-backdrop .toast, .has-backdrop .cm-tooltip, .has-backdrop .tab-ghost, .has-backdrop .pdf-tools,
 .has-backdrop .settings, .has-backdrop .overview, .has-backdrop .graph-view, .has-backdrop .idle, .has-backdrop .update-bar, .has-backdrop .focus-output, .has-backdrop .cm-panels {
   background: var(--overlay); -webkit-backdrop-filter: blur(30px) saturate(1.2); backdrop-filter: blur(30px) saturate(1.2); }
 .has-backdrop .settings-nav, .has-backdrop .settings-body { background: transparent; }
 .has-backdrop .cm-editor, .has-backdrop .cm-gutters { background: transparent !important; }
-
-/* Frosted glass: panels blur what's behind them. */
-.surface-frosted .island, .surface-frosted .chrome, .surface-frosted .status, .surface-frosted .launch-box, .surface-frosted .launch-column {
-  -webkit-backdrop-filter: blur(26px) saturate(1.3); backdrop-filter: blur(26px) saturate(1.3); }
-.surface-frosted .bench > .island, .surface-frosted .slot > .island { background: var(--editor); border-color: color-mix(in srgb, var(--ink) 8%, transparent); }
-
-/* Liquid glass: rounder, with a bright rim and a soft sheen, as on recent iPhones and Macs. */
-.surface-liquid .island, .surface-liquid .launch-box, .surface-liquid .menu, .surface-liquid .palette, .surface-liquid .sheet {
-  -webkit-backdrop-filter: blur(18px) saturate(1.8) brightness(1.04); backdrop-filter: blur(18px) saturate(1.8) brightness(1.04);
-  border-radius: 16px !important; border: 1px solid color-mix(in srgb, #fff 26%, transparent) !important;
-  background-image: linear-gradient(135deg, color-mix(in srgb, #fff 16%, transparent), color-mix(in srgb, #fff 2%, transparent) 48%, color-mix(in srgb, #fff 7%, transparent));
-  box-shadow: inset 0 1px 0 color-mix(in srgb, #fff 42%, transparent), inset 0 -1px 0 color-mix(in srgb, #fff 10%, transparent), 0 10px 40px rgba(0, 0, 0, .14); }
-.surface-liquid .bench > .island, .surface-liquid .slot > .island { background-color: var(--editor); overflow: hidden; }
-.surface-liquid .slot::before { display: none; }
-.surface-liquid .chrome, .surface-liquid .status { -webkit-backdrop-filter: blur(18px) saturate(1.6); backdrop-filter: blur(18px) saturate(1.6); }
 .setting-actions { display: flex; align-items: center; gap: 8px; flex: none; }
 .setting-thumb { width: 44px; height: 28px; background-size: cover; background-position: center; border: 1px solid var(--line); }
 .setting-color { width: 34px; height: 24px; padding: 0; border: 1px solid var(--line); background: none; cursor: pointer; }
@@ -1301,9 +1287,6 @@ button.journal-row:not(:disabled):hover span { text-decoration: underline; text-
 .setting-slider input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 10px; height: 14px; margin-top: -7px; background: var(--ink); border: none; }
 .setting-slider input[type=range]::-moz-range-track { height: 1px; background: var(--dash); }
 .setting-slider input[type=range]::-moz-range-thumb { width: 10px; height: 14px; background: var(--ink); border: none; border-radius: 0; }
-/* Inside liquid panels, small controls round off a little too. */
-.surface-liquid .launch-box input, .surface-liquid .palette input, .surface-liquid .sheet .field, .surface-liquid .text-btn, .surface-liquid .run-button { border-radius: 9px !important; }
-.surface-liquid .chrome .run-button, .surface-liquid .primary { border-radius: 9px !important; }
 
 /* ---- Home: a contents page ---- */
 .home.contents { padding: clamp(28px, 10vh, 128px) 32px clamp(16px, 5vh, 48px); }

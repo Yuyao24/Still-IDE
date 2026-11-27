@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from 'react'
+import { findClassRange, setClassSource } from './completion'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
@@ -18,7 +19,7 @@ import {
 import Editor, { defaultIndent, highlightToHtml, language, refactorHook, type CodeCapture, type Cursor, type EditorHandle, type EditorMemory, type EditorOptions, type LiveIssue } from './Editor'
 import CodeShot from './CodeShot'
 import { Preview, docKind, type DocKind } from './Preview'
-import { ImageView, PdfView, SvgView, TexPreview, binaryKind, fromBase64, type BinaryKind } from './DocViewers'
+import { ImageView, PdfView, SvgView, TexPreview, binaryKind, fromBase64, type BinaryKind, viewerTakesZoom } from './DocViewers'
 import { Minimap } from './Minimap'
 import { RunConfigDialog } from './RunConfig'
 import { Notebook } from './Notebook'
@@ -143,6 +144,44 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
   const shownDirectories = useMemo(() => workspace.file ? { '': (directories[''] ?? []).filter(entry => entry.path === workspace.file) } : directories, [directories, workspace.file])
   const [expanded, setExpanded] = useState(new Set<string>())
   const [files, setFiles] = useState<Entry[]>([])
+  // Member suggestions for `robot.`: classes defined in other files are found here.
+  const classLookup = useRef({ tabs: [] as Tab[], files: [] as Entry[] })
+  useEffect(() => {
+    const declares = (text: string, name: string, python: boolean) => findClassRange(text, name, python) !== null
+    setClassSource(async (name, fromPath, fileText) => {
+      const python = /\.pyi?$/.test(fromPath)
+      const { tabs: open, files: known } = classLookup.current
+      for (const tab of open) if (tab.path !== fromPath && !tab.binary && /\.(py|pyi|java|kt|cs|ts|tsx|js|jsx)$/.test(tab.path) && declares(tab.contents, name, /\.pyi?$/.test(tab.path))) return { text: tab.contents, python: /\.pyi?$/.test(tab.path) }
+      const candidates: string[] = []
+      const paths = known.filter(item => !item.directory).map(item => item.path)
+      // A class named after its file (Java, Kotlin, C#, TypeScript).
+      for (const path of paths) if (new RegExp('(^|/)' + name + '\\.(java|kt|cs|ts|tsx|js|jsx)$').test(path)) candidates.push(path)
+      // Python: the module an import names (from robots.base import Robot).
+      if (python) {
+        const imported = new RegExp('^\\s*from\\s+(\\.*)([\\w.]*)\\s+import\\s+[^\\n]*\\b' + name + '\\b', 'm').exec(fileText)
+        if (imported) {
+          const base = imported[1] ? fromPath.split('/').slice(0, -imported[1].length).join('/') : ''
+          const module = [base, imported[2].replace(/\./g, '/')].filter(Boolean).join('/')
+          for (const path of paths) if (path === module + '.py' || path.endsWith('/' + module + '.py') || path === module + '/__init__.py' || path.endsWith('/' + module + '/__init__.py')) candidates.push(path)
+        }
+        const snake = name.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase()
+        for (const path of paths) if (new RegExp('(^|/)(' + snake + '|' + name.toLowerCase() + ')\\.py$').test(path)) candidates.push(path)
+      }
+      for (const path of [...new Set(candidates)].slice(0, 6)) {
+        const text = await fs.read(path).catch(() => '')
+        if (declares(text, name, /\.pyi?$/.test(path))) return { text, python: /\.pyi?$/.test(path) }
+      }
+      // Anywhere in the project.
+      const found = await fs.search('(class|interface|record|enum)\\s+' + name + '\\b', { regex: true, caseSensitive: true, wholeWord: false }).catch(() => null)
+      for (const match of found?.matches.slice(0, 4) ?? []) {
+        const text = await fs.read(match.path).catch(() => '')
+        if (declares(text, name, /\.pyi?$/.test(match.path))) return { text, python: /\.pyi?$/.test(match.path) }
+      }
+      return null
+    })
+    return () => setClassSource(null)
+  }, [fs])
+  classLookup.current = { tabs, files }
   const [status, setStatus] = useState(emptyStatus)
   const [gitError, setGitError] = useState('')
   const [log, setLog] = useState<Commit[]>([])
@@ -2137,7 +2176,7 @@ export default function Ide({ workspace, initial, onHome, onSwitch, onSettings, 
         event.preventDefault(); editor.current?.find(); return
       }
       // Code zoom: Ctrl+= / Ctrl+- / Ctrl+0, as in browsers and other editors.
-      if (!event.altKey && ['=', '+', '-', '_', '0'].includes(key) && !(event.target as Element | null)?.closest?.('.xterm, input, textarea')) {
+      if (!event.altKey && ['=', '+', '-', '_', '0'].includes(key) && !(event.target as Element | null)?.closest?.('.xterm, input, textarea') && !viewerTakesZoom()) {
         event.preventDefault()
         update({ editorFontSize: key === '0' ? 14 : Math.max(9, Math.min(28, settings.editorFontSize + (key === '-' || key === '_' ? -1 : 1))) })
         return

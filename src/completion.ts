@@ -243,6 +243,11 @@ export function classMembers(state: CompletionContext['state'], pos: number, lan
     while (end <= doc.lines && (!doc.line(end).text.trim() || /^\s*/.exec(doc.line(end).text)![0].length > classIndent)) end++
     to = end <= doc.lines ? doc.line(end).from : doc.length
   } else return []
+  return membersInRange(text, from, to, python, 0)
+}
+
+/** Fields and methods declared in text[from, to) (a class), plus parent classes found in the same text. */
+export function membersInRange(text: string, from: number, to: number, python: boolean, depth: number): Member[] {
   const members = new Map<string, Member>()
   const add = (name: string, kind: Member['kind'], detail?: string) => {
     if (!name || notMembers.has(name) || (python && /^__\w+__$/.test(name))) return
@@ -303,20 +308,113 @@ export function classMembers(state: CompletionContext['state'], pos: number, lan
     void start
     for (const match of body.matchAll(/\bthis\.([A-Za-z_$#][\w$]*)\s*=(?!=)/g)) add(match[1].replace(/^#/, ''), 'property')
   }
-  // Parent classes defined in the same file.
-  for (const parent of parents.slice(0, 3)) {
-    const at = text.search(new RegExp(python ? '^\\s*class\\s+' + parent + '\\b' : '\\b(class|interface)\\s+' + parent + '\\b', 'm'))
-    if (at < 0 || (at >= from && at < to)) continue
-    const inner = text.indexOf(python ? ':' : '{', at)
-    if (inner < 0) continue
-    for (const member of classMembers(state, inner + 2, languageName)) if (!members.has(member.name)) members.set(member.name, member)
+  // Parent classes defined in the same text.
+  if (depth < 3) for (const parent of parents.slice(0, 3)) {
+    const range = findClassRange(text, parent, python)
+    if (!range || (range.from >= from && range.from < to)) continue
+    for (const member of membersInRange(text, range.from, range.to, python, depth + 1)) if (!members.has(member.name)) members.set(member.name, member)
   }
   return [...members.values()]
 }
 
-export function smartCompletions(languageName: string): CompletionSource {
+/** Where `class Name` is declared in text: from its header to the end of its body. */
+export function findClassRange(text: string, name: string, python: boolean): { from: number; to: number } | null {
+  if (!/^[A-Za-z_$][\w$]*$/.test(name)) return null
+  if (python) {
+    const match = new RegExp('^([ \\t]*)class\\s+' + name + '\\b', 'm').exec(text)
+    if (!match) return null
+    const indent = match[1].length
+    const lines = text.slice(match.index).split('\n')
+    let length = lines[0].length + 1
+    for (const line of lines.slice(1)) {
+      if (line.trim() && /^\s*/.exec(line)![0].length <= indent) break
+      length += line.length + 1
+    }
+    return { from: match.index, to: Math.min(text.length, match.index + length) }
+  }
+  const match = new RegExp('\\b(?:class|interface|record|enum|object|struct)\\s+' + name.replace(/\$/g, '\\$') + '\\b').exec(text)
+  if (!match) return null
+  const open = text.indexOf('{', match.index)
+  if (open < 0) return null
+  let depth = 0
+  for (let index = open; index < text.length; index++) {
+    const char = text[index]
+    if (char === '/' && text[index + 1] === '/') { const end = text.indexOf('\n', index); index = end < 0 ? text.length : end; continue }
+    if (char === '/' && text[index + 1] === '*') { const end = text.indexOf('*/', index + 2); index = end < 0 ? text.length : end + 1; continue }
+    if (char === '"' || char === "'" || char === '`') { let end = index + 1; while (end < text.length && text[end] !== char) end += text[end] === '\\' ? 2 : 1; index = end; continue }
+    if (char === '{') depth++
+    else if (char === '}' && --depth === 0) return { from: match.index, to: index + 1 }
+  }
+  return { from: match.index, to: text.length }
+}
+
+const typeNoise = new Set(['return', 'new', 'else', 'case', 'throw', 'import', 'package', 'var', 'val', 'let', 'const', 'final', 'static', 'public', 'private', 'protected', 'in', 'of', 'instanceof', 'yield', 'await', 'print'])
+const builtinTypes = new Set(['int', 'long', 'short', 'byte', 'char', 'boolean', 'float', 'double', 'void', 'String', 'str', 'bool', 'number', 'string', 'any', 'object', 'Object', 'Integer', 'list', 'dict', 'set', 'tuple'])
+
+/**
+ * The class of the name before the dot, worked out from this file: `Robot robot`, `robot: Robot`,
+ * `robot = Robot(...)`, `var robot = new Robot()`, a field assigned through self./this., or the
+ * class name itself (`Robot.`). Null when it can't tell.
+ */
+export function receiverType(text: string, receiver: string, pos: number, python: boolean): string | null {
+  const name = receiver.replace(/^(?:self|this|cls)\./, '')
+  if (!/^[A-Za-z_$][\w$]*$/.test(name)) return null
+  if (/^[A-Z]/.test(name) && findClassRange(text, name, python)) return name
+  const before = text.slice(0, pos)
+  const escaped = name.replace(/\$/g, '\\$')
+  const candidates: { at: number; type: string }[] = []
+  const collect = (pattern: RegExp, group = 1) => {
+    for (const match of text.matchAll(pattern)) {
+      const type = match[group]?.split('.').at(-1)
+      if (!type || typeNoise.has(type) || builtinTypes.has(type)) continue
+      candidates.push({ at: match.index ?? 0, type })
+    }
+  }
+  // Typed declarations and parameters (Java, C#, Kotlin-less): `Robot robot`, `List<Robot> robots` skipped.
+  if (!python) collect(new RegExp('\\b([A-Z][\\w$]*(?:\\.[A-Z][\\w$]*)*)(?:<[^<>;()]*>)?\\s+' + escaped + '\\s*(?=[=;,)]|$|:)', 'gm'))
+  // Annotations: `robot: Robot` (Python, TypeScript, Kotlin).
+  collect(new RegExp('(?:^|[\\s(,])(?:self\\.|this\\.)?' + escaped + '\\s*\\??:\\s*(?:Optional\\[)?([A-Za-z_][\\w.]*)', 'gm'))
+  // Assignments from a constructor: `robot = Robot(...)`, `robot = new Robot(...)`.
+  collect(new RegExp('(?:^|[^\\w$.])(?:self\\.|this\\.)?' + escaped + '\\s*=\\s*(?:new\\s+)?([A-Z][\\w$.]*)\\s*(?:<[^>]*>)?\\(', 'gm'))
+  if (!candidates.length) return null
+  // The closest declaration above the caret wins, else the first one in the file.
+  const above = candidates.filter(item => item.at < before.length).sort((a, b) => b.at - a.at)
+  return (above[0] ?? candidates.sort((a, b) => a.at - b.at)[0]).type
+}
+
+/** The name (or self.name / this.name) right before the dot at the caret, if not self/this itself. */
+export function receiverBeforeDot(context: CompletionContext): string | null {
+  const match = context.matchBefore(/(?:\b(?:self|this|cls)\.)?[A-Za-z_$][\w$]*\s*\.\s*[\w$]*$/)
+  if (!match) return null
+  const receiver = /^((?:(?:self|this|cls)\.)?[A-Za-z_$][\w$]*)/.exec(match.text)![1]
+  if (/^(self|this|cls|super)$/.test(receiver)) return null
+  // Not the middle of a longer chain like a.b.c (only the first link can be typed from the file).
+  const start = match.from
+  if (start > 0 && /[.\w$]/.test(context.state.sliceDoc(start - 1, start)) && !/^(self|this|cls)\./.test(receiver)) return null
+  return receiver
+}
+
+/** Finds the source of a class defined elsewhere in the project (set by the IDE). */
+type ClassSource = (name: string, fromPath: string, fileText: string) => Promise<{ text: string; python: boolean } | null>
+let classSource: ClassSource | null = null
+export function setClassSource(source: ClassSource | null) { classSource = source }
+
+/** Members of the class the receiver is an instance of: from this file, else from the project. */
+export async function receiverMembers(text: string, receiver: string, pos: number, languageName: string, path: string): Promise<{ type: string; members: Member[] } | null> {
+  const python = languageName.toLowerCase() === 'python'
+  const type = receiverType(text, receiver, pos, python)
+  if (!type) return null
+  const local = findClassRange(text, type, python)
+  if (local) return { type, members: membersInRange(text, local.from, local.to, python, 0) }
+  const found = await classSource?.(type, path, text).catch(() => null)
+  if (!found) return null
+  const range = findClassRange(found.text, type, found.python)
+  return range ? { type, members: membersInRange(found.text, range.from, range.to, found.python, 0) } : null
+}
+
+export function smartCompletions(languageName: string, path = ''): CompletionSource {
   const vocabulary = vocabularies[languageName] ?? { builtins: [], keywords: [], members: [] }
-  return (context: CompletionContext): CompletionResult | null => {
+  return async (context: CompletionContext): Promise<CompletionResult | null> => {
     const word = context.matchBefore(/[A-Za-z_$][\w$]*/)
     const node = syntaxTree(context.state).resolveInner(context.pos, -1)
     // No suggestions inside strings and comments.
@@ -339,7 +437,15 @@ export function smartCompletions(languageName: string): CompletionSource {
     if (afterDot && receiverIsSelf(context, languageName)) {
       // self. / this.: the class's own fields and methods first.
       for (const member of classMembers(context.state, context.pos, languageName)) {
-        if (matches(member.name)) add({ label: member.name, type: member.kind, detail: member.detail, ['source' as never]: 'this class' } as Completion, 3.6)
+        if (matches(member.name)) add({ label: member.name, type: member.kind, detail: member.detail, ['source' as never]: 'this class', ['member' as never]: true } as Completion, 3.6)
+      }
+    } else if (afterDot) {
+      // robot. : the fields and methods of the variable's class, when the file says what it is.
+      const receiver = receiverBeforeDot(context)
+      const found = receiver ? await receiverMembers(context.state.doc.toString(), receiver, context.pos, languageName, path) : null
+      if (context.aborted) return null
+      if (found) for (const member of found.members) {
+        if (matches(member.name)) add({ label: member.name, type: member.kind, detail: member.detail, ['source' as never]: found.type, ['member' as never]: true } as Completion, 3.6)
       }
     }
     if (afterDot) {
